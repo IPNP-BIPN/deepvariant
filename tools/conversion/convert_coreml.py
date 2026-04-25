@@ -78,8 +78,17 @@ def convert(
         f"(compute_units={compute_units}, target={target})"
     )
     t0 = time.time()
+    dyn_shape = ct.Shape(
+        shape=(
+            ct.RangeDim(
+                lower_bound=batch_min, upper_bound=batch_max, default=1,
+            ),
+            100, 221, 7,
+        )
+    )
     mlmodel = ct.convert(
         prog,
+        inputs=[ct.TensorType(name="x", shape=dyn_shape)],
         compute_units=_COMPUTE_UNITS[compute_units],
         minimum_deployment_target=_TARGETS[target],
         convert_to="mlprogram",

@@ -317,15 +317,13 @@ def build_program(
     Input:  x  shape (N, 100, 221, 7)  NHWC float32 — matches original.
     Output: classification shape (N, 3)  float32 softmax.
     """
+    from coremltools.converters.mil.mil.program import get_new_symbol
+
+    # Use a symbol for the batch dim so ct.convert() can override it with
+    # a RangeDim (see convert_coreml.py inputs= parameter).
+    batch_sym = get_new_symbol()
     @mb.program(
-        input_specs=[
-            mb.TensorSpec(
-                shape=(
-                    mb.RangeDim(batch_min, batch_max),
-                    100, 221, 7,
-                )
-            )
-        ]
+        input_specs=[mb.TensorSpec(shape=(batch_sym, 100, 221, 7))]
     )
     def prog(x):
         # NHWC (N,100,221,7) → NCHW (N,7,100,221) for Core ML convs.
