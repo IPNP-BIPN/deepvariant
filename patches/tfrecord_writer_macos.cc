@@ -1,6 +1,4 @@
-// POSIX + protobuf replacement for third_party/nucleus/io/tfrecord_writer.cc.
-// Writes TFRecords without TF runtime. CRC uses the crc32c implementation from
-// abseil (absl::crc::crc32c::Extend).
+// POSIX replacement for third_party/nucleus/io/tfrecord_writer.cc.
 // Format: [uint64_le length][uint32_le masked_crc32c(len)]
 //         [bytes payload][uint32_le masked_crc32c(payload)]
 
@@ -9,69 +7,79 @@
 #include <cstdint>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include "absl/crc/crc32c.h"
 
 namespace nucleus {
 
 namespace {
-// masked CRC32C — matches TF's RecordWriter encoding.
 constexpr uint32_t kMaskDelta = 0xa282ead8UL;
 uint32_t MaskedCrc32c(const char* data, size_t n) {
   uint32_t crc = static_cast<uint32_t>(
       absl::ComputeCrc32c(std::string_view(data, n)));
   return ((crc >> 15) | (crc << 17)) + kMaskDelta;
 }
+
+struct TFRWImpl { std::ofstream stream; };
+std::mutex mu;
+std::unordered_map<TFRecordWriter*, std::unique_ptr<TFRWImpl>> impls;
 }  // namespace
 
-struct TFRecordWriterImpl {
-  std::ofstream stream;
-  explicit TFRecordWriterImpl(const std::string& path)
-      : stream(path, std::ios::binary | std::ios::trunc) {}
-};
-
-TFRecordWriter::TFRecordWriter() = default;
-TFRecordWriter::~TFRecordWriter() = default;
+TFRecordWriter::TFRecordWriter()  = default;
+TFRecordWriter::~TFRecordWriter() {
+  std::lock_guard<std::mutex> lk(mu);
+  impls.erase(this);
+}
 
 // static
 std::unique_ptr<TFRecordWriter> TFRecordWriter::New(
     const std::string& filename, const std::string& /*compression_type*/) {
-  auto w = std::unique_ptr<TFRecordWriter>(new TFRecordWriter());
-  auto impl = std::make_unique<TFRecordWriterImpl>(filename);
+  auto impl = std::make_unique<TFRWImpl>();
+  impl->stream.open(filename, std::ios::binary | std::ios::trunc);
   if (!impl->stream.is_open()) return nullptr;
-  w->file_ = std::move(impl);
+  auto w = std::unique_ptr<TFRecordWriter>(new TFRecordWriter());
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    impls[w.get()] = std::move(impl);
+  }
   return w;
 }
 
 bool TFRecordWriter::WriteRecord(const std::string& record) {
-  auto* impl = static_cast<TFRecordWriterImpl*>(file_.get());
-  if (!impl || !impl->stream.good()) return false;
+  std::lock_guard<std::mutex> lk(mu);
+  auto it = impls.find(this);
+  if (it == impls.end()) return false;
+  auto& s = it->second->stream;
 
   uint64_t len = record.size();
   uint32_t len_crc = MaskedCrc32c(reinterpret_cast<const char*>(&len), 8);
   uint32_t data_crc = MaskedCrc32c(record.data(), len);
 
-  impl->stream.write(reinterpret_cast<const char*>(&len), 8);
-  impl->stream.write(reinterpret_cast<const char*>(&len_crc), 4);
-  impl->stream.write(record.data(), static_cast<std::streamsize>(len));
-  impl->stream.write(reinterpret_cast<const char*>(&data_crc), 4);
-  return impl->stream.good();
+  s.write(reinterpret_cast<const char*>(&len), 8);
+  s.write(reinterpret_cast<const char*>(&len_crc), 4);
+  s.write(record.data(), static_cast<std::streamsize>(len));
+  s.write(reinterpret_cast<const char*>(&data_crc), 4);
+  return s.good();
 }
 
 bool TFRecordWriter::Flush() {
-  if (!file_) return false;
-  auto* impl = static_cast<TFRecordWriterImpl*>(file_.get());
-  impl->stream.flush();
-  return impl->stream.good();
+  std::lock_guard<std::mutex> lk(mu);
+  auto it = impls.find(this);
+  if (it == impls.end()) return false;
+  it->second->stream.flush();
+  return it->second->stream.good();
 }
 
 bool TFRecordWriter::Close() {
-  if (!file_) return true;
-  auto* impl = static_cast<TFRecordWriterImpl*>(file_.get());
-  impl->stream.flush();
-  impl->stream.close();
-  return !impl->stream.fail();
+  std::lock_guard<std::mutex> lk(mu);
+  auto it = impls.find(this);
+  if (it == impls.end()) return true;
+  it->second->stream.flush();
+  it->second->stream.close();
+  return !it->second->stream.fail();
 }
 
 }  // namespace nucleus

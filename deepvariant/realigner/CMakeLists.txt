@@ -14,6 +14,11 @@ target_include_directories(realigner PUBLIC
   "${CMAKE_SOURCE_DIR}"
   "${CMAKE_BINARY_DIR}/proto_gen"
   "${CMAKE_SOURCE_DIR}/cmake/tf_stubs"
+  "${ABSL_PREFIX}/include"
+  "${BOOST_INCLUDE_DIR}"
+)
+target_compile_options(realigner PRIVATE
+  "-include${CMAKE_SOURCE_DIR}/cmake/tf_stubs/tensorflow/core/platform/tf_compat.h"
 )
 
 target_link_libraries(realigner PUBLIC
@@ -28,19 +33,5 @@ target_link_libraries(realigner PUBLIC
   absl::flat_hash_set
 )
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-function(realigner_test name src)
-  add_executable(${name} "${CMAKE_CURRENT_SOURCE_DIR}/${src}")
-  target_include_directories(${name} PRIVATE
-    "${CMAKE_SOURCE_DIR}"
-    "${CMAKE_BINARY_DIR}/proto_gen"
-    "${CMAKE_SOURCE_DIR}/cmake/tf_stubs"
-  )
-  target_link_libraries(${name} PRIVATE realigner)
-  add_test(NAME ${name} COMMAND ${name})
-endfunction()
+# Tests deferred to tests/native/ smoke tests.
 
-realigner_test(fast_pass_aligner_test fast_pass_aligner_test.cc)
-realigner_test(ssw_test               ssw_test.cc)

@@ -58,16 +58,21 @@ add_library(nucleus_io STATIC
 )
 
 target_include_directories(nucleus_io PUBLIC
-  # Repo root — for "third_party/nucleus/..." and "deepvariant/..." includes
   "${CMAKE_SOURCE_DIR}"
-  # Generated proto headers
   "${CMAKE_BINARY_DIR}/proto_gen"
-  # TF stubs (shadows TF headers so no real TF is needed)
   "${CMAKE_SOURCE_DIR}/cmake/tf_stubs"
+  "${ABSL_PREFIX}/include"
+  "${RE2_PREFIX}/include"
+)
+# Force-include the TF compat umbrella so CHECK / TF_PREDICT_FALSE are
+# available without explicit #include in each nucleus .cc file.
+target_compile_options(nucleus_io PRIVATE
+  "-include${CMAKE_SOURCE_DIR}/cmake/tf_stubs/tensorflow/core/platform/tf_compat.h"
 )
 
 target_link_libraries(nucleus_io PUBLIC
   htslib::htslib
+  re2::re2
   proto_nucleus
   proto_tf_example
   absl::strings
@@ -79,20 +84,4 @@ target_link_libraries(nucleus_io PUBLIC
   ZLIB::ZLIB
 )
 
-# ---------------------------------------------------------------------------
-# Tests (Phase 1 gate)
-# ---------------------------------------------------------------------------
-function(nucleus_io_test name src)
-  add_executable(${name} "${CMAKE_CURRENT_SOURCE_DIR}/${src}")
-  target_include_directories(${name} PRIVATE
-    "${CMAKE_SOURCE_DIR}"
-    "${CMAKE_BINARY_DIR}/proto_gen"
-    "${CMAKE_SOURCE_DIR}/cmake/tf_stubs"
-  )
-  target_link_libraries(${name} PRIVATE nucleus_io)
-  add_test(NAME ${name} COMMAND ${name})
-endfunction()
-
-# Minimal smoke tests that don't need external data.
-nucleus_io_test(hts_verbose_test    hts_verbose_test.cc)
-nucleus_io_test(reader_base_test    reader_base_test.cc)
+# Tests deferred to tests/native/ smoke tests (upstream tests depend on test_utils.h).

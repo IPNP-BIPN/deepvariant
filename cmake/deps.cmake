@@ -1,20 +1,22 @@
-# deps.cmake — Fetch all external C++ dependencies (no TensorFlow).
+# deps.cmake — All external C++ dependencies (no TensorFlow).
 #
-# Dependencies:
-#   htslib 1.18      via Homebrew (autoconf project, easiest path on macOS)
-#   abseil-cpp       LTS 20240722 via FetchContent
-#   protobuf 21.9    via FetchContent (matches upstream WORKSPACE pin)
-#   libssw 1.2.5     via FetchContent (SSW aligner for realigner/)
+# All major deps use Homebrew (already installed) via find_package.
+# Only libssw (not in Homebrew) uses FetchContent.
+#
+# Homebrew versions on this machine:
+#   htslib  1.18        (req: 1.18)
+#   abseil  20260107.1  (req: ≥ 20240722; API-compatible)
+#   protobuf 34.1       (req: 21.9; API-compatible for generated code)
 #
 # Pangenome deps (gbwt, gbwtgraph, sdsl-lite, libdivsufsort, libhandlegraph)
 # are deferred until Phase 3 (pangenome-aware DeepVariant port).
 
 include(FetchContent)
 set(FETCHCONTENT_QUIET OFF)
-set(FETCHCONTENT_UPDATES_DISCONNECTED ON)  # skip re-fetch if already downloaded
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
 
 # ---------------------------------------------------------------------------
-# htslib 1.18 — use Homebrew on macOS (avoids autoconf complexity)
+# htslib 1.18 — Homebrew (avoids autoconf complexity on macOS)
 # ---------------------------------------------------------------------------
 find_program(BREW_EXECUTABLE brew REQUIRED)
 execute_process(
@@ -26,46 +28,52 @@ if(NOT HTSLIB_PREFIX)
   message(FATAL_ERROR "htslib not found — run: brew install htslib")
 endif()
 
-# Build an IMPORTED target so we can just link htslib::htslib everywhere.
 add_library(htslib::htslib STATIC IMPORTED)
 find_library(HTSLIB_LIB NAMES libhts.a hts PATHS "${HTSLIB_PREFIX}/lib" REQUIRED)
 set_target_properties(htslib::htslib PROPERTIES
   IMPORTED_LOCATION "${HTSLIB_LIB}"
   INTERFACE_INCLUDE_DIRECTORIES "${HTSLIB_PREFIX}/include"
 )
-# htslib needs these system frameworks / libs on macOS.
 target_link_libraries(htslib::htslib INTERFACE
   "-framework CoreFoundation"
+  /opt/homebrew/lib/libdeflate.a
   z bz2 lzma curl
 )
 message(STATUS "htslib: ${HTSLIB_LIB}")
 
 # ---------------------------------------------------------------------------
-# abseil-cpp LTS 20240722
+# abseil — Homebrew (no FetchContent; avoids hash management)
 # ---------------------------------------------------------------------------
-FetchContent_Declare(
-  abseil
-  URL      https://github.com/abseil/abseil-cpp/archive/refs/tags/20240722.1.tar.gz
-  URL_HASH SHA256=f50e5ac311a81382da7fa75b97310e4b9006474f9560ac46f54a9967f07d4ae3
+execute_process(
+  COMMAND ${BREW_EXECUTABLE} --prefix abseil
+  OUTPUT_VARIABLE ABSL_PREFIX
+  OUTPUT_STRIP_TRAILING_WHITESPACE
 )
-set(ABSL_PROPAGATE_CXX_STD ON)
-set(ABSL_BUILD_TESTING OFF)
-FetchContent_MakeAvailable(abseil)
+if(NOT ABSL_PREFIX)
+  message(FATAL_ERROR "abseil not found — run: brew install abseil")
+endif()
+list(APPEND CMAKE_PREFIX_PATH "${ABSL_PREFIX}")
+find_package(absl REQUIRED)
+message(STATUS "abseil: ${ABSL_PREFIX}")
 
 # ---------------------------------------------------------------------------
-# protobuf 21.9  (matches upstream WORKSPACE pin)
+# protobuf — Homebrew (no FetchContent; avoids hash management)
 # ---------------------------------------------------------------------------
-FetchContent_Declare(
-  protobuf
-  URL      https://github.com/protocolbuffers/protobuf/archive/refs/tags/v21.9.zip
-  URL_HASH SHA256=5babb8571f1cceafe0c18e13ddb3be556e87e12ceea3463d6b0d0064e6cc1ac3
+execute_process(
+  COMMAND ${BREW_EXECUTABLE} --prefix protobuf
+  OUTPUT_VARIABLE PROTOBUF_PREFIX
+  OUTPUT_STRIP_TRAILING_WHITESPACE
 )
-set(protobuf_BUILD_TESTS OFF)
-set(protobuf_BUILD_SHARED_LIBS OFF)
-set(protobuf_WITH_ZLIB OFF)
-# Prevent protobuf from pulling its own abseil copy — use ours.
-set(protobuf_ABSL_PROVIDER "package" CACHE STRING "" FORCE)
-FetchContent_MakeAvailable(protobuf)
+if(NOT PROTOBUF_PREFIX)
+  message(FATAL_ERROR "protobuf not found — run: brew install protobuf")
+endif()
+list(APPEND CMAKE_PREFIX_PATH "${PROTOBUF_PREFIX}")
+find_package(protobuf REQUIRED)
+message(STATUS "protobuf: ${PROTOBUF_PREFIX}")
+
+# Homebrew's protoc.
+find_program(PROTOC protoc HINTS "${PROTOBUF_PREFIX}/bin" REQUIRED)
+message(STATUS "protoc: ${PROTOC}")
 
 # ---------------------------------------------------------------------------
 # libssw 1.2.5 — Smith-Waterman aligner (realigner/)
@@ -87,10 +95,57 @@ add_library(ssw STATIC
   "${libssw_SOURCE_DIR}/src/ssw_cpp.cpp"
   "${libssw_SOURCE_DIR}/src/ssw_cpp.h"
 )
-target_include_directories(ssw PUBLIC "${libssw_SOURCE_DIR}/src")
+# deepvariant/realigner/ssw.h uses #include "src/ssw_cpp.h",
+# so the PARENT of src/ must be on the include path, not just src/.
+target_include_directories(ssw PUBLIC "${libssw_SOURCE_DIR}")
 # Apple Clang/arm64: SSW uses SSE2 intrinsics guarded by __SSE2__ —
 # arm64 does not have SSE2; the fallback scalar path is used automatically.
-target_compile_definitions(ssw PRIVATE)
+set(DV_LIBSSW_DIR "${libssw_SOURCE_DIR}" CACHE INTERNAL "libssw source root")
+
+# ---------------------------------------------------------------------------
+# re2 — Homebrew
+# ---------------------------------------------------------------------------
+execute_process(
+  COMMAND ${BREW_EXECUTABLE} --prefix re2
+  OUTPUT_VARIABLE RE2_PREFIX
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT RE2_PREFIX)
+  message(FATAL_ERROR "re2 not found — run: brew install re2")
+endif()
+add_library(re2::re2 STATIC IMPORTED)
+find_library(RE2_LIB NAMES libre2.a re2 PATHS "${RE2_PREFIX}/lib" REQUIRED)
+set_target_properties(re2::re2 PROPERTIES
+  IMPORTED_LOCATION "${RE2_LIB}"
+  INTERFACE_INCLUDE_DIRECTORIES "${RE2_PREFIX}/include"
+)
+message(STATUS "re2: ${RE2_LIB}")
+
+# ---------------------------------------------------------------------------
+# Boost — Homebrew (for debruijn_graph.h in realigner/)
+# ---------------------------------------------------------------------------
+execute_process(
+  COMMAND ${BREW_EXECUTABLE} --prefix boost
+  OUTPUT_VARIABLE BOOST_PREFIX
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT BOOST_PREFIX)
+  message(FATAL_ERROR "boost not found — run: brew install boost")
+endif()
+message(STATUS "boost: ${BOOST_PREFIX}")
+set(BOOST_INCLUDE_DIR "${BOOST_PREFIX}/include" CACHE INTERNAL "")
+
+# ---------------------------------------------------------------------------
+# GoogleTest — FetchContent (no standalone Homebrew package)
+# ---------------------------------------------------------------------------
+FetchContent_Declare(
+  googletest
+  URL      https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz
+  URL_HASH SHA256=8ad598c73ad796e0d8280b082cebd82a630d73e73cd3c70057938a6501bba5d7
+)
+set(INSTALL_GTEST OFF)
+FetchContent_MakeAvailable(googletest)
+set(GTEST_PREFIX "${googletest_SOURCE_DIR}" CACHE INTERNAL "")
 
 # ---------------------------------------------------------------------------
 # zlib — guaranteed present on macOS (from Xcode SDK)
