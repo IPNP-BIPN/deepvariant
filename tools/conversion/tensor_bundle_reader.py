@@ -303,6 +303,22 @@ class TensorBundle:
         )
         return self.prefix.parent / name
 
+    def read_raw(self, name: str) -> bytes:
+        """Return the raw bytes of a bundle entry (no dtype interpretation)."""
+        if name not in self.entries:
+            raise KeyError(f"variable {name!r} not in bundle")
+        e = self.entries[name]
+        path = self.shard_path(e.shard_id)
+        with open(path, "rb") as f:
+            f.seek(e.offset)
+            raw = f.read(e.size)
+        if len(raw) != e.size:
+            raise RuntimeError(
+                f"truncated read of {name} from {path}: "
+                f"want {e.size} bytes, got {len(raw)}"
+            )
+        return raw
+
     def read_tensor(self, name: str) -> np.ndarray:
         if name not in self.entries:
             raise KeyError(f"variable {name!r} not in bundle")
