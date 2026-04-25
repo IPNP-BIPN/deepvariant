@@ -19,6 +19,7 @@ build-*/
 tools/conversion/venv-*/
 tools/conversion/.cache/
 tools/conversion/models/
+tools/conversion/Generated/
 tools/reference/cache/
 tools/reference/output/
 benchmarks/runs/
