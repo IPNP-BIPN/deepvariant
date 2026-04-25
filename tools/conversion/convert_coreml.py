@@ -37,8 +37,8 @@ except ImportError as exc:
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Generated"))
 
-from tensor_bundle_reader import TensorBundle
-import inception_v3_mil as iv3
+from tensor_bundle_reader import TensorBundle  # noqa: E402
+import inception_v3_mil as iv3  # noqa: E402
 
 
 _COMPUTE_UNITS = {
@@ -73,7 +73,10 @@ def convert(
     prog = iv3.build_program(bundle, batch_min=batch_min, batch_max=batch_max)
     print(f"  done in {time.time()-t0:.1f}s")
 
-    print(f"coremltools.convert  (compute_units={compute_units}, target={target})")
+    print(
+        f"coremltools.convert  "
+        f"(compute_units={compute_units}, target={target})"
+    )
     t0 = time.time()
     mlmodel = ct.convert(
         prog,
@@ -109,7 +112,7 @@ def main() -> int:
     p.add_argument(
         "--bundle",
         required=True,
-        help="prefix for the TensorBundle, e.g. models/wgs/variables/variables",
+        help="TensorBundle prefix, e.g. models/wgs/variables/variables",
     )
     p.add_argument("--output", required=True, help="output .mlpackage path")
     p.add_argument(
