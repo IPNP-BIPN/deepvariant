@@ -12,21 +12,22 @@ Running log: `PORT_LOG.md`.
 ## Hard constraints (non-negotiable)
 
 - macOS ≥ 14, arm64 only.
-- No Docker / no Rosetta / no CUDA / no embedded Python interpreter shipped to the user.
+- No Docker / no Rosetta / no CUDA at runtime. **No Python anywhere in the project we add** (Voie A strict — dev-time tools are Swift/C++, not Python).
 - Build is reproducible. User installs in one Homebrew command, no compilation on their box.
-- **Scientific accuracy preserved**: SNP F1 ≥ reference − 0.05 %, INDEL F1 ≥ reference − 0.10 %.
+- **Scientific accuracy preserved**: SNP F1 ≥ reference − 0.05 %, INDEL F1 ≥ reference − 0.10 %. Argmax 100 % agreement on the 1000-example Phase 0 bench. Max-abs softmax ≤ 1e-3.
 - **GPU truly engaged**: verified by `powermetrics --samplers gpu_power,ane_power` showing non-zero residency.
-- **Speedup ≥ 2.5×** vs published Linux x86 reference.
+- **Speedup ≥ 2.5×** vs published Linux x86 reference (`call_variants` stage, Phase 0 gate).
 
 ## Working rules
 
-1. **Test before commit.** Every commit must leave the build green: `cmake --build build && ctest -V` (after Phase 1) or, for Phase 0, the conversion + parity-check scripts must run end-to-end.
+1. **Test before commit.** Every commit must leave the build green: `swift build && swift test` in `tools/conversion/` for Phase 0 work; `cmake --build build && ctest -V` for Phases 1+.
 2. **Never degrade scientific precision.** F1 thresholds are gates, not goals. If we slip below, we fix the root cause — we do not lower the bar.
 3. **Never bypass an error.** No `--no-verify`, no swallowed exceptions, no commenting out of failing tests. Diagnose the root cause.
 4. **Document every critical decision** in `PORT_LOG.md` with date, context, alternatives considered, and rationale.
 5. **Don't touch the v1 worktree** at `/Users/benjamin/projects/deepvariant-apple-silicon/.worktrees/apple-silicon-native/`. v1 is a separate clone retained as research; v2 is its own fresh history.
-6. **Don't modify upstream `BUILD` / Bazel rules.** They stay as a Linux/Bazel reference. v2 builds via CMake on macOS only.
-7. **No half-finished implementations.** Each phase has a success gate; do not cross it without meeting the gate.
+6. **Don't modify upstream `BUILD` / Bazel rules or upstream Python files.** They stay as a Linux/Bazel reference. v2 builds via CMake on macOS only and contains zero Python files of our own.
+7. **No half-finished implementations.** Each phase has a success gate; do not cross it without meeting the gate. Stubs are allowed but must error out with `not yet implemented` rather than silently no-op.
+8. **No Python in our code, ever.** All dev-time tooling is Swift (`tools/conversion/`, a Swift Package) or shell (`tools/reference/`, `release/`). The only Python in the repo is upstream's pre-existing tools/*.py from r1.10 — left untouched.
 
 ## Stop conditions (per spec)
 
@@ -52,13 +53,14 @@ If any of the following happen, stop, write a report in `PORT_LOG.md`, and surfa
 
 ## Pitfalls already known (mine before re-discovering)
 
-- **TF 2.20 + coremltools 9 hangs** during WGS SavedModel conversion (21 min / 3 GB RSS). Pin TF 2.16.x in the conversion venv.
-- **tensorflow-metal 1.2.0** is frozen at TF 2.16; M-series ReLU bugs reported. Include in bench, expect to lose.
-- **ANE prefers 4-channel image-shaped tensors.** Our model is 7- or 12-channel. ANE may refuse — accept GPU-only fallback.
-- **Metal compute is not bitwise reproducible** across some ops/reboots. Validate via softmax tolerance (≤1e-3) + argmax agreement, not bit-equality.
+- **`tensorflow-metal` is dead** — unmaintained since mid-2024, frozen at TF 2.16, M-series ReLU bugs. Dropped from the v2 bench.
+- **TensorFlow is banned in our venvs.** `setup_venvs.sh` enforces `import tensorflow` failing. SavedModel reading uses a pure-protobuf parser in `tools/conversion/savedmodel_reader.py` (vendored TF `.proto` files compiled via `protoc --python_out`). Core ML emit goes through PyTorch (`coremltools.convert(traced_torch_model, source="pytorch")`) instead of the TF path.
+- **ANE prefers 4-channel image-shaped tensors.** Our model is 7- or 12-channel. ANE may refuse — accept GPU-only fallback. Core ML's `.all` compute units do this fallback automatically op-by-op.
+- **Metal compute is not bitwise reproducible** across some ops/reboots. Validate via softmax tolerance (≤1e-3) + argmax agreement (100 %), not bit-equality.
 - **`build-prereq.sh` is Linux-only.** v2 ships `scripts/build-prereq-macos.sh`.
 - **8.5 GB of model artifacts** can't fit in a single Homebrew bottle alongside the binary. Split into `deepvariant-models` formula.
 - **Xcode CLT is enough — no full Xcode required.** Ship `.mlpackage` uncompiled; runtime compiles on first load via `MLModel compileModelAtURL:error:`. Avoid `xcrun coremlcompiler` (full Xcode only).
+- **TF v2 checkpoint format** (the `variables/variables.{index, data-*}` layout) is documented at `tensorflow/core/util/tensor_bundle/tensor_bundle.h` — we replicate `BundleReader` in pure Python.
 
 ## Key file paths
 
@@ -67,10 +69,10 @@ If any of the following happen, stop, write a report in `PORT_LOG.md`, and surfa
 - v1 reference clone: `/Users/benjamin/projects/deepvariant-apple-silicon/.worktrees/apple-silicon-native/` (read-only)
 - Native runtime (Phases 2-3): `deepvariant/native/`
 - Build (Phase 1): `CMakeLists.txt` + `cmake/*.cmake`
-- Conversion (Phase 0, dev-time): `tools/conversion/`
-- Linux ref capture (Phase 0): `tools/reference/`
-- Release tooling (Phase 5): `release/`
-- Homebrew formulas (Phase 6): separate repo `homebrew-deepvariant/`
+- Conversion (Phase 0, dev-time, Swift Package): `tools/conversion/` — produces the `dv-tools` CLI.
+- Linux ref capture (Phase 0): `tools/reference/` (shell + Docker, no Python).
+- Release tooling (Phase 5): `release/` (shell + `codesign` + `xcrun notarytool`).
+- Homebrew formulas (Phase 6): separate repo `homebrew-deepvariant/`.
 
 ## Reused upstream C++ (do not rewrite)
 
