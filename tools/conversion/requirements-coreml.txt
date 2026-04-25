@@ -1,17 +1,9 @@
-# Phase 0 Voie A — Core ML conversion venv (TF-free)
+# Phase 0 Voie A — Core ML conversion venv (TF-free, PyTorch-free)
 #
-# We bridge the SavedModel via PyTorch + torchvision instead of TF.
-# coremltools accepts a traced PyTorch model (`source="pytorch"`) without
-# importing tensorflow.
-#
-# SavedModel reading is done via `dv-tools` Python helpers under
-# Sources/savedmodel_reader.py (planned), which generate Python from
-# TF's public .proto files via protoc — no TF runtime.
-torch==2.4.1
-torchvision==0.19.1
+# MIL path: weights come from TensorBundle directly as numpy arrays,
+# coremltools builds the MLProgram from a mb.program() description.
+# No TensorFlow, no PyTorch, no ONNX needed.
 coremltools==7.2
 numpy<2
 protobuf==4.25.3
-absl-py==2.1.0
 google-crc32c==1.5.0
-safetensors>=0.4.5
