@@ -8,7 +8,7 @@ Source: <https://github.com/tensorflow/tensorflow>
 Branch: `r2.16` (matches the TF version that DeepVariant 1.10 SavedModels were written by).
 Fetched: 2026-04-25.
 
-Files (25):
+Files (26 — `error_codes.proto` and `debug_event.proto` were dropped because they pull in `tsl/protobuf/error_codes.proto` from a separate Google package, and neither is needed for SavedModel parsing):
 
 ```text
 core/framework/allocation_description.proto
@@ -18,6 +18,7 @@ core/framework/device_attributes.proto
 core/framework/full_type.proto
 core/framework/function.proto
 core/framework/graph.proto
+core/framework/graph_debug_info.proto
 core/framework/node_def.proto
 core/framework/op_def.proto
 core/framework/resource_handle.proto
@@ -25,13 +26,13 @@ core/framework/step_stats.proto
 core/framework/tensor.proto
 core/framework/tensor_description.proto
 core/framework/tensor_shape.proto
+core/framework/tensor_slice.proto
 core/framework/types.proto
 core/framework/variable.proto
 core/framework/versions.proto
-core/protobuf/debug_event.proto
-core/protobuf/error_codes.proto
 core/protobuf/meta_graph.proto
 core/protobuf/saved_model.proto
+core/protobuf/saved_object_graph.proto
 core/protobuf/saver.proto
 core/protobuf/struct.proto
 core/protobuf/tensor_bundle.proto
@@ -55,12 +56,23 @@ Python bindings are generated under `tools/conversion/Generated/` (gitignored):
 
 ```sh
 cd tools/conversion
+rm -rf Generated && mkdir Generated
 protoc --python_out=Generated/ \
-       --proto_path=Protos/tensorflow \
-       Protos/tensorflow/core/**/*.proto
+       --proto_path=Protos \
+       $(cd Protos && find tensorflow -name '*.proto')
+touch Generated/__init__.py
 ```
 
-Bindings are regenerated on demand by `setup_venvs.sh` (TBD).
+After generation, the `tensorflow.core.protobuf.*_pb2` and `tensorflow.core.framework.*_pb2` modules become importable when `Generated/` is on the Python path:
+
+```python
+import sys; sys.path.insert(0, "tools/conversion/Generated")
+from tensorflow.core.protobuf import saved_model_pb2, tensor_bundle_pb2
+```
+
+The proto_path must be the parent of `tensorflow/`, not `tensorflow/` itself, because the proto files use absolute-style imports like `import "tensorflow/core/framework/graph.proto"`.
+
+Bindings are regenerated on demand by `setup_venvs.sh` (or the snippet above).
 
 ## Why we vendor instead of pip-install
 

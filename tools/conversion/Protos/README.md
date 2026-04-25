@@ -1,31 +1,20 @@
 # Vendored TF `.proto` files (TF-free SavedModel reading)
 
-(Empty in this scaffold commit.)
+25 `.proto` files vendored from `tensorflow/r2.16` (Apache-2.0). See `SOURCES.md` for the exact list, the upstream branch, and the re-fetch commands.
 
-To enable the TF-free SavedModel reader in `savedmodel_reader.py`, vendor these public protobuf schemas verbatim from `github.com/tensorflow/tensorflow` at `r2.16` (Apache-2.0):
+The vendored set is just the schema definitions — no TensorFlow runtime, no Python TF package. We compile them with system `protoc --python_out=Generated/` and import the resulting `*_pb2` modules from `savedmodel_reader.py`.
 
-```
-Protos/tensorflow/core/protobuf/saved_model.proto
-Protos/tensorflow/core/protobuf/meta_graph.proto
-Protos/tensorflow/core/framework/graph.proto
-Protos/tensorflow/core/framework/node_def.proto
-Protos/tensorflow/core/framework/attr_value.proto
-Protos/tensorflow/core/framework/tensor.proto
-Protos/tensorflow/core/framework/tensor_shape.proto
-Protos/tensorflow/core/framework/types.proto
-Protos/tensorflow/core/framework/op_def.proto
-Protos/tensorflow/core/framework/function.proto
-Protos/tensorflow/core/framework/versions.proto
-Protos/tensorflow/core/framework/resource_handle.proto
-Protos/tensorflow/core/framework/variable.proto
-Protos/tensorflow/core/util/tensor_bundle/tensor_bundle.proto
-```
-
-Then generate Python bindings (no TF runtime):
+## Generate Python bindings
 
 ```sh
-brew install protobuf
-protoc --python_out=Generated/ -I=Protos/tensorflow Protos/tensorflow/...
+cd tools/conversion
+mkdir -p Generated
+protoc --python_out=Generated/ \
+       --proto_path=Protos/tensorflow \
+       $(find Protos/tensorflow -name '*.proto')
+touch Generated/__init__.py
 ```
 
-`SOURCES.md` (next to this file) records the exact upstream commit hash for each vendored file.
+After generation, all `core/protobuf/*.proto` are accessible as `core.protobuf.*_pb2`, and `core/framework/*.proto` as `core.framework.*_pb2`.
+
+The `Generated/` directory is `.gitignore`d — bindings are regenerated on every `setup_venvs.sh` run.

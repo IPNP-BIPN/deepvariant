@@ -59,4 +59,16 @@ setup_venv() {
 setup_venv coreml
 setup_venv mlx
 
+echo "==> generating Python protobuf bindings under Generated/"
+if ! command -v protoc >/dev/null 2>&1; then
+  echo "error: protoc not found. brew install protobuf" >&2
+  exit 1
+fi
+rm -rf Generated
+mkdir -p Generated
+( cd Protos && protoc --python_out=../Generated -I=. \
+    $(find tensorflow -name '*.proto') )
+touch Generated/__init__.py
+echo "==> generated $(find Generated -name '*_pb2.py' | wc -l | tr -d ' ') Python modules"
+
 echo "==> both venvs ready (TF-free)"
