@@ -24,5 +24,6 @@ function(phase1_test name src lib)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-phase1_test(nucleus_io_smoke  nucleus_io_smoke_test.cc  nucleus_io)
-phase1_test(realigner_smoke   realigner_smoke_test.cc   realigner)
+phase1_test(nucleus_io_smoke      nucleus_io_smoke_test.cc      nucleus_io)
+phase1_test(realigner_smoke       realigner_smoke_test.cc       realigner)
+phase1_test(call_variants_smoke   call_variants_smoke_test.cc   dv_call_variants_lib)
