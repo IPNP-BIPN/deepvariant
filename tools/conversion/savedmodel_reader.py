@@ -154,19 +154,18 @@ class SavedModelReader:
     def weights(self) -> dict[str, Any]:
         """Read variable tensors from variables/variables.{index, data-*}.
 
-        STUB. Implementation requires a TensorBundle / SSTable reader —
-        see tensorflow/core/util/tensor_bundle/tensor_bundle.h. Planned in
-        a follow-up commit; ~250 LOC for footer + block + record parsing.
+        Returns a dict mapping variable name (e.g. ``conv2d_1/kernel``) to
+        a numpy.ndarray with the original dtype + shape. No TF runtime —
+        uses the in-tree TensorBundle reader.
         """
         idx = self.directory / "variables" / "variables.index"
         if not idx.exists():
             raise FileNotFoundError(f"{idx} not found")
 
-        raise NotImplementedError(
-            "TensorBundle SSTable reader not yet implemented. "
-            "Format: tensorflow/core/util/tensor_bundle/tensor_bundle.h. "
-            f"Found {idx}."
-        )
+        from tensor_bundle_reader import TensorBundle
+
+        bundle = TensorBundle(self.directory / "variables" / "variables")
+        return {name: bundle.read_tensor(name) for name in bundle.names()}
 
 
 # ---------------------------------------------------------------------------
