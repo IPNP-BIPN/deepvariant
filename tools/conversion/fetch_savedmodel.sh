@@ -17,12 +17,15 @@ fi
 mkdir -p "${DST}/variables"
 
 # Public bucket; HTTPS works without credentials.
-BASE="https://storage.googleapis.com/deepvariant/models/DeepVariant/1.10.0/${NAME}"
+# Path pattern (from upstream Dockerfile, line 47-50):
+#   gs://deepvariant/models/DeepVariant/<VERSION>/savedmodels/deepvariant.<NAME>.savedmodel/<file>
+DV_VERSION="${DV_VERSION:-1.10.0}"
+BASE="https://storage.googleapis.com/deepvariant/models/DeepVariant/${DV_VERSION}/savedmodels/deepvariant.${NAME}.savedmodel"
 
-# Standard SavedModel layout. Some files are optional depending on TF version.
 FILES=(
   "saved_model.pb"
   "fingerprint.pb"
+  "model.example_info.json"
   "variables/variables.data-00000-of-00001"
   "variables/variables.index"
 )
@@ -32,20 +35,17 @@ for f in "${FILES[@]}"; do
   out="${DST}/${f}"
   echo "==> fetching ${url}"
   if ! curl -fL --retry 3 --connect-timeout 15 -o "${out}" "${url}"; then
-    if [[ "${f}" == "fingerprint.pb" ]]; then
-      echo "    (fingerprint.pb optional, skipping)"
-      rm -f "${out}"
-    else
-      echo "error: failed to fetch ${url}" >&2
-      exit 1
-    fi
+    case "${f}" in
+      fingerprint.pb|model.example_info.json)
+        echo "    (${f} optional, skipping)"
+        rm -f "${out}"
+        ;;
+      *)
+        echo "error: failed to fetch ${url}" >&2
+        exit 1
+        ;;
+    esac
   fi
-done
-
-# Some bundles include an example_info.json or assets — try to grab them but don't fail.
-for opt in "example_info.json" "assets/extra_options.json"; do
-  curl -fL --retry 1 --connect-timeout 5 -o "${DST}/${opt}" \
-    "${BASE}/${opt}" 2>/dev/null || true
 done
 
 echo "==> ${NAME} SavedModel ready at ${DST}"

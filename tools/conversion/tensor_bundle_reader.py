@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import struct
 import sys
-import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -101,11 +100,66 @@ def _read_footer(path: Path) -> tuple[BlockHandle, BlockHandle]:
 # Block reader
 # ---------------------------------------------------------------------------
 
+def _snappy_decompress(data: bytes) -> bytes:
+    """Pure-Python Snappy decompressor.
+
+    Format: varint uncompressed_length, then a stream of tag-prefixed
+    sub-blocks. Tag bits 0-1 = element type:
+        0b00 LITERAL   ((tag>>2)+1 bytes; or extended for ≥60)
+        0b01 COPY_1    1-byte offset (high 3 bits in tag)
+        0b10 COPY_2    2-byte LE offset
+        0b11 COPY_4    4-byte LE offset
+    See google/snappy/blob/main/format_description.txt.
+    """
+    expected_len, i = _read_varint(data, 0)
+    out = bytearray()
+    n = len(data)
+    while i < n:
+        tag = data[i]
+        i += 1
+        kind = tag & 0x3
+        if kind == 0:  # LITERAL
+            ln = tag >> 2
+            if ln < 60:
+                ln += 1
+            else:
+                extra = ln - 59  # 1, 2, 3 or 4
+                ln = (
+                    int.from_bytes(data[i:i + extra], "little") + 1
+                )
+                i += extra
+            out += data[i:i + ln]
+            i += ln
+        else:
+            if kind == 1:  # COPY_1
+                ln = ((tag >> 2) & 0x7) + 4
+                offset = ((tag >> 5) << 8) | data[i]
+                i += 1
+            elif kind == 2:  # COPY_2
+                ln = (tag >> 2) + 1
+                offset = int.from_bytes(data[i:i + 2], "little")
+                i += 2
+            else:  # COPY_4
+                ln = (tag >> 2) + 1
+                offset = int.from_bytes(data[i:i + 4], "little")
+                i += 4
+            # Snappy may copy past current end (overlapping copy);
+            # naive byte-by-byte handles that correctly.
+            base = len(out) - offset
+            for k in range(ln):
+                out.append(out[base + k])
+    if len(out) != expected_len:
+        raise RuntimeError(
+            f"snappy: decoded {len(out)} bytes, expected {expected_len}"
+        )
+    return bytes(out)
+
+
 def _read_block(path: Path, handle: BlockHandle) -> bytes:
     """Read the data portion of a block (drops the 5-byte type+CRC trailer).
 
-    No CRC verification (dev tool). No snappy decompression — TF's
-    TensorBundle writes uncompressed blocks; we error out on snappy.
+    No CRC verification (dev tool). Supports uncompressed + snappy —
+    TF tensor bundles default to snappy.
     """
     with open(path, "rb") as f:
         f.seek(handle.offset)
@@ -119,10 +173,7 @@ def _read_block(path: Path, handle: BlockHandle) -> bytes:
     if comp_type == _NO_COMPRESSION:
         return body
     if comp_type == _SNAPPY_COMPRESSION:
-        raise NotImplementedError(
-            "snappy-compressed bundle blocks are not supported "
-            "(TF tensor bundles default to uncompressed)"
-        )
+        return _snappy_decompress(body)
     raise RuntimeError(f"unknown block compression type {comp_type}")
 
 
@@ -188,7 +239,13 @@ class TensorEntry:
 
 
 class TensorBundle:
-    """A read-only view of a TF tensor bundle (one .index + N .data shards)."""
+    """A read-only view of a TF tensor bundle (one .index + N .data shards).
+
+    The .index file is a leveldb-format table:
+        footer -> index_block -> data_block(s) -> records
+    The records' keys are variable names (UTF-8) or empty (== header).
+    Records' values are serialized BundleEntryProto / BundleHeaderProto.
+    """
 
     def __init__(self, prefix: str | Path) -> None:
         self.prefix = Path(prefix)
@@ -203,34 +260,36 @@ class TensorBundle:
         )
         self._tb_pb = tensor_bundle_pb2
 
-        # Read the footer + iterate the index block to get all entries.
         _, index_handle = _read_footer(index_path)
         index_block = _read_block(index_path, index_handle)
 
-        # In TF tensor bundles, the index block contains records where
-        # key = variable name (or empty for the BundleHeaderProto entry)
-        # value = BundleEntryProto serialized
         self.header = None
         self.entries: dict[str, TensorEntry] = {}
-        for key, value in _iterate_block(index_block):
-            if not key:
-                # Empty key = the BundleHeaderProto.
-                hdr = tensor_bundle_pb2.BundleHeaderProto()
-                hdr.ParseFromString(value)
-                self.header = hdr
-                continue
-            entry = tensor_bundle_pb2.BundleEntryProto()
-            entry.ParseFromString(value)
-            name = key.decode("utf-8")
-            shape = tuple(d.size for d in entry.shape.dim)
-            self.entries[name] = TensorEntry(
-                name=name,
-                dtype=entry.dtype,
-                shape=shape,
-                shard_id=entry.shard_id,
-                offset=entry.offset,
-                size=entry.size,
-            )
+
+        # The index block's records each map a "largest key in the data
+        # block" -> BlockHandle (encoded as two varints) of that data block.
+        # Iterate each data block and collect the actual records.
+        for _largest_key, handle_bytes in _iterate_block(index_block):
+            data_handle, _ = _decode_block_handle(handle_bytes, 0)
+            data_block = _read_block(index_path, data_handle)
+            for key, value in _iterate_block(data_block):
+                if not key:
+                    hdr = tensor_bundle_pb2.BundleHeaderProto()
+                    hdr.ParseFromString(value)
+                    self.header = hdr
+                    continue
+                entry = tensor_bundle_pb2.BundleEntryProto()
+                entry.ParseFromString(value)
+                name = key.decode("utf-8")
+                shape = tuple(d.size for d in entry.shape.dim)
+                self.entries[name] = TensorEntry(
+                    name=name,
+                    dtype=entry.dtype,
+                    shape=shape,
+                    shard_id=entry.shard_id,
+                    offset=entry.offset,
+                    size=entry.size,
+                )
 
         if self.header is None:
             raise RuntimeError(
@@ -276,8 +335,3 @@ def open_bundle(prefix: str | Path) -> TensorBundle:
     return TensorBundle(prefix)
 
 
-# ---------------------------------------------------------------------------
-# Internal: silence the unused-import warning from `zlib` if we never need
-# CRC verification. Keep it imported so future verify-CRC can land easily.
-# ---------------------------------------------------------------------------
-_ = zlib
