@@ -557,3 +557,76 @@ The deliverable that's actually shippable today: a Mac arm64 binary
 that runs DeepVariant WGS single-sample with bit-identical inference
 to upstream and ~84 % VCF call agreement on the chr20:5M–6M fixture.
 That's a milestone, not a release.
+
+### Postprocess at 99.93% bit-parity vs upstream (2026-04-26 evening)
+
+**Big win**: when given upstream's exact CVOs as input, our postprocess
+now produces 2965/2967 = 99.93% identical VCF lines vs upstream's
+final VCF on the chr20:5000000-6000000 fixture.
+
+Three upstream-matching ports landed in `postprocess_main.cc`:
+
+1. **NoCall rewrite** (mirror of `uncall_homref_gt_if_lowqual`): CNN
+   RefCalls with GQ < `cnn_homref_call_min_gq` (default 20.0) become
+   "./.": NoCall instead of "0/0": RefCall.
+
+2. **GQ formula fix**: was `phred(second_best_likelihood)`, now matches
+   upstream `compute_quals`:
+     gq = round(-10 · log10(1 - P(called_genotype)))
+   The previous formula gave 1 phred too high at the NoCall boundary.
+
+3. **Alt-allele pruning** (`get_alt_alleles_to_remove` + `prune_alleles`):
+   per-alt CVO QUAL = phred(P(0/0)); alts with QUAL < qual_filter
+   (default 1.0) are dropped. Combined-likelihood vector is masked +
+   renormalised so pruned alts can't be picked. Critical for
+   multi-allelic sites where one alt is a clear false positive.
+
+Bug fixed during the alt-pruning port: previously rebuilt the Variant
+proto from scratch on prune, losing `variant.calls[]` (which carries
+DP/AD/VAF in `call.info`). Now mutates `alternate_bases` in place.
+
+### Remaining 13.6% gap on full native pipeline
+
+End-to-end (our make_examples → our call_variants → our postprocess) on
+the same 1 Mb fixture: 2564 / 2967 = 86.4% match upstream. The
+postprocess is at 99.93% on identical input, so the gap is entirely
+in **make_examples**: our realigner emits ~321 candidates that
+upstream's realigner doesn't (different DBG haplotype enumeration or
+FastPassAligner alignment scoring). Closing this needs the upstream
+realigner.py orchestration ported byte-for-byte (~3-5 days of careful
+side-by-side work, comparing intermediates after each step).
+
+### Scaffolding committed for v1.0 release path
+
+- `release/sign.sh`           — codesign with Developer ID
+- `release/notarize.sh`       — Apple notarytool submit + staple
+- `release/build_release.sh`  — one-shot clean + cmake + ctest + sign
+- `release/homebrew/deepvariant.rb`         — bottle-only formula
+- `release/homebrew/deepvariant-models.rb`  — separate models formula
+- `validation/run_giab.sh`    — hap.py F1 runner against GIAB truth
+
+These are scripts and templates only — none have been run end-to-end
+yet (need a Developer ID + bottle hashes + GIAB hap.py Docker).
+
+### What's still missing for v1.0
+
+After this commit, the still-open items from the plan's v1.0 list:
+
+| item | state | effort |
+| ---- | ---- | ---- |
+| DeepTrio orchestration (3-BAM make_examples) | ❌ not started; .mlpackage models converted | 1 wk |
+| DeepSomatic orchestration (tumor + normal)   | ❌ not started; .mlpackage models converted | 1-2 wk |
+| Pangenome (12-channel, GBZ reader)            | ❌ not started | 1 wk |
+| `--output_gvcf` reference blocks              | ❌ flag declared, no impl | 3 d |
+| DirectPhasing wired in                         | ❌ C++ lib compiled, not used | 3 d |
+| Alt-aligned pileup (PacBio/ONT mode)            | ❌ disabled by default | 2 d |
+| Methylation channels                          | ❌ disabled | 2 d |
+| GIAB hap.py F1 validation (run, not script)   | ❌ script written, never run | 1 wk |
+| Code signing (sign + notarize execution)       | ⏳ scripts ready | 2 d (depends on cert) |
+| Homebrew bottles (build + publish)            | ⏳ formulas ready | 2 d |
+| Virgin-machine M1/M2/M3/M4 matrix              | ❌ not started | 2 d |
+| Full chr20 validation (whole chromosome)        | ❌ only tested 1 Mb | 1 d run |
+| Realigner port to close 86.4 % → 99 %+         | ❌ understood, not done | 3-5 d |
+
+Total: 5-8 person-weeks more. Today we have a solid scaffold + WGS
+single-sample at 86 % VCF match + every postprocess gate at 99.93 %.
