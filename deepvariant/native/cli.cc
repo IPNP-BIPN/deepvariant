@@ -80,10 +80,18 @@ int RunAll(int argc, char** argv) {
     return 1;
   }
 
-  const std::string examples_pattern =
-      absl::StrCat(tmp_dir, "/examples.tfrecord@", num_shards);
-  const std::string cvo_pattern =
-      absl::StrCat(tmp_dir, "/cvo.tfrecord@", num_shards);
+  // For num_shards == 1 we use a plain path (no @1 suffix); for >1 shards
+  // make_examples writes to one file per task_id and the shard expansion
+  // happens later by convention "path-NNNNN-of-NNNNN".
+  std::string examples_pattern;
+  std::string cvo_pattern;
+  if (num_shards <= 1) {
+    examples_pattern = absl::StrCat(tmp_dir, "/examples.tfrecord");
+    cvo_pattern     = absl::StrCat(tmp_dir, "/cvo.tfrecord");
+  } else {
+    examples_pattern = absl::StrCat(tmp_dir, "/examples.tfrecord@", num_shards);
+    cvo_pattern     = absl::StrCat(tmp_dir, "/cvo.tfrecord@",      num_shards);
+  }
   const std::string model_path = ModelPath(model_type);
 
   // ── Stage 1: make_examples ────────────────────────────────────────────────
