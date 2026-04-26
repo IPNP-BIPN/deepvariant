@@ -52,6 +52,29 @@ If any of the following happen, stop, write a report in `PORT_LOG.md`, and surfa
 - After **Phase 3** first end-to-end native run — first real VCF produced.
 - After **Phase 4** validation — release go/no-go.
 
+## Where the project actually stands (rolling status)
+
+Phases 0–2 done. Phase 3 has shippable WGS single-sample only. Phases 4–7
+not started. Honest backlog tracked in `PORT_LOG.md` under the
+"Honest assessment" section. Each item below has a real (not hand-wavy)
+effort estimate:
+
+- DeepTrio orchestration (3-BAM make_examples, 6-channel pileup): ~1 wk
+- DeepSomatic orchestration (tumor + normal, somatic filtering): ~1-2 wk
+- Pangenome-aware (12-channel + GBZ reader): ~1 wk
+- gVCF blocks (`--output_gvcf` impl): ~3 d
+- DirectPhasing wired in: ~3 d
+- Alt-aligned pileup (PacBio/ONT): ~2 d
+- Methylation channels: ~2 d
+- GIAB hap.py F1 validation: ~1 wk
+- Code signing + notarization scripts: ~2 d
+- Homebrew formulas (`deepvariant`, `deepvariant-models`): ~2 d
+- Virgin-machine M1/M2/M3/M4 matrix: ~2 d
+- Closing the WGS chr20 16% VCF delta to >99%: ~1 wk
+
+A claim "near release-ready" requires those gates met, not just a
+working WGS pipeline at 84% match.
+
 ## Pitfalls already known (mine before re-discovering)
 
 - **`tensorflow-metal` is dead** — unmaintained since mid-2024, frozen at TF 2.16, M-series ReLU bugs. Dropped from the v2 bench.
