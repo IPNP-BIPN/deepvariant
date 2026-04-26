@@ -180,6 +180,29 @@ target_link_libraries(dump_cvo PRIVATE
 )
 
 # ---------------------------------------------------------------------------
+# dump_allele_counts — dev-only AlleleCount dumper.
+# Useful for diffing per-position ref/alt counts between our pipeline
+# and upstream during candidate-set parity work.
+# ---------------------------------------------------------------------------
+add_executable(dump_allele_counts
+  "${CMAKE_CURRENT_SOURCE_DIR}/dump_allele_counts_main.cc"
+)
+target_include_directories(dump_allele_counts PRIVATE ${ME_INCLUDE_DIRS})
+target_compile_options(dump_allele_counts PRIVATE ${ME_COMPILE_OPTS})
+target_link_libraries(dump_allele_counts PRIVATE
+  dv_allelecounter
+  proto_dv
+  proto_nucleus
+  nucleus_io
+  absl::log
+  absl::strings
+  absl::hash
+  absl::flat_hash_map
+  absl::flat_hash_set
+  absl::raw_hash_set
+)
+
+# ---------------------------------------------------------------------------
 # deepvariant — main binary (CLI dispatcher)
 # ---------------------------------------------------------------------------
 add_executable(deepvariant
