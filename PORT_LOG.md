@@ -494,3 +494,66 @@ choice; ANE is then off, but the GPU is.
 The 16 % residual gap is in pre-/post-processing (realigner FP rate,
 RefCall emission threshold for low-VAF candidates), not in the
 inference path. Each remaining gap is documented above.
+
+### Honest assessment — what's done vs what's left (2026-04-26 final)
+
+After the user pushed back ("you sure we're nearly done? this seems too
+short to redo DeepVariant for Mac changing the architecture"), here's
+the honest state:
+
+**Done:**
+- Native arm64 binary (`bin/deepvariant`)
+- Pipeline `make_examples → call_variants → postprocess` runs end-to-end
+- Inference path 100 % bit-parity vs upstream Linux x86 (verified)
+- 23 .mlpackage models converted (out of 27 total upstream variants)
+  - DeepVariant: wgs, wes, pacbio, ont, hybrid, masseq, rnaseq (7/7)
+  - DeepTrio: wgs_{child,parent}, wes_{child,parent} (4/8 — pacbio +
+    ont trio variants don't ship example_info.json so auto-shape
+    falls back to wrong default; manual shape pass needed)
+  - DeepSomatic: 12/12 (wgs, wes, pacbio, ont + ffpe variants × tumor +
+    tumor_only)
+
+**Tested only on a 1 Mb fixture (chr20:5000000-6000000, single sample,
+WGS):**
+- 84 % match upstream calls
+- 16 % delta from realigner FP rate + RefCall threshold differences
+  (documented above)
+
+**Not done — multi-week work each:**
+1. **DeepTrio orchestration**: native `make_examples` for 3-BAM input
+   (child + 2 parents), 6-channel pileup, family-aware variant
+   propagation. The .mlpackage models exist; the C++ code to USE them
+   does not. ~1 week.
+2. **DeepSomatic orchestration**: 2-BAM input (tumor + normal),
+   somatic-specific filtering and germline subtraction. ~1-2 weeks.
+3. **Pangenome-aware DeepVariant**: 12-channel input + GBZ-based
+   reference augmentation. We have `gbz_reader.h` but it's excluded
+   from the build (Boost-IPC and pangenome utilities). ~1 week.
+4. **gVCF reference blocks**: `--output_gvcf` flag is wired but not
+   implemented. ~3 days.
+5. **DirectPhasing / read phasing**: C++ library compiled but not
+   integrated. ~3 days.
+6. **Alt-aligned pileup**: not enabled (used by PacBio/ONT modes for
+   indel resolution). ~2 days.
+7. **Methylation calling**: 5mC / 6mA channel handling not enabled.
+   ~2 days.
+8. **GIAB validation (hap.py F1 thresholds)**: not run. The plan's
+   scientific gates (SNP F1 ≥ ref-0.05 %, INDEL F1 ≥ ref-0.10 %) are
+   not yet measured. ~1 week (data + run + tuning).
+9. **Code signing + notarization**: scripts not written. ~2 days.
+10. **Homebrew formula** (separate `homebrew-deepvariant` repo): not
+    started. ~2 days.
+11. **Virgin-machine validation** (M1/M2/M3/M4 fresh-install matrix):
+    not done. ~2 days.
+12. **Closing the 16 % VCF delta**: documented in this PORT_LOG —
+    realigner false-positives need the linear WindowSelectorModel
+    path, plus polish on multi-allelic merge edge cases. ~1 week.
+
+**Honest total of remaining work**: 6–10 person-weeks to deliver a
+production-ready v1.0 matching the original plan. Today we have a
+solid scaffold + WGS proof-of-concept, not a 1.0.
+
+The deliverable that's actually shippable today: a Mac arm64 binary
+that runs DeepVariant WGS single-sample with bit-identical inference
+to upstream and ~84 % VCF call agreement on the chr20:5M–6M fixture.
+That's a milestone, not a release.
