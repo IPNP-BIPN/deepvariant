@@ -38,3 +38,4 @@ testdata/reference/large/
 *.tbi
 *.bed
 .DS_Store
+validation/work/
