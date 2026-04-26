@@ -458,3 +458,39 @@ Remaining gaps to 100 % VCF parity:
 The model itself remains bit-identical to upstream (small_model + big
 model both pass parity_check.py at 0.000000 max-abs softmax diff on
 the upstream golden examples).
+
+### Phase 2.5 — Batched Core ML + final GPU bench (2026-04-26 evening)
+
+The single-prediction loop (predictionFromFeatures: in a for) was the
+bottleneck for GPU/ANE — per-call Metal dispatch overhead dominated.
+Switched to a single (N,H,W,C) MLMultiArray prediction. On 668 chr20
+examples (batch=128):
+
+  FP32 single-prediction:     2.59 s (cpu_only fastest)
+  FP32 batched:               1.06 s (compute_units=all wins)
+
+So *batching* is what unlocks GPU on this model.
+
+**ANE situation:** `compute_units=all` with a FP32 .mlpackage routes
+to GPU+CPU only. ANE only operates in FP16. We provide both:
+  - `wgs.mlpackage`       (FP32) — 100% argmax + ≤2e-6 max-abs vs upstream
+  - `wgs_fp16.mlpackage`  (FP16) — 100% argmax + ~3.7e-3 max-abs
+
+For "exactly the same results as upstream" the FP32 model is the
+choice; ANE is then off, but the GPU is.
+
+### Phase 3 — final state on the 1 Mb chr20 fixture
+
+| metric                    |   ours  | upstream |
+| ----                      | ----    | ----     |
+| total VCF lines           | 3288    | 2967     |
+| match (chrom/pos/ref/alt/GT) | 2491    | —        |
+| match as % of upstream    | 83.9 %  | 100 %    |
+| only-ours (spurious)      | 797     | —        |
+| only-upstream (missed)    | 476     | —        |
+| inference path bit-parity | 100 %   | 100 %    |
+| `compute_units=all`       | 1.06 s/668 ex | — |
+
+The 16 % residual gap is in pre-/post-processing (realigner FP rate,
+RefCall emission threshold for low-VAF candidates), not in the
+inference path. Each remaining gap is documented above.
