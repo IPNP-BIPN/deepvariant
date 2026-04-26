@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -105,51 +106,61 @@ std::pair<int, int> GenotypeFromPLIndex(int pl_index, int n_alts) {
 }
 
 // Combine all CVOs for one site into a per-genotype likelihood vector.
-// Returns a vector of length NumDiploidGenotypes(n_alts).
+// Mirror of postprocess_variants.py:merge_predictions "product" mode.
 //
-// Each CVO contributes its three-class probs to the corresponding diploid
-// genotypes:
-//   indices == [i]   →   contributes to (0,0), (0,i+1), (i+1,i+1)
-//   indices == [i,j] →   contributes to (i+1,j+1) on probs[1]
+// For each diploid genotype (allele1, allele2), each CVO contributes
+// cvo.probs[overlap] where overlap = #{alleles in cvo's alt set}, computed
+// per allele1, allele2 ∈ {ref, alt1, alt2, …}. Per-CVO contributions are
+// fused by product, then normalised across all genotypes.
 //
-// When multiple CVOs assign a probability to the same genotype, we take the
-// MAX (the most confident measurement of that genotype's likelihood).
+// PL ordering (VCF "G" Number): F(j/k) = k*(k+1)/2 + j  (j ≤ k).
 std::vector<double> CombineLikelihoods(
     const std::vector<const CallVariantsOutput*>& cvos, int n_alts) {
   const int n_gt = NumDiploidGenotypes(n_alts);
-  std::vector<double> like(n_gt, 0.0);
+  std::vector<double> like(n_gt, 1.0);  // multiplicative identity
+
+  if (cvos.empty()) return like;
+  // All CVOs of a site share the same `variant` (ADD_HET_ALT_IMAGES); take
+  // the alt list from the first.
+  const auto& alts = cvos.front()->variant().alternate_bases();
 
   auto pl_idx = [](int j, int k) {
     if (j > k) std::swap(j, k);
     return k * (k + 1) / 2 + j;
   };
 
+  // Genotype 0 = REF, alleles 1..n_alts = alternate_bases[0..n_alts-1].
+  // For the "in this CVO's alt set" check we need each cvo's set of alt
+  // strings (from alt_allele_indices).
+  std::vector<std::set<std::string>> per_cvo_alts;
+  per_cvo_alts.reserve(cvos.size());
   for (const auto* cvo : cvos) {
-    const auto& probs = cvo->genotype_probabilities();
-    if (probs.size() < 3) continue;
-    const auto& indices = cvo->alt_allele_indices().indices();
-    if (indices.size() == 1) {
-      const int i = indices[0];
-      // (0,0)            ← probs[0]
-      // (0, i+1)         ← probs[1]
-      // (i+1, i+1)       ← probs[2]
-      like[pl_idx(0, 0)] = std::max(like[pl_idx(0, 0)], probs[0]);
-      like[pl_idx(0, i + 1)] = std::max(like[pl_idx(0, i + 1)], probs[1]);
-      like[pl_idx(i + 1, i + 1)] =
-          std::max(like[pl_idx(i + 1, i + 1)], probs[2]);
-    } else if (indices.size() == 2) {
-      const int i = indices[0];
-      const int j = indices[1];
-      // (i+1, j+1)       ← probs[1] (the het-of-both signal)
-      like[pl_idx(i + 1, j + 1)] =
-          std::max(like[pl_idx(i + 1, j + 1)], probs[1]);
-      // probs[0] also contributes to ref genotype.
-      like[pl_idx(0, 0)] = std::max(like[pl_idx(0, 0)], probs[0]);
+    std::set<std::string> s;
+    for (int idx : cvo->alt_allele_indices().indices()) {
+      if (idx >= 0 && idx < alts.size()) s.insert(alts[idx]);
+    }
+    per_cvo_alts.push_back(std::move(s));
+  }
+
+  // For every diploid genotype, fuse probabilities across CVOs by product.
+  for (int k = 0; k <= n_alts; ++k) {
+    for (int j = 0; j <= k; ++j) {
+      const std::string a1 = (j == 0) ? "" : alts[j - 1];  // "" = REF
+      const std::string a2 = (k == 0) ? "" : alts[k - 1];
+      double fused = 1.0;
+      for (size_t ci = 0; ci < cvos.size(); ++ci) {
+        const auto& probs = cvos[ci]->genotype_probabilities();
+        if (probs.size() < 3) continue;
+        const int overlap = (a1.empty() ? 0 : per_cvo_alts[ci].count(a1)) +
+                            (a2.empty() ? 0 : per_cvo_alts[ci].count(a2));
+        // overlap ∈ {0, 1, 2} maps directly to the 3-class softmax index.
+        fused *= probs[overlap];
+      }
+      like[pl_idx(j, k)] = fused;
     }
   }
 
-  // Renormalise so the vector sums to 1 (or close): if no entry was set,
-  // default to uniform.
+  // Normalise across the per-genotype vector.
   double s = 0;
   for (double v : like) s += v;
   if (s <= 0.0) {
