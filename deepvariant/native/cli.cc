@@ -6,6 +6,7 @@
 
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
+#include "absl/log/globals.h"
 #include "absl/log/initialize.h"
 #include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
@@ -151,6 +152,8 @@ int RunAll(int argc, char** argv) {
 
 int main(int argc, char** argv) {
   absl::InitializeLog();
+  // Default log level: send INFO to stderr.
+  absl::SetStderrThreshold(absl::LogSeverity::kInfo);
 
   if (argc < 2) {
     LOG(ERROR) << "Usage: deepvariant <subcommand> [flags]\n"

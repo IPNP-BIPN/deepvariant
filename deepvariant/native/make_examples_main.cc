@@ -134,6 +134,15 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   pic.set_types_to_alt_align("indels");
   pic.set_min_non_zero_allele_frequency(0.00001f);
   *pic.mutable_read_requirements() = read_reqs;
+  // Default channels for WGS: 6 base + insert_size = 7 (matches model input).
+  pic.add_channels("read_base");
+  pic.add_channels("base_quality");
+  pic.add_channels("mapping_quality");
+  pic.add_channels("strand");
+  pic.add_channels("read_supports_variant");
+  pic.add_channels("base_differs_from_ref");
+  pic.add_channels("insert_size");
+  pic.set_num_channels(7);
   *opts.mutable_pic_options() = pic;
 
   // Sample options.
@@ -141,6 +150,7 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   sopt->set_role("sample");
   sopt->set_name(sample_name);
   sopt->add_reads_filenames(absl::GetFlag(FLAGS_reads));
+  sopt->set_pileup_height(100);  // WGS default pileup height per sample.
   *sopt->mutable_variant_caller_options() = vc_opts;
   opts.set_main_sample_index(0);
   opts.set_sample_role_to_train("sample");
@@ -260,6 +270,7 @@ int RunMakeExamples(int argc, char** argv) {
     }
     reads_iter->Release().IgnoreError();
 
+    LOG(INFO) << "  read " << reads.size() << " reads from BAM";
     if (reads.empty()) continue;
 
     // AlleleCounter.
@@ -296,6 +307,9 @@ int RunMakeExamples(int argc, char** argv) {
     std::vector<int> sample_order = {0};
     std::vector<float> mean_coverage = {0.0f};
     std::vector<int> image_shape;
+
+    LOG(INFO) << "  candidates=" << candidates.size()
+              << " reads=" << reads.size();
 
     auto stats = generator.WriteExamplesInRegion(
         absl::MakeSpan(cand_ptrs), absl::MakeSpan(reads_per_sample),

@@ -65,6 +65,12 @@ static uint64_t ReadVarint(const uint8_t* buf, size_t len, size_t& i) {
 }
 
 // Extract a single bytes value from a BytesList field (wire type 2).
+// Extracts the first bytes-value from a Feature whose payload is a BytesList.
+// The input is the raw bytes of a Feature proto (the value side of a
+// map<string, Feature> entry). The Feature is a oneof — field 1 is BytesList.
+// BytesList itself has `repeated bytes value = 1;` — each value is a
+// length-delimited bytes entry. We walk both levels and return the first
+// value's raw bytes (with no proto framing).
 static std::string ExtractBytesListFirst(const uint8_t* buf, size_t len) {
   size_t i = 0;
   while (i < len) {
@@ -73,8 +79,25 @@ static std::string ExtractBytesListFirst(const uint8_t* buf, size_t len) {
     uint32_t wire  = static_cast<uint32_t>(tag & 7);
     if (wire != 2) break;  // we only handle length-delimited
     uint64_t seg_len = ReadVarint(buf, len, i);
-    if (field == 1 && i + seg_len <= len) {
-      return std::string(reinterpret_cast<const char*>(buf + i), seg_len);
+    if (i + seg_len > len) break;
+    if (field == 1) {
+      // We're inside Feature.bytes_list — recurse one level to read the
+      // first BytesList.value entry (also a length-delimited bytes field).
+      const uint8_t* inner = buf + i;
+      size_t j = 0;
+      while (j < seg_len) {
+        uint64_t itag = ReadVarint(inner, seg_len, j);
+        uint32_t ifield = static_cast<uint32_t>(itag >> 3);
+        uint32_t iwire  = static_cast<uint32_t>(itag & 7);
+        if (iwire != 2) break;
+        uint64_t ilen = ReadVarint(inner, seg_len, j);
+        if (j + ilen > seg_len) break;
+        if (ifield == 1) {
+          return std::string(reinterpret_cast<const char*>(inner + j), ilen);
+        }
+        j += ilen;
+      }
+      return {};
     }
     i += seg_len;
   }

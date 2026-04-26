@@ -111,7 +111,8 @@ bool CoreMLModel::Predict(const float* images, int N, int H, int W, int C,
     // (Batched MLArrayBatchProvider API was deprecated in macOS 14.
     //  Single-prediction loop is compatible and correct.)
     for (int i = 0; i < N; ++i) {
-      NSArray<NSNumber*>* shape = @[@(H), @(W), @(C)];
+      // Model expects 4D NHWC (batch=1, H, W, C).
+      NSArray<NSNumber*>* shape = @[@1, @(H), @(W), @(C)];
       MLMultiArray* arr = [[MLMultiArray alloc]
           initWithShape:shape
               dataType:MLMultiArrayDataTypeFloat32
