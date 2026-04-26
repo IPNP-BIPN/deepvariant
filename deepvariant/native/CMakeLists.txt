@@ -162,6 +162,24 @@ target_link_libraries(dv_postprocess_lib PUBLIC
 )
 
 # ---------------------------------------------------------------------------
+# dump_cvo — dev-only TFRecord dumper for CallVariantsOutput protos.
+# Used to diff our candidate set against upstream's during parity work.
+# ---------------------------------------------------------------------------
+add_executable(dump_cvo
+  "${CMAKE_CURRENT_SOURCE_DIR}/dump_cvo_main.cc"
+)
+target_include_directories(dump_cvo PRIVATE ${ME_INCLUDE_DIRS})
+target_compile_options(dump_cvo PRIVATE ${ME_COMPILE_OPTS})
+target_link_libraries(dump_cvo PRIVATE
+  dv_tfrecord
+  proto_dv
+  proto_nucleus
+  absl::log
+  absl::strings
+  absl::hash
+)
+
+# ---------------------------------------------------------------------------
 # deepvariant — main binary (CLI dispatcher)
 # ---------------------------------------------------------------------------
 add_executable(deepvariant
