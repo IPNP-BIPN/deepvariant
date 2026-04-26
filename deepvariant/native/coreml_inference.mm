@@ -106,52 +106,47 @@ bool CoreMLModel::Predict(const float* images, int N, int H, int W, int C,
 
     const NSInteger elemPerImage = H * W * C;
 
-    // Build a batch of MLFeatureProvider, one per example.
-    // Run inference example by example.
-    // (Batched MLArrayBatchProvider API was deprecated in macOS 14.
-    //  Single-prediction loop is compatible and correct.)
-    for (int i = 0; i < N; ++i) {
-      // Model expects 4D NHWC (batch=1, H, W, C).
-      NSArray<NSNumber*>* shape = @[@1, @(H), @(W), @(C)];
-      MLMultiArray* arr = [[MLMultiArray alloc]
-          initWithShape:shape
-              dataType:MLMultiArrayDataTypeFloat32
-                 error:&error];
-      if (!arr) {
-        NSLog(@"MLMultiArray alloc failed: %@", error.localizedDescription);
-        return false;
-      }
-      float* dst = (float*)arr.dataPointer;
-      std::memcpy(dst, images + (size_t)i * elemPerImage,
-                  (size_t)elemPerImage * sizeof(float));
-
-      MLDictionaryFeatureProvider* fp =
-          [[MLDictionaryFeatureProvider alloc]
-              initWithDictionary:@{in_name: arr}
-                           error:&error];
-      if (!fp) {
-        NSLog(@"Feature provider failed: %@", error.localizedDescription);
-        return false;
-      }
-
-      id<MLFeatureProvider> result =
-          [model predictionFromFeatures:fp error:&error];
-      if (!result) {
-        NSLog(@"Prediction failed for example %d: %@", i,
-              error.localizedDescription);
-        return false;
-      }
-
-      MLMultiArray* out_arr =
-          [result featureValueForName:out_name].multiArrayValue;
-      if (!out_arr) {
-        NSLog(@"Output '%@' missing in result %d", out_name, i);
-        return false;
-      }
-      const float* src = (const float*)out_arr.dataPointer;
-      std::memcpy(probs + (size_t)i * num_classes, src,
-                  (size_t)num_classes * sizeof(float));
+    // Single (N,H,W,C) MLMultiArray covering the whole batch — lets Core ML
+    // route the whole batch through GPU/ANE in one shot instead of N
+    // separate predictionFromFeatures: calls (which dominate runtime when
+    // GPU dispatch overhead > inference time).
+    NSArray<NSNumber*>* shape = @[@(N), @(H), @(W), @(C)];
+    MLMultiArray* arr = [[MLMultiArray alloc]
+        initWithShape:shape
+            dataType:MLMultiArrayDataTypeFloat32
+               error:&error];
+    if (!arr) {
+      NSLog(@"MLMultiArray alloc failed: %@", error.localizedDescription);
+      return false;
     }
+    std::memcpy(arr.dataPointer, images,
+                (size_t)N * (size_t)elemPerImage * sizeof(float));
+
+    MLDictionaryFeatureProvider* fp =
+        [[MLDictionaryFeatureProvider alloc]
+            initWithDictionary:@{in_name: arr}
+                         error:&error];
+    if (!fp) {
+      NSLog(@"Feature provider failed: %@", error.localizedDescription);
+      return false;
+    }
+
+    id<MLFeatureProvider> result =
+        [model predictionFromFeatures:fp error:&error];
+    if (!result) {
+      NSLog(@"Batch prediction failed: %@", error.localizedDescription);
+      return false;
+    }
+
+    MLMultiArray* out_arr =
+        [result featureValueForName:out_name].multiArrayValue;
+    if (!out_arr) {
+      NSLog(@"Output '%@' missing in batch result", out_name);
+      return false;
+    }
+    // Output is FP32 (we requested it at conversion time) and shape (N, K).
+    const float* src = (const float*)out_arr.dataPointer;
+    std::memcpy(probs, src, (size_t)N * (size_t)num_classes * sizeof(float));
     return true;
   }
 }
