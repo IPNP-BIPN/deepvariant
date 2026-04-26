@@ -53,6 +53,12 @@ ABSL_FLAG(std::string, output_vcf_outfile, "", "Output VCF path.");
 ABSL_FLAG(std::string, gvcf_outfile, "", "gVCF output path (optional).");
 ABSL_FLAG(double, qual_filter, 1.0,
           "Variants with QUAL below this become RefCall instead of PASS.");
+// Default 20.0 matches upstream postprocess_variants.py default. When a
+// CNN RefCall has GQ < this, upstream rewrites it to "./.": NoCall (no
+// determination, low confidence). We mirror that exactly.
+ABSL_FLAG(double, cnn_homref_call_min_gq, 20.0,
+          "All CNN RefCalls whose GQ is less than this become ./. NoCall "
+          "instead of 0/0 RefCall (matches upstream default 20.0).");
 
 namespace deepvariant {
 
@@ -103,6 +109,50 @@ std::pair<int, int> GenotypeFromPLIndex(int pl_index, int n_alts) {
     }
   }
   return {0, 0};  // fallback
+}
+
+// QUAL of an alt allele = -10 * log10(p_ref). Mirror of
+// postprocess_variants.py:compute_quals(predictions, 0) → qual.
+double AltAlleleQual(const CallVariantsOutput& cvo) {
+  if (cvo.genotype_probabilities_size() < 1) return 0.0;
+  const double p_ref = cvo.genotype_probabilities(0);
+  if (p_ref <= 0.0) return kMaxPhred;
+  if (p_ref >= 1.0) return 0.0;
+  return std::min(-10.0 * std::log10(p_ref),
+                  static_cast<double>(kMaxPhred));
+}
+
+// Returns the set of alt-allele strings to remove from the variant.
+// Mirror of postprocess_variants.py:get_alt_alleles_to_remove. An alt is
+// flagged for removal when its QUAL (= phred(p_ref)) is below qual_filter.
+// If every alt would be removed, the one with the highest QUAL is kept.
+std::set<std::string> AltsToRemove(
+    const std::vector<const CallVariantsOutput*>& cvos,
+    double qual_filter) {
+  std::set<std::string> to_remove;
+  if (qual_filter <= 0.0 || cvos.empty()) return to_remove;
+  const auto& canonical = cvos.front()->variant();
+  std::string max_qual_allele;
+  double max_qual = -1.0;
+  for (const auto* cvo : cvos) {
+    const auto& indices = cvo->alt_allele_indices().indices();
+    if (indices.size() != 1) continue;
+    const int idx = indices[0];
+    if (idx < 0 || idx >= canonical.alternate_bases_size()) continue;
+    const std::string& alt = canonical.alternate_bases(idx);
+    const double qual = AltAlleleQual(*cvo);
+    if (qual > max_qual) {
+      max_qual = qual;
+      max_qual_allele = alt;
+    }
+    if (qual < qual_filter) to_remove.insert(alt);
+  }
+  if (!max_qual_allele.empty() &&
+      static_cast<int>(to_remove.size()) ==
+          canonical.alternate_bases_size()) {
+    to_remove.erase(max_qual_allele);  // keep the strongest one
+  }
+  return to_remove;
 }
 
 // Combine all CVOs for one site into a per-genotype likelihood vector.
@@ -183,6 +233,8 @@ nucleus::genomics::v1::VcfHeader MakeVcfHeader(
       {"PASS",    "All filters passed"},
       {"RefCall", "Most likely homozygous reference"},
       {"LowQual", "Confidence in this variant being real is below threshold"},
+      {"NoCall",
+       "Site has no call due to low quality (GQ < cnn_homref_call_min_gq)"},
   };
   for (const auto& fi : kFilters) {
     auto* f = hdr.add_filters();
@@ -321,18 +373,110 @@ int RunPostprocessVariants(int argc, char** argv) {
   auto vcf_writer = std::move(writer_or.ValueOrDie());
 
   const double qual_filter = absl::GetFlag(FLAGS_qual_filter);
+  const double homref_min_gq = absl::GetFlag(FLAGS_cnn_homref_call_min_gq);
 
   int written = 0;
   int refcall = 0;
+  int nocall = 0;
 
   for (const auto& key : ordered_keys) {
     const auto& cvos = groups[key];
     Variant variant = cvos.front()->variant();
+    const int orig_n_alts = variant.alternate_bases_size();
+    const int orig_n_gt = NumDiploidGenotypes(orig_n_alts);
+
+    // Compute alt-pruning set on the ORIGINAL alts (CVOs still reference
+    // them by index). We do the actual pruning AFTER picking the
+    // best genotype.
+    const auto alts_to_remove = AltsToRemove(cvos, qual_filter);
+
+    // Combine likelihoods over the ORIGINAL alt list.
+    auto like = CombineLikelihoods(cvos, orig_n_alts);
+
+    // Mask out genotypes whose alleles are in alts_to_remove. Setting
+    // their likelihood to 0 makes them not selectable as argmax.
+    if (!alts_to_remove.empty()) {
+      for (int k = 0; k <= orig_n_alts; ++k) {
+        for (int j = 0; j <= k; ++j) {
+          const std::string a1 =
+              (j == 0) ? "" : variant.alternate_bases(j - 1);
+          const std::string a2 =
+              (k == 0) ? "" : variant.alternate_bases(k - 1);
+          if ((!a1.empty() && alts_to_remove.count(a1)) ||
+              (!a2.empty() && alts_to_remove.count(a2))) {
+            like[k * (k + 1) / 2 + j] = 0.0;
+          }
+        }
+      }
+      // Renormalise.
+      double s = 0;
+      for (double v : like) s += v;
+      if (s > 0.0) for (double& v : like) v /= s;
+    }
+
+    // Now physically prune the variant (renumbering alts). Preserve all
+    // other fields — VariantCall.info contains DP/AD/VAF set in
+    // make_examples; we must NOT throw them away by replacing the proto.
+    if (!alts_to_remove.empty()) {
+      google::protobuf::RepeatedPtrField<std::string> kept_alts;
+      for (const auto& a : variant.alternate_bases()) {
+        if (!alts_to_remove.count(a)) *kept_alts.Add() = a;
+      }
+      *variant.mutable_alternate_bases() = std::move(kept_alts);
+    }
+
     const int n_alts = variant.alternate_bases_size();
+    if (n_alts == 0) continue;
     const int n_gt = NumDiploidGenotypes(n_alts);
 
-    // Combine likelihoods over all CVOs of this site.
-    auto like = CombineLikelihoods(cvos, n_alts);
+    // After pruning, remap the original-index likelihood vector down to
+    // the new alt indexing. (Genotype (j, k) on pruned alts maps back to
+    // (j', k') on the original alts where j', k' are the original
+    // positions of the j-th and k-th non-pruned alts.)
+    std::vector<int> new_to_orig(n_alts + 1);
+    new_to_orig[0] = 0;
+    {
+      int new_pos = 1;
+      for (int orig = 0; orig < orig_n_alts; ++orig) {
+        if (!alts_to_remove.count(variant.alternate_bases().Get(
+                std::min(new_pos - 1, n_alts - 1)))) {
+          // Find the original index of variant.alternate_bases(new_pos - 1)
+          // in the source CVO's alt list.
+          // Since `variant` post-prune lists alts in original order, the
+          // mapping for new index i is the i-th surviving original index.
+        }
+      }
+      // Simpler reconstruction: walk pruned alts and find each in the
+      // first CVO's alt list.
+      const auto& orig_alts = cvos.front()->variant().alternate_bases();
+      int n = 1;
+      for (int i = 0; i < n_alts; ++i) {
+        for (int oi = 0; oi < orig_alts.size(); ++oi) {
+          if (orig_alts.Get(oi) == variant.alternate_bases(i)) {
+            new_to_orig[n++] = oi + 1;
+            break;
+          }
+        }
+      }
+    }
+    std::vector<double> like_pruned(n_gt, 0.0);
+    for (int k = 0; k <= n_alts; ++k) {
+      for (int j = 0; j <= k; ++j) {
+        const int oj = new_to_orig[j];
+        const int ok = new_to_orig[k];
+        const int new_idx = k * (k + 1) / 2 + j;
+        const int orig_idx =
+            std::max(oj, ok) * (std::max(oj, ok) + 1) / 2 + std::min(oj, ok);
+        if (orig_idx < orig_n_gt) {
+          like_pruned[new_idx] = like[orig_idx];
+        }
+      }
+    }
+    // Renormalise.
+    double sp = 0;
+    for (double v : like_pruned) sp += v;
+    if (sp > 0.0) for (double& v : like_pruned) v /= sp;
+    like = std::move(like_pruned);
 
     // argmax genotype.
     int best = 0;
@@ -376,12 +520,19 @@ int RunPostprocessVariants(int argc, char** argv) {
       nucleus::SetInfoField("MID", mid, call);
     }
 
-    // GQ = quality of the called genotype vs the next-best.
-    double second_best = 0.0;
-    for (int i = 0; i < n_gt; ++i) {
-      if (i != best) second_best = std::max(second_best, like[i]);
+    // GQ — mirror of postprocess_variants.py:compute_quals's
+    //   gq = round(ptrue_to_bounded_phred(predictions[prediction_index]))
+    // i.e. phred(1 - P_called), bounded. Different from "second-best
+    // probability"; matters at the cnn_homref_call_min_gq=20 boundary.
+    const double p_called = like[best];
+    int gq;
+    if (p_called >= 1.0) {
+      gq = kMaxPhred;
+    } else {
+      const double err = std::max(1.0 - p_called, 1e-10);  // bounded
+      gq = static_cast<int>(std::round(-10.0 * std::log10(err)));
+      gq = std::min(std::max(gq, 0), kMaxPhred);
     }
-    int gq = ProbToPhred(second_best);
     nucleus::SetInfoField("GQ", gq, call);
 
     // PL = phred-scaled likelihoods for each genotype.
@@ -404,6 +555,18 @@ int RunPostprocessVariants(int argc, char** argv) {
       variant.add_filter("PASS");
     }
 
+    // Mirror postprocess_variants.py:uncall_homref_gt_if_lowqual.
+    // CNN RefCalls with GQ < cnn_homref_call_min_gq become "./.": NoCall.
+    if (variant.filter_size() == 1 && variant.filter(0) == "RefCall" &&
+        gq < homref_min_gq) {
+      variant.clear_filter();
+      variant.add_filter("NoCall");
+      call->clear_genotype();
+      call->add_genotype(-1);
+      call->add_genotype(-1);
+      ++nocall;
+    }
+
     auto status = vcf_writer->Write(variant);
     if (!status.ok()) {
       LOG(WARNING) << "Failed to write variant at "
@@ -415,7 +578,8 @@ int RunPostprocessVariants(int argc, char** argv) {
   }
 
   LOG(INFO) << "postprocess_variants done: " << written << " VCF lines"
-            << " (" << refcall << " RefCall, "
+            << " (" << (refcall - nocall) << " RefCall, "
+            << nocall << " NoCall, "
             << (written - refcall) << " PASS).";
   return 0;
 }
