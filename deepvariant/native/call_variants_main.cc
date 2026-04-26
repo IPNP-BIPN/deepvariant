@@ -256,10 +256,15 @@ int RunCallVariants(int argc, char** argv) {
           return false;
         }
       } else {
-        // uint8 → float32
+        // uint8 → float32 normalized to [0, 1]. The model expects normalized
+        // input — passing raw [0, 255] saturates softmax to (1.0, 0, 0) for
+        // every example.
         const uint8_t* src = reinterpret_cast<const uint8_t*>(img.data());
         float* dst = images.data() + i * elem;
-        for (int64_t j = 0; j < elem; ++j) dst[j] = static_cast<float>(src[j]);
+        constexpr float kInvScale = 1.0f / 255.0f;
+        for (int64_t j = 0; j < elem; ++j) {
+          dst[j] = static_cast<float>(src[j]) * kInvScale;
+        }
       }
     }
 
