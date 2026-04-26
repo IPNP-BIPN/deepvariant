@@ -32,6 +32,28 @@ target_link_libraries(dv_coreml PUBLIC
 )
 
 # ---------------------------------------------------------------------------
+# dv_small_model — Obj-C++ wrapper around the small_model .mlpackage
+# ---------------------------------------------------------------------------
+add_library(dv_small_model STATIC
+  small_model_inference.mm
+  small_model_features.cc
+)
+set_source_files_properties(small_model_inference.mm PROPERTIES
+  COMPILE_FLAGS "-fobjc-arc"
+)
+target_include_directories(dv_small_model PUBLIC
+  "${CMAKE_SOURCE_DIR}"
+  "${CMAKE_BINARY_DIR}/proto_gen"
+  "${ABSL_PREFIX}/include"
+)
+target_link_libraries(dv_small_model PUBLIC
+  proto_dv
+  proto_nucleus
+  "-framework CoreML"
+  "-framework Foundation"
+)
+
+# ---------------------------------------------------------------------------
 # dv_call_variants_lib — the call_variants logic (C++, no Obj-C)
 # ---------------------------------------------------------------------------
 add_library(dv_call_variants_lib STATIC call_variants_main.cc)
