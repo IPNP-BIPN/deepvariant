@@ -19,8 +19,12 @@
 #include "deepvariant/allelecounter.h"
 #include "deepvariant/make_examples_native.h"
 #include "deepvariant/native/regions.h"
+#include "deepvariant/native/small_model_features.h"
+#include "deepvariant/native/small_model_inference.h"
+#include "deepvariant/native/tfrecord.h"
 #include "deepvariant/protos/deepvariant.pb.h"
 #include "deepvariant/variant_calling.h"
+#include "deepvariant/variant_calling_multisample.h"
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
 #include "absl/log/check.h"
@@ -33,7 +37,10 @@
 #include "third_party/nucleus/protos/range.pb.h"
 #include "third_party/nucleus/protos/reads.pb.h"
 #include "third_party/nucleus/protos/reference.pb.h"
+#include "third_party/nucleus/protos/struct.pb.h"
 #include "third_party/nucleus/util/proto_ptr.h"
+#include "third_party/nucleus/util/utils.h"
+#include <cmath>
 
 ABSL_FLAG(std::string, reads, "", "BAM/CRAM file with aligned reads.");
 ABSL_FLAG(std::string, ref, "", "Reference FASTA (.fai index required).");
@@ -61,6 +68,17 @@ ABSL_FLAG(int, partition_size, 1000,
           "AlleleCounter partition size (bp per window).");
 ABSL_FLAG(int, min_mapping_quality, 10, "Min read mapping quality.");
 ABSL_FLAG(int, min_base_quality, 10, "Min base quality.");
+// Small model first-pass.
+ABSL_FLAG(std::string, small_model, "",
+          "Path to the small_model .mlpackage. Empty = no small model "
+          "(every candidate goes through the big InceptionV3 model).");
+ABSL_FLAG(std::string, small_model_cvo_outfile, "",
+          "TFRecord path for CVOs the small model decides directly. "
+          "Read by postprocess_variants alongside the big-model CVOs.");
+ABSL_FLAG(int, small_model_snp_gq_threshold, 20,
+          "Min phred GQ for the small model to commit a SNP call.");
+ABSL_FLAG(int, small_model_indel_gq_threshold, 28,
+          "Min phred GQ for the small model to commit an indel call.");
 
 namespace deepvariant {
 
@@ -106,6 +124,10 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   vc_opts.set_ploidy(2);
   vc_opts.set_fraction_reference_sites_to_emit(0.0);
   vc_opts.set_random_seed(1260872234);
+  // Required so variant_calling_multisample.cc populates ref_support_ext —
+  // without it the small_model sees zero ref-supporting reads on every
+  // candidate and predicts hom_ref for everything.
+  vc_opts.set_track_ref_reads(true);
 
   // Pileup image options (WGS defaults).
   PileupImageOptions pic;
@@ -170,6 +192,65 @@ std::string InferSampleName(
     if (!rg.sample_id().empty()) return rg.sample_id();
   }
   return "sample";
+}
+
+// Walk a 51-bp window of AlleleCounts around the candidate and populate
+// the candidate's allele_frequency_at_position map with VAF (×100, integer)
+// at each position. The map is used by the small_model's VAF-context
+// features (offsets −25..+25 around the variant).
+void PopulateVafContext(
+    DeepVariantCall* candidate,
+    const std::vector<AlleleCount>& allele_counts) {
+  if (allele_counts.empty()) return;
+  const int64_t variant_pos = candidate->variant().start();
+  const int64_t region_start = allele_counts.front().position().position();
+  const int64_t local_idx = variant_pos - region_start;
+  constexpr int kHalfWindow = kSmallModelVafContextWindow / 2;  // 25
+  for (int o = -kHalfWindow; o <= kHalfWindow; ++o) {
+    const int64_t idx = local_idx + o;
+    if (idx < 0 || idx >= static_cast<int64_t>(allele_counts.size())) continue;
+    const auto& ac = allele_counts[idx];
+    const int depth = ac.ref_supporting_read_count() + ac.read_alleles_size();
+    const int vaf = depth > 0 ? (100 * ac.read_alleles_size()) / depth : 0;
+    (*candidate->mutable_allele_frequency_at_position())[
+        ac.position().position()] = vaf;
+  }
+}
+
+// Returns true if the (alt_idx-only) sub-variant is a SNP — used to pick
+// the small_model GQ threshold (snp=20 vs indel=28).
+bool IsSnpAlt(const nucleus::genomics::v1::Variant& v, int alt_idx) {
+  if (alt_idx < 0 || alt_idx >= v.alternate_bases_size()) return false;
+  return v.reference_bases().size() == 1 &&
+         v.alternate_bases(alt_idx).size() == 1;
+}
+
+// Phred = -10 * log10(p).  Capped at 99.
+int ProbToPhred(double p) {
+  if (p <= 0.0) return 99;
+  if (p >= 1.0) return 0;
+  return std::min(static_cast<int>(std::round(-10.0 * std::log10(p))), 99);
+}
+
+// Build a CallVariantsOutput proto for a single (candidate, alt_idx) pair
+// that the small model has resolved. We tag MID="small_model" in the
+// VariantCall.info so postprocess can propagate it to the VCF.
+CallVariantsOutput MakeSmallModelCvo(
+    const DeepVariantCall& candidate, int alt_idx,
+    const float* probs) {
+  CallVariantsOutput cvo;
+  *cvo.mutable_variant() = candidate.variant();
+  cvo.mutable_alt_allele_indices()->add_indices(alt_idx);
+  // Probabilities written as double — same wire-format as the big model.
+  for (int i = 0; i < 3; ++i) cvo.add_genotype_probabilities(probs[i]);
+  // Tag MID in VariantCall.info["MID"]. variant_calling.cc already adds an
+  // empty VariantCall, so reuse that slot rather than appending another one
+  // (would trigger the VcfWriter's "calls != samples" check).
+  auto* v = cvo.mutable_variant();
+  if (v->calls_size() == 0) v->add_calls();
+  nucleus::SetInfoField("MID", std::string("small_model"),
+                         v->mutable_calls(0));
+  return cvo;
 }
 
 }  // namespace
@@ -239,12 +320,49 @@ int RunMakeExamples(int argc, char** argv) {
   ExamplesGenerator generator(opts, example_filenames);
 
   // ── Variant caller ────────────────────────────────────────────────────────
+  // Single-sample variant_calling.cc — the multi-sample variant emits ~4×
+  // more candidates than upstream's pipeline does at the same options,
+  // which we don't want. variant_calling.cc has been patched to populate
+  // mapping_quality / average_base_quality / is_reverse_strand on the
+  // ReadSupport entries (mirror of what multisample does) so the
+  // small_model's per-read features aren't saturated at 0.
+  // PopulateVafContext below fills in allele_frequency_at_position which
+  // the small_model uses for its 51 VAF-context features.
   vcf_candidate_importer::VariantCaller caller(
       opts.sample_options(0).variant_caller_options());
+
+  // ── Optional: small model first-pass ──────────────────────────────────────
+  std::unique_ptr<SmallModel> small_model;
+  std::unique_ptr<TFRecordWriter> small_cvo_writer;
+  const std::string small_path = absl::GetFlag(FLAGS_small_model);
+  const std::string small_cvo_path =
+      absl::GetFlag(FLAGS_small_model_cvo_outfile);
+  const int snp_gq_threshold = absl::GetFlag(FLAGS_small_model_snp_gq_threshold);
+  const int indel_gq_threshold =
+      absl::GetFlag(FLAGS_small_model_indel_gq_threshold);
+  if (!small_path.empty()) {
+    if (small_cvo_path.empty()) {
+      LOG(ERROR) << "--small_model requires --small_model_cvo_outfile";
+      return 1;
+    }
+    small_model = SmallModel::Load(small_path);
+    if (!small_model) {
+      LOG(ERROR) << "Failed to load small_model at " << small_path;
+      return 1;
+    }
+    small_cvo_writer = TFRecordWriter::New(small_cvo_path);
+    if (!small_cvo_writer) {
+      LOG(ERROR) << "Failed to open small CVO writer: " << small_cvo_path;
+      return 1;
+    }
+    LOG(INFO) << "Small model active: " << small_path;
+  }
 
   // ── Main loop ─────────────────────────────────────────────────────────────
   int64_t total_candidates = 0;
   int64_t total_examples = 0;
+  int64_t total_small_hits = 0;
+  int64_t total_big_dispatched = 0;
 
   for (const auto& region : shard_regions) {
     LOG(INFO) << "Region: " << region.reference_name() << ":"
@@ -287,10 +405,71 @@ int RunMakeExamples(int argc, char** argv) {
 
     total_candidates += candidates.size();
 
+    // Optional small-model first-pass dispatch. We try each candidate against
+    // the small model (one prediction per alt allele); if EVERY alt for a
+    // candidate gets a confident enough genotype call, we emit the per-alt
+    // CVOs directly and skip the big model. Otherwise the candidate falls
+    // through to ExamplesGenerator (which generates the pileup image and the
+    // big model picks up downstream in call_variants).
+    std::vector<DeepVariantCall> big_candidates;
+    if (small_model) {
+      // Populate VAF context for every candidate (the small model's 51
+      // VAF-context features need it; the big model doesn't, but it's cheap
+      // and keeps both paths producing the same DeepVariantCall shape).
+      const auto& allele_counts = counter.Counts();
+      for (auto& c : candidates) {
+        PopulateVafContext(&c, allele_counts);
+      }
+
+      for (const auto& c : candidates) {
+        const int n_alts = c.variant().alternate_bases_size();
+        // Decide per-alt; only keep the candidate fully on the small-model
+        // path if every alt clears its threshold.
+        std::vector<CallVariantsOutput> per_alt_cvos;
+        bool all_alts_pass = (n_alts > 0);
+        for (int alt_idx = 0; alt_idx < n_alts; ++alt_idx) {
+          const auto features = EncodeSmallModelFeatures(c, {alt_idx});
+          float probs[3] = {0, 0, 0};
+          if (!small_model->Predict(features.data(), 1, probs)) {
+            all_alts_pass = false;
+            break;
+          }
+          // The small_model GQ is the phred score of NOT being the called
+          // genotype, i.e. -10·log10(1 − max_p).
+          const float max_p = std::max({probs[0], probs[1], probs[2]});
+          const int gq = ProbToPhred(1.0 - max_p);
+          const int threshold =
+              IsSnpAlt(c.variant(), alt_idx) ? snp_gq_threshold
+                                              : indel_gq_threshold;
+          if (gq < threshold) {
+            all_alts_pass = false;
+            break;
+          }
+          per_alt_cvos.push_back(MakeSmallModelCvo(c, alt_idx, probs));
+        }
+        if (all_alts_pass) {
+          for (const auto& cvo : per_alt_cvos) {
+            std::string serialized;
+            cvo.SerializeToString(&serialized);
+            small_cvo_writer->WriteRecord(serialized);
+            ++total_small_hits;
+          }
+        } else {
+          big_candidates.push_back(c);
+          ++total_big_dispatched;
+        }
+      }
+    } else {
+      big_candidates = candidates;
+      total_big_dispatched += candidates.size();
+    }
+
+    if (big_candidates.empty()) continue;
+
     // Wrap in ConstProtoPtr for ExamplesGenerator API.
     std::vector<nucleus::ConstProtoPtr<DeepVariantCall>> cand_ptrs;
-    cand_ptrs.reserve(candidates.size());
-    for (auto& c : candidates) {
+    cand_ptrs.reserve(big_candidates.size());
+    for (auto& c : big_candidates) {
       cand_ptrs.push_back(nucleus::ConstProtoPtr<DeepVariantCall>(&c));
     }
 
@@ -321,9 +500,12 @@ int RunMakeExamples(int argc, char** argv) {
   }
 
   generator.SignalShardFinished();
+  if (small_cvo_writer) small_cvo_writer->Close();
 
   LOG(INFO) << "make_examples done: " << total_candidates << " candidates, "
-            << total_examples << " examples written.";
+            << total_examples << " examples written"
+            << " (small_model_hits=" << total_small_hits
+            << ", big_model_dispatched=" << total_big_dispatched << ").";
   return 0;
 }
 

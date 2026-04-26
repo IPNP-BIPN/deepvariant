@@ -29,7 +29,9 @@
 #include "deepvariant/native/coreml_inference.h"
 #include "deepvariant/native/tfrecord.h"
 #include "deepvariant/protos/deepvariant.pb.h"
+#include "third_party/nucleus/protos/struct.pb.h"
 #include "third_party/nucleus/protos/variants.pb.h"
+#include "third_party/nucleus/util/utils.h"
 
 ABSL_FLAG(std::string, examples,  "", "Input TFRecord file(s) of tf.train.Example.");
 ABSL_FLAG(std::string, checkpoint, "", ".mlpackage path for the inference model.");
@@ -289,6 +291,15 @@ int RunCallVariants(int argc, char** argv) {
       for (int k = 0; k < K; ++k) {
         cvo.add_genotype_probabilities(probs[i * K + k]);
       }
+      // Tag MID="deepvariant" so postprocess can write it as a VCF FORMAT
+      // field. Reuse the empty VariantCall slot that variant_calling.cc
+      // already added (otherwise we end up with 2 calls and VcfWriter
+      // rejects the variant for not matching sample count).
+      auto* v = cvo.mutable_variant();
+      if (v->calls_size() == 0) v->add_calls();
+      nucleus::SetInfoField("MID", std::string("deepvariant"),
+                             v->mutable_calls(0));
+
       std::string serialized;
       if (!cvo.SerializeToString(&serialized)) {
         LOG(ERROR) << "Failed to serialize CallVariantsOutput";

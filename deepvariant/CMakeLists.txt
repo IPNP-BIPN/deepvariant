@@ -73,6 +73,7 @@ dv_library(dv_allelecounter
   SRCS
     allelecounter.cc
     variant_calling.cc
+    variant_calling_multisample.cc
   DEPS
     dv_utils
     proto_dv

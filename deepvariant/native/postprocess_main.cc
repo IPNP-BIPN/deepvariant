@@ -196,12 +196,13 @@ nucleus::genomics::v1::VcfHeader MakeVcfHeader(
     const char* desc;
   };
   static constexpr Fmt fmts[] = {
-      {"GT", "1", "String", "Genotype"},
-      {"GQ", "1", "Integer", "Conditional genotype quality"},
-      {"DP", "1", "Integer", "Read depth"},
-      {"AD", "R", "Integer", "Allelic depths for ref and alt alleles"},
-      {"VAF", "A", "Float", "Variant allele fractions"},
-      {"PL", "G", "Integer", "Phred-scaled genotype likelihoods"},
+      {"GT",  "1", "String",  "Genotype"},
+      {"GQ",  "1", "Integer", "Conditional genotype quality"},
+      {"DP",  "1", "Integer", "Read depth"},
+      {"AD",  "R", "Integer", "Allelic depths for ref and alt alleles"},
+      {"VAF", "A", "Float",   "Variant allele fractions"},
+      {"MID", "1", "String",  "Model identifier (small_model | deepvariant)"},
+      {"PL",  "G", "Integer", "Phred-scaled genotype likelihoods"},
   };
   for (const auto& f : fmts) {
     auto* fi = hdr.add_formats();
@@ -342,6 +343,27 @@ int RunPostprocessVariants(int argc, char** argv) {
     call->clear_genotype();
     call->add_genotype(j);
     call->add_genotype(k);
+
+    // Propagate MID from any of the source CVOs. If at least one CVO in
+    // this site's group was tagged as a small_model hit, use that;
+    // otherwise fall back to deepvariant. (Both tags are set upstream of
+    // postprocess: small_model in make_examples_main.cc, deepvariant in
+    // call_variants_main.cc.)
+    std::string mid;
+    for (const auto* cvo : cvos) {
+      for (const auto& src_call : cvo->variant().calls()) {
+        auto it = src_call.info().find("MID");
+        if (it != src_call.info().end() && it->second.values_size() > 0) {
+          const std::string& v = it->second.values(0).string_value();
+          if (v == "small_model") { mid = v; break; }
+          if (mid.empty()) mid = v;
+        }
+      }
+      if (mid == "small_model") break;
+    }
+    if (!mid.empty()) {
+      nucleus::SetInfoField("MID", mid, call);
+    }
 
     // GQ = quality of the called genotype vs the next-best.
     double second_best = 0.0;

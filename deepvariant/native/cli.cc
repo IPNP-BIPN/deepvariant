@@ -1,6 +1,7 @@
 #include "deepvariant/native/cli.h"
 
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,9 @@ ABSL_FLAG(std::string, intermediate_results_dir, "/tmp/dv_run",
           "Directory for intermediate TFRecord files.");
 ABSL_FLAG(std::string, model, "",
           "Path to .mlpackage model (overrides --model_type lookup).");
+ABSL_FLAG(std::string, small_model_path, "",
+          "Path to small_model .mlpackage. Empty = no small-model first-pass; "
+          "every candidate goes through the big InceptionV3.");
 
 // Flags owned by the subcommand .cc files — declared here for use by RunAll.
 ABSL_DECLARE_FLAG(std::string, reads);
@@ -85,14 +89,21 @@ int RunAll(int argc, char** argv) {
   // happens later by convention "path-NNNNN-of-NNNNN".
   std::string examples_pattern;
   std::string cvo_pattern;
+  std::string small_cvo_path;
+  std::string merged_cvo_path;
   if (num_shards <= 1) {
     examples_pattern = absl::StrCat(tmp_dir, "/examples.tfrecord");
-    cvo_pattern     = absl::StrCat(tmp_dir, "/cvo.tfrecord");
+    cvo_pattern      = absl::StrCat(tmp_dir, "/cvo.tfrecord");
+    small_cvo_path   = absl::StrCat(tmp_dir, "/small_cvo.tfrecord");
+    merged_cvo_path  = absl::StrCat(tmp_dir, "/merged_cvo.tfrecord");
   } else {
     examples_pattern = absl::StrCat(tmp_dir, "/examples.tfrecord@", num_shards);
-    cvo_pattern     = absl::StrCat(tmp_dir, "/cvo.tfrecord@",      num_shards);
+    cvo_pattern      = absl::StrCat(tmp_dir, "/cvo.tfrecord@",      num_shards);
+    small_cvo_path   = absl::StrCat(tmp_dir, "/small_cvo.tfrecord");
+    merged_cvo_path  = absl::StrCat(tmp_dir, "/merged_cvo.tfrecord");
   }
   const std::string model_path = ModelPath(model_type);
+  const std::string small_model_path = absl::GetFlag(FLAGS_small_model_path);
 
   // ── Stage 1: make_examples ────────────────────────────────────────────────
   LOG(INFO) << "Stage 1: make_examples";
@@ -106,6 +117,11 @@ int RunAll(int argc, char** argv) {
     };
     if (!regions_flag.empty()) {
       me_args.push_back(absl::StrCat("--regions=", regions_flag));
+    }
+    if (!small_model_path.empty()) {
+      me_args.push_back(absl::StrCat("--small_model=", small_model_path));
+      me_args.push_back(absl::StrCat("--small_model_cvo_outfile=",
+                                      small_cvo_path));
     }
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
@@ -132,11 +148,31 @@ int RunAll(int argc, char** argv) {
     }
   }
 
+  // ── Stage 2.5: merge small_cvo + big_cvo into a single file ──────────────
+  // postprocess takes one --infile so we concatenate the (already valid)
+  // TFRecord files. TFRecord allows naive byte concatenation since each
+  // record is self-delimiting.
+  std::string postprocess_input = cvo_pattern;
+  if (!small_model_path.empty()) {
+    LOG(INFO) << "Stage 2.5: merge small_cvo + big_cvo → " << merged_cvo_path;
+    std::ifstream sm(small_cvo_path, std::ios::binary);
+    std::ifstream bg(cvo_pattern,    std::ios::binary);
+    std::ofstream out(merged_cvo_path, std::ios::binary);
+    if (!out) {
+      LOG(ERROR) << "Cannot open merged CVO: " << merged_cvo_path;
+      return 1;
+    }
+    if (sm) out << sm.rdbuf();
+    if (bg) out << bg.rdbuf();
+    out.close();
+    postprocess_input = merged_cvo_path;
+  }
+
   // ── Stage 3: postprocess_variants ────────────────────────────────────────
   LOG(INFO) << "Stage 3: postprocess_variants";
   {
     std::vector<std::string> pp_args = {
-        absl::StrCat("--infile=", cvo_pattern),
+        absl::StrCat("--infile=", postprocess_input),
         absl::StrCat("--ref=", ref_flag),
         absl::StrCat("--output_vcf_outfile=", output_vcf_flag),
     };

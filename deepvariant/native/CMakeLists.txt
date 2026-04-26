@@ -130,6 +130,7 @@ target_link_libraries(dv_make_examples_lib PUBLIC
   dv_make_examples_native
   dv_allelecounter
   dv_tfrecord
+  dv_small_model
   proto_dv
   proto_nucleus
   absl::flags
