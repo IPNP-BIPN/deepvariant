@@ -432,11 +432,51 @@ int RunPostprocessVariants(int argc, char** argv) {
     // other fields — VariantCall.info contains DP/AD/VAF set in
     // make_examples; we must NOT throw them away by replacing the proto.
     if (!alts_to_remove.empty()) {
+      // Compute which original alt indices survive — index ranges from 0
+      // (first alt) to n_alts-1.
+      std::vector<bool> keep_alt(orig_n_alts, false);
+      {
+        const auto& orig_alts = variant.alternate_bases();
+        for (int i = 0; i < orig_alts.size(); ++i) {
+          keep_alt[i] = !alts_to_remove.count(orig_alts.Get(i));
+        }
+      }
       google::protobuf::RepeatedPtrField<std::string> kept_alts;
       for (const auto& a : variant.alternate_bases()) {
         if (!alts_to_remove.count(a)) *kept_alts.Add() = a;
       }
       *variant.mutable_alternate_bases() = std::move(kept_alts);
+
+      // Mirror upstream's AlleleRemapper.reindex_allele_indexed_fields for
+      // _ALT_ALLELE_INDEXED_FORMAT_FIELDS = {("AD", true), ("VAF", false),
+      // ("MF", true), ("MD", true)}. AD/MF/MD have a ref entry at index 0
+      // (ref_is_zero=true) so keep [0] + the kept alt slots. VAF has no ref
+      // entry (ref_is_zero=false) so it just gets the kept alt slots.
+      for (auto& call : *variant.mutable_calls()) {
+        auto* info = call.mutable_info();
+        for (const auto& field_info :
+             {std::make_pair(std::string("AD"), true),
+              std::make_pair(std::string("VAF"), false),
+              std::make_pair(std::string("MF"), true),
+              std::make_pair(std::string("MD"), true)}) {
+          auto it = info->find(field_info.first);
+          if (it == info->end()) continue;
+          ::nucleus::genomics::v1::ListValue kept;
+          const bool ref_is_zero = field_info.second;
+          const auto& vals = it->second.values();
+          for (int i = 0; i < vals.size(); ++i) {
+            bool keep;
+            if (ref_is_zero && i == 0) {
+              keep = true;  // always keep the ref entry
+            } else {
+              const int orig_alt = ref_is_zero ? (i - 1) : i;
+              keep = (orig_alt < orig_n_alts) ? keep_alt[orig_alt] : false;
+            }
+            if (keep) *kept.add_values() = vals.Get(i);
+          }
+          *it->second.mutable_values() = std::move(*kept.mutable_values());
+        }
+      }
     }
 
     const int n_alts = variant.alternate_bases_size();
