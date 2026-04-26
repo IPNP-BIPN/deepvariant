@@ -113,6 +113,16 @@ RealignerOptions DefaultRealignerOptions() {
   ws->set_min_base_quality(20);
   ws->set_min_windows_distance(80);
   ws->set_max_window_size(1000);
+  // Mirrors upstream's `_MIN_ALLELE_SUPPORT = 2` in realigner.py — without
+  // this, AlleleFilter() in window_selector.cc accepts singleton alleles
+  // (count=1), so positions with only one supporting read can still seed
+  // a candidate window. Upstream rejects them.
+  ws->set_min_allele_support(2);
+  // 20bp on each side. Mirrors realigner.py:_WS_REGION_EXPANSION_IN_BP.
+  // Used by RealignReadsForRegion when building the WindowSelector
+  // AlleleCounter (so reads that overhang the region edges still
+  // contribute counts at boundary positions).
+  ws->set_region_expansion_in_bp(20);
   // De-Bruijn graph — defaults from realigner.py.
   auto* dbg = opts.mutable_dbg_config();
   dbg->set_min_k(10);

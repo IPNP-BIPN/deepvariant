@@ -405,14 +405,42 @@ int RunMakeExamples(int argc, char** argv) {
     // tracking see the realigned reads (matches upstream's flow).
     std::vector<nucleus::genomics::v1::Read> working_reads;
     if (absl::GetFlag(FLAGS_realigner_enabled)) {
-      // Pre-scan AlleleCounter to give the realigner candidate-position
-      // counts (its WindowSelector consumes the AlleleCounts).
-      AlleleCounter pre(ref_reader.get(), region, {},
-                        opts.allele_counter_options());
+      // Pre-scan AlleleCounter for the WindowSelector. Upstream
+      // (realigner/window_selector.py:_candidates_from_reads) builds
+      // a *dedicated* AlleleCounter with WindowSelector-specific
+      // requirements (ws_min_mapq=20, ws_min_base_quality=20) over an
+      // expanded region (region_expansion_in_bp=20). The candidate-
+      // emission AlleleCounter further down uses the looser
+      // make_examples thresholds (10/10) — they're separate counters.
+      const auto realigner_opts = DefaultRealignerOptions();
+      const int expand_bp = realigner_opts.ws_config().region_expansion_in_bp();
+      auto contig_or = ref_reader->Contig(region.reference_name());
+      const int64_t contig_n =
+          contig_or.ok() ? contig_or.ValueOrDie()->n_bases() :
+          static_cast<int64_t>(region.end()) + expand_bp;
+      nucleus::genomics::v1::Range ws_region;
+      ws_region.set_reference_name(region.reference_name());
+      ws_region.set_start(std::max<int64_t>(0,
+          static_cast<int64_t>(region.start()) - expand_bp));
+      ws_region.set_end(std::min<int64_t>(contig_n,
+          static_cast<int64_t>(region.end()) + expand_bp));
+
+      AlleleCounterOptions ws_ac_opts;
+      ws_ac_opts.set_partition_size(opts.allele_counter_options().partition_size());
+      ws_ac_opts.mutable_read_requirements()->set_min_mapping_quality(
+          realigner_opts.ws_config().min_mapq());
+      ws_ac_opts.mutable_read_requirements()->set_min_base_quality(
+          realigner_opts.ws_config().min_base_quality());
+      ws_ac_opts.mutable_read_requirements()->set_min_base_quality_mode(
+          nucleus::genomics::v1::ReadRequirements::ENFORCED_BY_CLIENT);
+      // track_ref_reads stays false — the WindowSelector doesn't use ref
+      // reads (AlleleFilter() rejects REFERENCE alleles).
+      AlleleCounter pre(ref_reader.get(), ws_region, /*candidates=*/{},
+                        ws_ac_opts);
       for (const auto& r : reads) pre.Add(r, sample_name);
       working_reads =
-          RealignReadsForRegion(reads, region, pre, *ref_reader,
-                                 DefaultRealignerOptions());
+          RealignReadsForRegion(reads, ws_region, pre, *ref_reader,
+                                 realigner_opts);
     } else {
       working_reads = reads;
     }
