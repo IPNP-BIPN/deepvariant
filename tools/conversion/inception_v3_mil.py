@@ -91,7 +91,7 @@ def _cbr(
     )
     x = mb.batch_norm(
         x=x, mean=mean, variance=var, gamma=gamma, beta=beta,
-        epsilon=1e-3, name=f"{name}_bn",
+        epsilon=1e-4, name=f"{name}_bn",
     )
     return mb.relu(x=x, name=f"{name}_r")
 
@@ -369,11 +369,15 @@ def build_program(
         x = mb.reduce_mean(x=x, axes=[2, 3], keep_dims=True, name="gap")
         x = mb.squeeze(x=x, axes=[2, 3], name="squeeze")
 
-        # Dense 2048 → 3
+        # Dense 2048 → 3 (kernel + bias — the bias is the only one in the
+        # whole model since every conv is fused with BN).
         w = bundle.read_tensor(
             f"layer_with_weights-188/kernel/{_ATTR}"
         ).T.astype(np.float32)
-        x = mb.linear(x=x, weight=w, name="logits")
+        b = bundle.read_tensor(
+            f"layer_with_weights-188/bias/{_ATTR}"
+        ).astype(np.float32)
+        x = mb.linear(x=x, weight=w, bias=b, name="logits")
 
         return mb.softmax(x=x, axis=1, name="classification")
 
