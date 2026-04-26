@@ -348,3 +348,59 @@ to use InceptionV3 (already bit-parity).
 
 Conversion is also wired up for variants other than WGS by passing
 the variant name to `convert_small_model.sh wes|pacbio|ont_r104|…`.
+
+### Phase 3 milestone: small_model integration end-to-end (2026-04-26)
+
+The 70-feature small_model first pass is now wired through the
+pipeline. Coverage and bit-comparison vs upstream on
+`chr20:5000000-6000000` (HG002 BAM, GRCh38):
+
+  small_model coverage:    78.0 %  (1899/2440 sites)
+                                vs upstream's 83.8 % (2485/2967 sites)
+  exact-match calls:       91.8 %  (2239/2440 lines match upstream
+                                    on chrom+pos+ref+alt+GT)
+
+Sample line, our pipeline vs upstream — same chrom/pos/ref/alt/GT/GQ/MID:
+  ours:     chr20 5000094  C  T  39.31  PASS  0/1:39:54:23,30:...:small_model:39,0,49
+  upstream: chr20 5000094  C  T  39.40  PASS  0/1:39:56:23,32:...:small_model:39,0,48
+
+Diff sources:
+
+- **728 sites only in upstream**: upstream's realigner re-aligns
+  reads through De-Bruijn graph haplotypes and recovers candidates
+  where reads disagree with the reference. Our pipeline still has
+  `realigner_enabled = false`. Wiring the realigner (we already
+  build the C++ primitives) closes this gap; that's the largest
+  remaining piece.
+- **201 sites only in ours**: residual multi-allelic merge differences
+  in postprocess. We use max() across CVOs per diploid genotype slot;
+  upstream's combining function weights genotypes differently when
+  ADD_HET_ALT_IMAGES emits 3 CVOs per tri-allelic site.
+
+Implementation pieces:
+
+- Two-pass AlleleCounter: probe pass without candidate_positions to
+  enumerate variant sites, then real pass with that list. Required
+  because AlleleCounter only retains REF reads in `read_alleles` at
+  positions in `candidate_positions_` (with track_ref_reads=true).
+- Per-read fields populated in single-sample variant_calling.cc
+  (mirror of multisample variant_calling_multisample.cc): without
+  this, 6 of the 12 small_model BaseFeatures stayed at 0.
+- `track_ref_reads = true` on both AlleleCounterOptions and
+  VariantCallerOptions (was missing from the former).
+- MID FORMAT field propagated from CVO → VCF line. Small-model CVOs
+  get MID="small_model" in make_examples; big-model CVOs get
+  MID="deepvariant" in call_variants. postprocess gives
+  precedence to small_model when both source CVOs exist for a site.
+- cli.cc orchestration: --small_model_path → make_examples; small
+  CVOs concatenated with big CVOs into merged_cvo before postprocess
+  (TFRecord format allows naive byte concat).
+
+Next pieces to fully match upstream's VCF (still open):
+1. Realigner integration in make_examples (~1k LOC port from
+   realigner.py + window_selector.py orchestration on top of the
+   already-built debruijn_graph / fast_pass_aligner / window_selector
+   C++ primitives).
+2. Multi-allelic merge: replace per-genotype max() with the upstream
+   weighting from postprocess_variants.py:_combine_predictions.
+3. gVCF reference blocks (--output_gvcf flag).
