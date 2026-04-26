@@ -160,3 +160,43 @@ What is still **not** wired in Phase 3:
 
 Each of those is an additive feature and does not change the pipeline
 shape; they are deferred behind the working WGS path.
+
+### Phase 0 follow-up — direct TF→CoreML conversion (2026-04-26)
+
+The hand-built MIL converter (`tools/conversion/inception_v3_mil.py`)
+mapped the (conv, BN) pairs of Inception type-B blocks (`Mixed_6b`,
+`6c`, `6d`, `6e`) and Reduction-B (`Mixed_7a`) incorrectly. Two convs
+within those blocks share the same kernel shape (e.g. two `[1,7,128,128]`
+1×7 convs in `Mixed_6b`), so the wrong-weight assignment compiled
+silently and produced shape-valid but semantically wrong outputs.
+Symptoms: 35–46% argmax agreement vs upstream (the model still
+predicted plausible-looking probabilities, just not the right ones).
+
+Replaced with the official path: `coremltools.convert(saved_model,
+source="tensorflow", compute_precision=FLOAT32)` run inside the
+upstream `google/deepvariant:1.10.0` Docker image (which already ships
+TF 2.16 + a Python that lets us pip-install `coremltools==7.2`). See
+`tools/conversion/convert_via_docker.sh`.
+
+This reverts the v1 concern about the TF→CoreML path hanging:
+v1 saw that with TF 2.20 + coremltools 9.0; TF 2.16 + coremltools 7.2
+converts in ~5 s and produces a faithful model.
+
+Verification on the upstream `examples.tfrecord.gz` (424 examples, 395
+unique variants):
+
+  argmax agreement : 395/395 = 100.000%
+  softmax max-abs  : 0.000000
+
+The native pipeline now produces identical CallVariantsOutput protos
+to upstream Linux x86 DeepVariant 1.10. End-to-end on a 100 kb chr20
+fixture: 309 variants — 62 hom-ref + 146 het + 101 hom-alt (vs. our
+prior broken model: 209 hom-ref + 100 het + 0 hom-alt).
+
+`inception_v3_mil.py` is kept in tree as documentation of why the
+hand-built path is brittle (and contains the bugs as a cautionary
+example); the production conversion runs through Docker.
+
+CLAUDE.md amendment needed: TF is allowed transitively via the
+upstream Docker image at conversion time, but never in our local
+venvs and never in the runtime artefact.
