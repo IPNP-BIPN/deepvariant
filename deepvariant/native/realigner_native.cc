@@ -31,7 +31,36 @@ struct AssemblyRegion {
   nucleus::genomics::v1::Range region;
   std::vector<std::string> haplotypes;
   std::vector<int> read_indices;  // indices into the input reads vector
+  // Read span: the minimal interval covering ALL assigned reads' alignment
+  // positions. Used to extend the ref window passed to FastPassAligner so
+  // reads sticking out of `region` still align cleanly.
+  int64_t read_span_start = 0;
+  int64_t read_span_end   = 0;
 };
+
+// Returns [read_start, read_end_exclusive) in reference coords, derived
+// from alignment.position + the cigar's reference span (mirrors
+// nucleus.util.utils.read_end on the Python side).
+std::pair<int64_t, int64_t> ReadRefSpan(
+    const nucleus::genomics::v1::Read& read) {
+  const int64_t start = read.alignment().position().position();
+  int64_t ref_len = 0;
+  for (const auto& cu : read.alignment().cigar()) {
+    using ::nucleus::genomics::v1::CigarUnit;
+    switch (cu.operation()) {
+      case CigarUnit::ALIGNMENT_MATCH:
+      case CigarUnit::SEQUENCE_MATCH:
+      case CigarUnit::SEQUENCE_MISMATCH:
+      case CigarUnit::DELETE:
+      case CigarUnit::SKIP:
+        ref_len += cu.operation_length();
+        break;
+      default:
+        break;  // INSERT, soft/hard clip, pad don't consume reference.
+    }
+  }
+  return {start, start + ref_len};
+}
 
 // Merge candidate positions into windows of width 2 × min_windows_distance.
 // Mirror of window_selector._candidates_to_windows. Only positions with
@@ -190,14 +219,30 @@ std::vector<nucleus::genomics::v1::Read> RealignReadsForRegion(
   if (assembled.empty()) return reads;
 
   // ── Step 4: assign reads to assembled regions (first-overlap wins) ───────
+  // While assigning, accumulate read_span = min/max alignment span across
+  // all reads in the region — mirror of realigner.py's AssemblyRegion.add().
   std::vector<bool> read_assigned(reads.size(), false);
   for (auto& ar : assembled) {
+    bool span_init = false;
     for (size_t i = 0; i < reads.size(); ++i) {
       if (read_assigned[i]) continue;
       if (nucleus::ReadOverlapsRegion(reads[i], ar.region)) {
         ar.read_indices.push_back(static_cast<int>(i));
         read_assigned[i] = true;
+        const auto [rs, re] = ReadRefSpan(reads[i]);
+        if (!span_init) {
+          ar.read_span_start = rs;
+          ar.read_span_end   = re;
+          span_init = true;
+        } else {
+          ar.read_span_start = std::min(ar.read_span_start, rs);
+          ar.read_span_end   = std::max(ar.read_span_end,   re);
+        }
       }
+    }
+    if (!span_init) {
+      ar.read_span_start = ar.region.start();
+      ar.read_span_end   = ar.region.end();
     }
   }
 
@@ -217,12 +262,22 @@ std::vector<nucleus::genomics::v1::Read> RealignReadsForRegion(
     if (!contig_or.ok()) continue;
     const int64_t contig_n_bases = contig_or.ValueOrDie()->n_bases();
 
+    // Match realigner.py: extend the ref window to the broader of the
+    // assembled region and the actual reads' alignment span, plus margin.
+    //   ref_start = max(0, min(read_span.start, region.start) - margin)
+    //   ref_end   = min(contig_n, max(read_span.end,   region.end)   + margin)
+    // The interior "window" handed to FastPassAligner stays bounded by the
+    // assembled region — only the prefix/suffix grow when reads overhang.
+    const int64_t span_start =
+        std::min<int64_t>(ar.read_span_start, ar.region.start());
+    const int64_t span_end =
+        std::max<int64_t>(ar.read_span_end, ar.region.end());
     const int64_t ref_start =
-        std::max<int64_t>(0, ar.region.start() - kRefAlignMargin);
+        std::max<int64_t>(0, span_start - kRefAlignMargin);
     const int64_t ref_end =
-        std::min<int64_t>(contig_n_bases, ar.region.end() + kRefAlignMargin);
-    if (ref_end <= ar.region.end()) {
-      // Can't extend; pass these reads through unchanged.
+        std::min<int64_t>(contig_n_bases, span_end + kRefAlignMargin);
+    if (ref_start >= ar.region.start() || ref_end <= ar.region.end()) {
+      // Can't form a non-empty prefix or suffix; pass reads through.
       for (int idx : ar.read_indices) out.push_back(reads[idx]);
       continue;
     }
