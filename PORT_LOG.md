@@ -404,3 +404,57 @@ Next pieces to fully match upstream's VCF (still open):
 2. Multi-allelic merge: replace per-genotype max() with the upstream
    weighting from postprocess_variants.py:_combine_predictions.
 3. gVCF reference blocks (--output_gvcf flag).
+
+### Phase 3 — Realigner integration (2026-04-26 evening)
+
+Native port of `deepvariant/realigner/realigner.py:Realigner.realign_reads`
+landed as `deepvariant/native/realigner_native.{h,cc}`. Wired into
+make_examples_main.cc via `--realigner_enabled` (cli.cc default true).
+
+End-to-end on chr20:5000000-6000000 vs upstream:
+
+|              | before | after  | upstream |
+| ----         | ----   | ----   | -------  |
+| total lines  | 2440   | 3288   | 2967     |
+| ∩ upstream   | 2239   | 2459   | —        |
+| only-ours    | 201    | 829    | —        |
+| only-upstream| 728    | 508    | —        |
+| match (∩/upstream) | 75.5 % | **82.9 %** | — |
+
+Net effect: +220 calls upstream emits that we previously missed
+(realigner-recovered indel-rich sites), at the cost of 628 spurious
+extras — mostly small_model-confident RefCalls (771 / 829 only-ours
+are 0/0).
+
+Why the noise: our window-selector still uses the "legacy" count-based
+mode (matches upstream's default `--ws_use_window_selector_model=False`)
+but with the same threshold of 2 alt reads we keep windows on
+positions where upstream's downstream filtering (or post-merge logic)
+would suppress the call. We did not find a single configuration knob
+that closes the gap cleanly.
+
+Remaining gaps to 100 % VCF parity:
+
+1. **Multi-allelic merge weighting** in `postprocess_main.cc`. On a
+   handful of compound-het sites (chr20:5005000, 5006948, 5011300, …)
+   our `max()`-per-genotype combiner picks 0/2 where upstream picks
+   1/2 — both have PL == 0 in our combined likelihoods. The fix is to
+   port `postprocess_variants.py:_combine_predictions` exactly (it
+   uses a weighted-sum, not max).
+
+2. **RefCall suppression on weak candidates**. Upstream emits ~1146
+   RefCalls in this region; we emit ~1494. The extras are mostly
+   small_model-confident hom-ref calls at low-alt-fraction positions.
+   Need to verify: does upstream's pipeline skip emitting CVOs when
+   `min_alt_fraction_for_emit` falls below some threshold?
+
+3. **Realigner false positives**. The realigner's DBG produces
+   haplotypes that when read-aligned reveal SNPs in proportions
+   slightly different from upstream's. Closing this likely needs the
+   `WindowSelectorModel` linear path (and we'd need the trained
+   coefficients — they're not in flags_for_calling so we'd have to
+   port the upstream Python defaults).
+
+The model itself remains bit-identical to upstream (small_model + big
+model both pass parity_check.py at 0.000000 max-abs softmax diff on
+the upstream golden examples).
