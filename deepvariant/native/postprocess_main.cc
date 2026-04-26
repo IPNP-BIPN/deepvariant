@@ -506,11 +506,21 @@ int RunPostprocessVariants(int argc, char** argv) {
     }
     auto [j, k] = GenotypeFromPLIndex(best, n_alts);
 
-    // QUAL = phred-scale of P(0/0).
-    double p_ref = like[0];
-    double qual = (p_ref >= 1.0) ? 0.0
-                                 : std::min(-10.0 * std::log10(p_ref),
-                                            static_cast<double>(kMaxPhred));
+    // QUAL = phred-scale of P(non-ref).
+    //
+    // Upstream's formula:
+    //   qual = ptrue_to_bounded_phred(min(sum(predictions[1:]), 1.0))
+    //        = phred(1 - sum(predictions[1:]))
+    // *not* phred(predictions[0]) — these only agree when the prediction
+    // vector sums to exactly 1.0, which it doesn't quite under FP32. Using
+    // predictions[0] directly drifts QUAL by up to ~0.1 (e.g. 54.1 vs 54).
+    double sum_alt = 0.0;
+    for (int i = 1; i < n_gt; ++i) sum_alt += like[i];
+    if (sum_alt > 1.0) sum_alt = 1.0;
+    const double err_for_qual = std::max(1.0 - sum_alt, 0.0);
+    double qual = (err_for_qual >= 1.0) ? 0.0
+                                        : std::min(-10.0 * std::log10(err_for_qual),
+                                                   static_cast<double>(kMaxPhred));
 
     // Set up the VariantCall.
     if (variant.calls_size() == 0) variant.add_calls();
