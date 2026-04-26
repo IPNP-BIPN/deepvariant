@@ -18,11 +18,13 @@
 
 #include "deepvariant/allelecounter.h"
 #include "deepvariant/make_examples_native.h"
+#include "deepvariant/native/realigner_native.h"
 #include "deepvariant/native/regions.h"
 #include "deepvariant/native/small_model_features.h"
 #include "deepvariant/native/small_model_inference.h"
 #include "deepvariant/native/tfrecord.h"
 #include "deepvariant/protos/deepvariant.pb.h"
+#include "deepvariant/protos/realigner.pb.h"
 #include "deepvariant/variant_calling.h"
 #include "deepvariant/variant_calling_multisample.h"
 #include "absl/flags/flag.h"
@@ -79,6 +81,9 @@ ABSL_FLAG(int, small_model_snp_gq_threshold, 20,
           "Min phred GQ for the small model to commit a SNP call.");
 ABSL_FLAG(int, small_model_indel_gq_threshold, 28,
           "Min phred GQ for the small model to commit an indel call.");
+ABSL_FLAG(bool, realigner_enabled, false,
+          "Enable upstream's realigner (DeBruijnGraph + FastPassAligner) "
+          "to recover candidates in indel-rich regions.");
 
 namespace deepvariant {
 
@@ -395,10 +400,27 @@ int RunMakeExamples(int argc, char** argv) {
     LOG(INFO) << "  read " << reads.size() << " reads from BAM";
     if (reads.empty()) continue;
 
+    // ── Optional: realign reads through assembled haplotypes ─────────────
+    // Done before any AlleleCounter pass so candidate sweep + ref read
+    // tracking see the realigned reads (matches upstream's flow).
+    std::vector<nucleus::genomics::v1::Read> working_reads;
+    if (absl::GetFlag(FLAGS_realigner_enabled)) {
+      // Pre-scan AlleleCounter to give the realigner candidate-position
+      // counts (its WindowSelector consumes the AlleleCounts).
+      AlleleCounter pre(ref_reader.get(), region, {},
+                        opts.allele_counter_options());
+      for (const auto& r : reads) pre.Add(r, sample_name);
+      working_reads =
+          RealignReadsForRegion(reads, region, pre, *ref_reader,
+                                 DefaultRealignerOptions());
+    } else {
+      working_reads = reads;
+    }
+
     // First pass: find candidate positions (no ref-read tracking yet).
     AlleleCounter probe(ref_reader.get(), region, {},
                         opts.allele_counter_options());
-    for (const auto& r : reads) probe.Add(r, sample_name);
+    for (const auto& r : working_reads) probe.Add(r, sample_name);
     auto probe_candidates = caller.CallsFromAlleleCounter(probe);
     if (probe_candidates.empty()) continue;
 
@@ -419,7 +441,7 @@ int RunMakeExamples(int argc, char** argv) {
 
     AlleleCounter counter(ref_reader.get(), region, candidate_positions,
                           opts.allele_counter_options());
-    for (const auto& r : reads) counter.Add(r, sample_name);
+    for (const auto& r : working_reads) counter.Add(r, sample_name);
 
     std::vector<DeepVariantCall> candidates =
         caller.CallsFromAlleleCounter(counter);
@@ -496,8 +518,8 @@ int RunMakeExamples(int argc, char** argv) {
     }
 
     std::vector<nucleus::ConstProtoPtr<nucleus::genomics::v1::Read>> read_ptrs;
-    read_ptrs.reserve(reads.size());
-    for (auto& r : reads) {
+    read_ptrs.reserve(working_reads.size());
+    for (auto& r : working_reads) {
       read_ptrs.push_back(
           nucleus::ConstProtoPtr<nucleus::genomics::v1::Read>(&r));
     }
