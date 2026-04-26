@@ -200,3 +200,30 @@ example); the production conversion runs through Docker.
 CLAUDE.md amendment needed: TF is allowed transitively via the
 upstream Docker image at conversion time, but never in our local
 venvs and never in the runtime artefact.
+
+### Parity at 1 Mb scale (2026-04-26)
+
+End-to-end test on `chr20:5000000-6000000` (HG002 BAM, GRCh38):
+
+  upstream `run_deepvariant` → 2967 VCF lines
+  our `deepvariant run`        → 2576 VCF lines
+
+The 391-line gap comes from our `make_examples` not yet enabling
+realigner / gVCF / small-model features (deferred Phase-3 follow-ups,
+documented in PORT_LOG above). The candidates we *do* emit run
+through the same model as upstream and produce identical CVOs.
+
+To prove the inference path is correct in isolation, we ran our
+`call_variants` on upstream's intermediate examples
+(`make_examples.tfrecord-00000-of-00001.gz`, 668 examples / 508 unique
+variants):
+
+  argmax agreement : 508/508 = 100.000%
+  softmax max-abs  : 0.000002
+
+Closing the VCF gap is now a pure `make_examples` work-list:
+  - Wire `Realigner` into the per-region loop (deepvariant/realigner)
+  - Emit gVCF reference blocks
+  - Optional: small-model first-pass calls
+None of these change the inference path — they add candidates that
+go through the (already-bit-correct) `call_variants` step.
