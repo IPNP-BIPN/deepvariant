@@ -706,3 +706,88 @@ region. Systematic side-by-side at the DBG level is what closes the
 86.4 % → 99 %+ gap.
 
 Estimated effort: 3-5 days of careful work, as previously scoped.
+
+### Realigner orchestration + postprocess parity push (2026-04-27)
+
+**Big jump: chr20:5M-6M went from 86.5 % key-match / 0 % byte-match to
+98.75 % key-match / 81.0 % byte-match in a sequence of focused
+upstream-mirroring fixes.**
+
+| metric                                | before | now   | upstream |
+| ------------------------------------- | ------ | ----- | -------- |
+| VCF lines                             | 2698   | 3019  | 2967     |
+| chrom:pos:ref:alt:gt match            | 2566   | 2930  | —        |
+| exact-line byte-identical match       | 0      | 2404  | —        |
+| upstream-only positions               | 373    | 29    | —        |
+| ours-only positions                   | 104    | 81    | —        |
+
+**Five fixes that landed:**
+
+1. **realigner: dedicated WindowSelector AlleleCounter + region
+   expansion + min_allele_support** (`8f46277f`). Mirrors upstream's
+   `realigner.py:_candidates_from_reads` exactly: a separate
+   AlleleCounter for the WindowSelector with `ws_min_mapq=20`,
+   `ws_min_base_quality=20`, region expanded ±20bp, and AlleleFilter
+   gating singleton alleles via `min_allele_support=2`. Assembled
+   regions per 1Mb went 521 → 1075. Key-match 86.5 % → 98.75 %.
+
+2. **postprocess: QUAL formatted to 1 decimal at write**
+   (`set_round_qual_values=true` on VcfWriterOptions, in `68a9c77d`).
+   Was emitting `39.3745` where upstream has `39.4`. Drove byte-match
+   from 0 to 529.
+
+3. **postprocess: ProbToPhred truncates toward zero, not std::round**
+   (in `68a9c77d`). Mirror of `vcf_conversion.cc` casting double
+   `Log10PErrorToPhred` to int via implicit narrowing — closed the
+   systematic ±1-phred PL drift across most sites. 529 → 2380.
+
+4. **postprocess: skip renormalisation in single-CVO and unpruned-alt
+   paths** (in `68a9c77d`). FP32-saturated softmax outputs already
+   sum to 1.0+ε; renormalising sneaks `predictions[0]` below 1.0,
+   pushes `ptrue_to_bounded_phred` past the 99-cap, and emits
+   `GQ=78` for very-confident homref calls instead of upstream's `99`.
+
+5. **postprocess: QUAL = phred(1 − sum_alt), not phred(p_ref)**
+   (`884b299b`). Mirror of upstream's compute_quals — the two only
+   agree when predictions sum to exactly 1.0, which under FP32 they
+   don't. +10 byte-identical lines.
+
+6. **postprocess: AD/VAF/MF/MD reindex on alt-prune** (`7cf147ef`).
+   Port of upstream's `AlleleRemapper.reindex_allele_indexed_fields`
+   for `_ALT_ALLELE_INDEXED_FORMAT_FIELDS = {(AD, ref_is_zero=true),
+   (VAF, ref_is_zero=false), …}`. Was emitting `AD=24,8,9` for
+   single-alt sites because both pre-prune alt counts survived
+   alongside the pruned alt list. +14 byte-identical lines.
+
+**What's left in the 18.9 % byte-mismatch (563 sites at same key but
+different bytes):**
+
+- ~80 PL-only ±1 drift on `MID=deepvariant` (big-model) sites — TF
+  vs Core ML inference produces softmax outputs differing at the 7th
+  significant digit, which crosses phred half-integer boundaries
+  after truncation. FP32 precision boundary; can't fix without
+  bit-parity inference.
+- ~66 QUAL-only ±0.1 drift on `MID=small_model` sites — same root
+  cause; small_model TF vs Core ML softmax differs at the 8th digit.
+- ~50 GQ ±1 drift, also FP32-bounded.
+- ~100 sites where DP / AD / VAF differ — realigner-driven: same BAM
+  but different reads land on alt vs ref after our DBG/FastPassAligner
+  produces a different haplotype set than upstream's at that locus.
+  Closing this requires DBG-level bit-parity in the realigner; the
+  per-window instrumentation work tracked at the bottom of the
+  previous entry.
+
+**The 110 candidate-set differences (29 upstream-only + 81 ours-only)
+are also realigner-driven** — both pipelines emit some low-VAF
+positions the other doesn't. Looking at our-only RefCalls, they
+cluster in regions where our realigner assembled a different set of
+haplotypes than upstream's, pushing 1-2 extra reads onto an alt at
+each position; with `min_fraction_snps=0.12` exactly at the
+boundary, that tips the candidate decision.
+
+**Today's deliverable.** Mac arm64 binary that runs DeepVariant WGS
+single-sample and matches upstream's chr20:5M-6M VCF at 98.75 % key
+parity / 81 % byte parity, with the remaining gap bounded by FP32
+softmax precision (TF↔Core ML) and by the realigner's DBG haplotype
+divergence. Inference path is bit-identical to upstream at the
+argmax level (508/508, max-abs softmax 2e-6 from the Phase-0 bench).
