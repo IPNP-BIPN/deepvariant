@@ -28,6 +28,7 @@ Running log: `PORT_LOG.md`.
 6. **Don't modify upstream `BUILD` / Bazel rules or upstream Python files.** They stay as a Linux/Bazel reference. v2 builds via CMake on macOS only and contains zero Python files of our own.
 7. **No half-finished implementations.** Each phase has a success gate; do not cross it without meeting the gate. Stubs are allowed but must error out with `not yet implemented` rather than silently no-op.
 8. **No Python in our code, ever.** All dev-time tooling is Swift (`tools/conversion/`, a Swift Package) or shell (`tools/reference/`, `release/`). The only Python in the repo is upstream's pre-existing tools/*.py from r1.10 — left untouched.
+9. **TF is allowed transitively in Docker at conversion time.** The model conversion runs `coremltools.convert(saved_model, source='tensorflow')` inside `google/deepvariant:1.10.0` (which already ships TF 2.16). TF never appears in our local venvs and never in the runtime artefact. See `tools/conversion/convert_via_docker.sh`.
 
 ## Stop conditions (per spec)
 

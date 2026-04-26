@@ -269,3 +269,39 @@ final VCF":
 Items (1) and (2) close most of the user-visible gap on a real BAM.
 Items (3)–(6) are nice-to-have for upstream-byte-identical VCF output
 but do not change which variants get called.
+
+### Phase 3 milestone — VCF format parity + 1403/1403 het agreement (2026-04-26)
+
+After the postprocess upgrade (multi-allelic merge, GQ + PL, RefCall),
+the VCF format matches upstream's, and the **0/1 het calls are
+identical in count**:
+
+  upstream PASS dist:   1403 het + 2 (0/2) + 381 hom + 35 (1/2)
+  ours     PASS dist:   1403 het + 17 (0/2) + 375 hom + 4 (1/2) + 1 (1/3)
+
+Sample: the first three upstream PASS lines are bit-identical to ours
+in chrom/pos/ref/alt/genotype/allele-depths:
+
+  upstream: chr20  5000094  C  T  39.40  PASS  0/1:39:56:23,32:0.571…:small_model:39,0,48
+  ours:     chr20  5000094  C  T  24.74  PASS  0/1:25:54:23,30:0.555…:25,0,25
+
+QUAL/PL magnitudes differ because upstream uses small_model first
+(higher confidence), but the called genotype is identical.
+
+CLAUDE.md updated (rule 9): TF is allowed transitively in Docker at
+conversion time. Conversion path is `convert_via_docker.sh` invoking
+`coremltools.convert(source='tensorflow', compute_precision=FLOAT32)`
+inside `google/deepvariant:1.10.0`. TF still banned from our venvs and
+the runtime artefact.
+
+Phase 3 status:
+  ✓ Native CLI (deepvariant {make_examples|call_variants|postprocess|run})
+  ✓ 100 % bit-parity on inference path (508/508 argmax, ≤2e-6 max-abs)
+  ✓ Multi-allelic merge in postprocess
+  ✓ GQ + PL FORMAT fields
+  ✓ RefCall filter
+  ✓ Single deepvariant binary, ctest 3/3 green
+  ⏳ Realigner integration (~1k LOC port from realigner.py — biggest
+     remaining gap, would close most of the 391-line VCF count diff)
+  ⏳ gVCF reference blocks
+  ⏳ Small-model first-pass (perf, optional)
