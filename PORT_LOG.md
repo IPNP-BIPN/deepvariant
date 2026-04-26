@@ -630,3 +630,79 @@ After this commit, the still-open items from the plan's v1.0 list:
 
 Total: 5-8 person-weeks more. Today we have a solid scaffold + WGS
 single-sample at 86 % VCF match + every postprocess gate at 99.93 %.
+
+### Realigner port — read_span + per-position diagnostics (2026-04-26 night)
+
+**What landed.**
+
+1. `realigner_native.cc` — extended ref window passed to FastPassAligner
+   to cover reads that overhang the assembled window:
+       ref_start = max(0, min(read_span.start, region.start) - margin)
+       ref_end   = min(contig_n, max(read_span.end, region.end) + margin)
+   Mirror of `realigner.py:call_fast_pass_aligner`. Reads sticking out
+   of the window now align cleanly at the prefix/suffix instead of
+   being truncated.
+
+2. `dump_cvo` — TFRecord dumper for CallVariantsOutput protos. Prints
+   `<chrom>\t<pos1>\t<ref>\t<alt>...\t<argmax>` per record so we can
+   diff our small_cvo / big_cvo position sets against upstream's
+   intermediate output without spinning up Python.
+
+3. `dump_allele_counts` — runs our AlleleCounter on a chr:start-end and
+   prints per-position ref + alt allele counts. The reproducer for
+   parity work at the candidate-generation layer.
+
+**Measurements on chr20:5M-6M with read_span fix in.**
+
+| metric                                | upstream | ours | gap |
+| ------------------------------------- | -------- | ---- | --- |
+| VCF lines                             | 2967     | 2698 | -269 |
+| chrom:pos:ref:alt:gt matches          | —        | 2566 | 401 missing |
+| small_cvo positions (after grouping)  | 2500     | 2200 | -300 |
+| big_cvo positions                     | 508      | 443  | -65  |
+
+read_span fix alone moved 2 calls (2564 → 2566 match). Marginal — the
+dominant gap is upstream of the FastPassAligner step.
+
+**Categorisation of the 373 upstream-only positions.**
+
+- 351 are `RefCall 0/0` low-VAF homref candidates (small_model)
+- 14 are `NoCall ./.` (small_model below GQ threshold)
+- 8 are `PASS 0/1` (real missed variants — mostly low-VAF indels in
+  homopolymers + dinucleotide repeats)
+
+These positions never appear in our candidate set at all, so they
+can't be recovered downstream by inference or postprocess polish.
+
+**Root cause located: realigner under-assembles compared to upstream.**
+
+Spot-check on chr20:5001580-5001650 (from `dump_allele_counts`,
+realigner OFF, our pipeline, raw alignment):
+
+| pos     | ref base | our ref | our alt        | upstream AD | gap   |
+| ------- | -------- | ------- | -------------- | ----------- | ----- |
+| 5001597 | A        | 22      | C=2 T=1        | 22, 5 (C)   | -3 C  |
+| 5001614 | T        | 24      | A=1 C=1 G=1    | 24, 4 (C)   | -3 C  |
+| 5001625 | A        | 25      | G=2            | 25, 6 (G)   | -4 G  |
+| 5001631 | T        | 26      | A=2            | 26, 4 (G)   | wrong alt |
+| 5001634 | T        | 27      | G=1            | 27, 4 (G)   | -3 G  |
+
+Upstream's published AD is **post-realignment** — 3-4 reads per
+position only land on the alt allele after realignment to an
+assembled haplotype. Our raw AlleleCounter is fine; the realigner
+isn't recovering those reads.
+
+When we run only chr20:5001580-5001650 through our binary with
+realigner on, it picks 1 candidate window and produces **0 assembled
+regions** — DBG either fails to build a graph or returns only the ref
+haplotype. Upstream must produce at least one non-ref haplotype here
+to push 3-4 reads onto each alt.
+
+**Next step.** Per-window instrumentation in our realigner: log every
+candidate window, its DBG haplotype set, and the count of reads that
+got re-aligned to non-ref. Diff that against upstream's diagnostics
+(`--realigner_diagnostics` mode in upstream's container) on the same
+region. Systematic side-by-side at the DBG level is what closes the
+86.4 % → 99 %+ gap.
+
+Estimated effort: 3-5 days of careful work, as previously scoped.
