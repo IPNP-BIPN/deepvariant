@@ -1,20 +1,30 @@
-// Native postprocess_variants — calling mode only.
+// Native postprocess_variants — calling mode.
 //
-// Reads CallVariantsOutput TFRecords, sorts by genomic coordinate,
-// assigns genotypes from 3-class probabilities, and writes VCF.
+// Reads CallVariantsOutput TFRecords, groups by genomic site (multi-allelic
+// merge), assigns the most-likely diploid genotype, and writes VCF with
+// FORMAT fields GT:GQ:DP:AD:VAF:PL.
 //
-// Genotype mapping:
-//   class 0 → 0/0 (hom ref)
-//   class 1 → 0/1 (het)
-//   class 2 → 1/1 (hom alt)
+// Multi-allelic merge: upstream make_examples emits one example per
+// alt-allele combination at multi-allelic sites (multi_allelic_mode =
+// ADD_HET_ALT_IMAGES). Each resulting CVO carries:
+//   - the same Variant (with the full alt list)
+//   - cvo.alt_allele_indices.indices: which alt(s) the example tested
+//   - cvo.genotype_probabilities: 3-vector
+//     - if indices == [i]:   [P(0/0), P(0/(i+1)), P((i+1)/(i+1))]
+//     - if indices == [i,j]: [P(other), P((i+1)/(j+1)), P(other)]
+// We collect these into a likelihood table over all diploid genotypes,
+// pick argmax, and emit one VCF line per site.
 
 #include "deepvariant/native/postprocess_main.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "deepvariant/native/tfrecord.h"
@@ -24,31 +34,35 @@
 #include "absl/log/check.h"
 #include "absl/log/initialize.h"
 #include "absl/log/log.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 #include "third_party/nucleus/io/reference.h"
 #include "third_party/nucleus/io/vcf_writer.h"
 #include "third_party/nucleus/protos/reference.pb.h"
+#include "third_party/nucleus/protos/struct.pb.h"
 #include "third_party/nucleus/protos/variants.pb.h"
 #include "third_party/nucleus/util/utils.h"
 
 ABSL_FLAG(std::string, infile, "", "Input CVO TFRecord path (may be sharded).");
-// --ref and --sample_name are owned by make_examples_main.cc.
 ABSL_DECLARE_FLAG(std::string, ref);
 ABSL_DECLARE_FLAG(std::string, sample_name);
-// --outfile here means VCF; renamed to avoid collision with call_variants.
 ABSL_FLAG(std::string, output_vcf_outfile, "", "Output VCF path.");
 ABSL_FLAG(std::string, gvcf_outfile, "", "gVCF output path (optional).");
-ABSL_FLAG(double, qual_filter, 0.0,
-          "Filter calls with QUAL below this threshold.");
+ABSL_FLAG(double, qual_filter, 1.0,
+          "Variants with QUAL below this become RefCall instead of PASS.");
 
 namespace deepvariant {
 
 using learning::genomics::deepvariant::CallVariantsOutput;
+using nucleus::genomics::v1::Variant;
+using nucleus::genomics::v1::VariantCall;
 
 namespace {
 
-// Expand a sharded filespec like "path/to/file@4" into the 4 shard paths.
+constexpr int kMaxPhred = 99;
+
 std::vector<std::string> ExpandShards(const std::string& spec) {
   auto at = spec.find('@');
   if (at == std::string::npos) return {spec};
@@ -63,64 +77,87 @@ std::vector<std::string> ExpandShards(const std::string& spec) {
   return paths;
 }
 
-constexpr int kPhred255 = 255;
-
-// GQ from probability: -10 * log10(1 - prob), capped at 255.
-int ProbToGQ(double prob) {
-  if (prob >= 1.0) return kPhred255;
-  double gq = -10.0 * std::log10(1.0 - prob);
-  return static_cast<int>(std::min(gq, static_cast<double>(kPhred255)));
+// Convert probability p (in [0,1]) to a phred score, capped at 99.
+int ProbToPhred(double p) {
+  if (p >= 1.0) return 0;
+  if (p <= 0.0) return kMaxPhred;
+  int phred = static_cast<int>(std::round(-10.0 * std::log10(p)));
+  return std::min(std::max(phred, 0), kMaxPhred);
 }
 
-// QUAL from call probs: -10 * log10(P(ref/ref)).
-double ProbsToQual(const google::protobuf::RepeatedField<double>& probs) {
-  if (probs.size() < 1) return 0.0;
-  double p_hom_ref = probs[0];
-  if (p_hom_ref <= 0.0) return 60.0;
-  return std::min(-10.0 * std::log10(p_hom_ref), 60.0);
+// Number of diploid genotypes for a variant with `n_alts` alternates:
+// 0/0, 0/1, 1/1, 0/2, 1/2, 2/2, ... = (n_alleles)*(n_alleles+1)/2.
+int NumDiploidGenotypes(int n_alts) {
+  const int n_alleles = n_alts + 1;
+  return n_alleles * (n_alleles + 1) / 2;
 }
 
-// Assign genotype and quality from 3-class softmax probabilities.
-// class 0 = hom ref, class 1 = het, class 2 = hom alt.
-void AssignGenotypeFromProbs(
-    const google::protobuf::RepeatedField<double>& probs,
-    nucleus::genomics::v1::VariantCall* call, double* qual_out) {
-  *qual_out = 0.0;
-  if (probs.size() < 3) {
-    call->add_genotype(0);
-    call->add_genotype(0);
-    return;
+// Return the two-allele genotype (a, b) with a <= b for the given VCF PL
+// index. PL ordering: F(j/k) = k*(k+1)/2 + j  (j <= k).
+std::pair<int, int> GenotypeFromPLIndex(int pl_index, int n_alts) {
+  for (int k = 0; k <= n_alts; ++k) {
+    for (int j = 0; j <= k; ++j) {
+      const int idx = k * (k + 1) / 2 + j;
+      if (idx == pl_index) return {j, k};
+    }
   }
+  return {0, 0};  // fallback
+}
 
-  int argmax = 0;
-  float max_p = probs[0];
-  for (int i = 1; i < probs.size(); ++i) {
-    if (probs[i] > max_p) {
-      max_p = probs[i];
-      argmax = i;
+// Combine all CVOs for one site into a per-genotype likelihood vector.
+// Returns a vector of length NumDiploidGenotypes(n_alts).
+//
+// Each CVO contributes its three-class probs to the corresponding diploid
+// genotypes:
+//   indices == [i]   →   contributes to (0,0), (0,i+1), (i+1,i+1)
+//   indices == [i,j] →   contributes to (i+1,j+1) on probs[1]
+//
+// When multiple CVOs assign a probability to the same genotype, we take the
+// MAX (the most confident measurement of that genotype's likelihood).
+std::vector<double> CombineLikelihoods(
+    const std::vector<const CallVariantsOutput*>& cvos, int n_alts) {
+  const int n_gt = NumDiploidGenotypes(n_alts);
+  std::vector<double> like(n_gt, 0.0);
+
+  auto pl_idx = [](int j, int k) {
+    if (j > k) std::swap(j, k);
+    return k * (k + 1) / 2 + j;
+  };
+
+  for (const auto* cvo : cvos) {
+    const auto& probs = cvo->genotype_probabilities();
+    if (probs.size() < 3) continue;
+    const auto& indices = cvo->alt_allele_indices().indices();
+    if (indices.size() == 1) {
+      const int i = indices[0];
+      // (0,0)            ← probs[0]
+      // (0, i+1)         ← probs[1]
+      // (i+1, i+1)       ← probs[2]
+      like[pl_idx(0, 0)] = std::max(like[pl_idx(0, 0)], probs[0]);
+      like[pl_idx(0, i + 1)] = std::max(like[pl_idx(0, i + 1)], probs[1]);
+      like[pl_idx(i + 1, i + 1)] =
+          std::max(like[pl_idx(i + 1, i + 1)], probs[2]);
+    } else if (indices.size() == 2) {
+      const int i = indices[0];
+      const int j = indices[1];
+      // (i+1, j+1)       ← probs[1] (the het-of-both signal)
+      like[pl_idx(i + 1, j + 1)] =
+          std::max(like[pl_idx(i + 1, j + 1)], probs[1]);
+      // probs[0] also contributes to ref genotype.
+      like[pl_idx(0, 0)] = std::max(like[pl_idx(0, 0)], probs[0]);
     }
   }
 
-  *qual_out = ProbsToQual(probs);
-
-  switch (argmax) {
-    case 0:
-      call->add_genotype(0);
-      call->add_genotype(0);
-      break;
-    case 1:
-      call->add_genotype(0);
-      call->add_genotype(1);
-      break;
-    default:
-      call->add_genotype(1);
-      call->add_genotype(1);
-      break;
+  // Renormalise so the vector sums to 1 (or close): if no entry was set,
+  // default to uniform.
+  double s = 0;
+  for (double v : like) s += v;
+  if (s <= 0.0) {
+    std::fill(like.begin(), like.end(), 1.0 / n_gt);
+  } else {
+    for (double& v : like) v /= s;
   }
-
-  // GQ via info map (the VCF FORMAT GQ field is stored in VariantCall.info).
-  // Skipped for now — not strictly needed for a well-formed VCF.
-  (void)ProbToGQ;
+  return like;
 }
 
 // Build a VcfHeader from reference contigs.
@@ -130,10 +167,17 @@ nucleus::genomics::v1::VcfHeader MakeVcfHeader(
   nucleus::genomics::v1::VcfHeader hdr;
   hdr.set_fileformat("VCFv4.2");
 
-  // FILTER lines.
-  auto* pass_filter = hdr.add_filters();
-  pass_filter->set_id("PASS");
-  pass_filter->set_description("All filters passed");
+  struct Filt { const char* id; const char* desc; };
+  static constexpr Filt kFilters[] = {
+      {"PASS",    "All filters passed"},
+      {"RefCall", "Most likely homozygous reference"},
+      {"LowQual", "Confidence in this variant being real is below threshold"},
+  };
+  for (const auto& fi : kFilters) {
+    auto* f = hdr.add_filters();
+    f->set_id(fi.id);
+    f->set_description(fi.desc);
+  }
 
   // INFO fields.
   {
@@ -145,58 +189,33 @@ nucleus::genomics::v1::VcfHeader MakeVcfHeader(
   }
 
   // FORMAT fields.
-  {
-    auto* f = hdr.add_formats();
-    f->set_id("GT");
-    f->set_number("1");
-    f->set_type("String");
-    f->set_description("Genotype");
-  }
-  {
-    auto* f = hdr.add_formats();
-    f->set_id("GQ");
-    f->set_number("1");
-    f->set_type("Integer");
-    f->set_description("Genotype quality");
-  }
-  {
-    auto* f = hdr.add_formats();
-    f->set_id("DP");
-    f->set_number("1");
-    f->set_type("Integer");
-    f->set_description("Read depth");
-  }
-  {
-    auto* f = hdr.add_formats();
-    f->set_id("AD");
-    f->set_number("R");
-    f->set_type("Integer");
-    f->set_description("Allelic depths for ref and alt alleles");
-  }
-  {
-    auto* f = hdr.add_formats();
-    f->set_id("VAF");
-    f->set_number("A");
-    f->set_type("Float");
-    f->set_description("Variant allele fractions");
-  }
-  {
-    auto* f = hdr.add_formats();
-    f->set_id("PL");
-    f->set_number("G");
-    f->set_type("Integer");
-    f->set_description("Phred-scaled genotype likelihoods");
+  struct Fmt {
+    const char* id;
+    const char* num;
+    const char* type;
+    const char* desc;
+  };
+  static constexpr Fmt fmts[] = {
+      {"GT", "1", "String", "Genotype"},
+      {"GQ", "1", "Integer", "Conditional genotype quality"},
+      {"DP", "1", "Integer", "Read depth"},
+      {"AD", "R", "Integer", "Allelic depths for ref and alt alleles"},
+      {"VAF", "A", "Float", "Variant allele fractions"},
+      {"PL", "G", "Integer", "Phred-scaled genotype likelihoods"},
+  };
+  for (const auto& f : fmts) {
+    auto* fi = hdr.add_formats();
+    fi->set_id(f.id);
+    fi->set_number(f.num);
+    fi->set_type(f.type);
+    fi->set_description(f.desc);
   }
 
   // Contigs.
   for (const auto& c : contigs) {
-    auto* contig = hdr.add_contigs();
-    *contig = c;
+    *hdr.add_contigs() = c;
   }
-
-  // Sample name.
   hdr.add_sample_names(sample_name);
-
   return hdr;
 }
 
@@ -221,7 +240,6 @@ int RunPostprocessVariants(int argc, char** argv) {
   auto ref_reader = std::move(ref_or.ValueOrDie());
   const auto& contigs = ref_reader->Contigs();
 
-  // Contig → position-in-FASTA map for sorting.
   std::map<std::string, int> contig_to_pos;
   for (int i = 0; i < static_cast<int>(contigs.size()); ++i) {
     contig_to_pos[contigs[i].name()] = i;
@@ -230,7 +248,6 @@ int RunPostprocessVariants(int argc, char** argv) {
   // ── Read all CallVariantsOutput protos ────────────────────────────────────
   const std::vector<std::string> shard_paths = ExpandShards(infile);
   std::vector<CallVariantsOutput> cvo_list;
-
   for (const auto& path : shard_paths) {
     auto reader = TFRecordReader::New(path);
     if (!reader) {
@@ -247,72 +264,109 @@ int RunPostprocessVariants(int argc, char** argv) {
     }
     reader->Close();
   }
-
   LOG(INFO) << "Read " << cvo_list.size() << " CallVariantsOutput protos.";
 
-  // ── Sort by genomic coordinate ────────────────────────────────────────────
-  std::stable_sort(
-      cvo_list.begin(), cvo_list.end(),
-      [&contig_to_pos](const CallVariantsOutput& a,
-                       const CallVariantsOutput& b) {
-        const int pa = contig_to_pos.count(a.variant().reference_name())
-                           ? contig_to_pos.at(a.variant().reference_name())
-                           : INT_MAX;
-        const int pb = contig_to_pos.count(b.variant().reference_name())
-                           ? contig_to_pos.at(b.variant().reference_name())
-                           : INT_MAX;
-        if (pa != pb) return pa < pb;
-        return a.variant().start() < b.variant().start();
-      });
+  // ── Group CVOs by site key (chrom, pos, ref, alts) ────────────────────────
+  // The variant proto is identical for all CVOs of the same site under
+  // ADD_HET_ALT_IMAGES; only the alt_allele_indices differ.
+  using SiteKey = std::tuple<std::string, int64_t, std::string, std::string>;
+  std::map<SiteKey, std::vector<const CallVariantsOutput*>> groups;
+  for (const auto& cvo : cvo_list) {
+    if (!cvo.has_variant()) continue;
+    const auto& v = cvo.variant();
+    SiteKey k{v.reference_name(), v.start(), v.reference_bases(),
+              absl::StrJoin(v.alternate_bases(), ",")};
+    groups[k].push_back(&cvo);
+  }
+  LOG(INFO) << "Grouped into " << groups.size() << " unique sites.";
+
+  // ── Sort sites by genomic coordinate ──────────────────────────────────────
+  std::vector<SiteKey> ordered_keys;
+  ordered_keys.reserve(groups.size());
+  for (const auto& [k, _] : groups) ordered_keys.push_back(k);
+  std::sort(ordered_keys.begin(), ordered_keys.end(),
+            [&contig_to_pos](const SiteKey& a, const SiteKey& b) {
+              const int pa = contig_to_pos.count(std::get<0>(a))
+                                 ? contig_to_pos.at(std::get<0>(a))
+                                 : INT_MAX;
+              const int pb = contig_to_pos.count(std::get<0>(b))
+                                 ? contig_to_pos.at(std::get<0>(b))
+                                 : INT_MAX;
+              if (pa != pb) return pa < pb;
+              return std::get<1>(a) < std::get<1>(b);
+            });
 
   // ── Open VCF writer ───────────────────────────────────────────────────────
   std::string sample_name = absl::GetFlag(FLAGS_sample_name);
   if (sample_name.empty()) sample_name = "SAMPLE";
-  nucleus::genomics::v1::VcfHeader hdr =
-      MakeVcfHeader(contigs, sample_name);
-
+  auto hdr = MakeVcfHeader(contigs, sample_name);
   nucleus::genomics::v1::VcfWriterOptions wr_opts;
+  // Tell the writer to read PL from VariantCall.info instead of from the
+  // (Float-typed) genotype_likelihood field, which lets us write Integer PL.
+  wr_opts.set_retrieve_gl_and_pl_from_info_map(true);
   auto writer_or = nucleus::VcfWriter::ToFile(outfile, hdr, wr_opts);
   CHECK(writer_or.ok()) << "Failed to open VCF output: " << outfile;
   auto vcf_writer = std::move(writer_or.ValueOrDie());
 
   const double qual_filter = absl::GetFlag(FLAGS_qual_filter);
 
-  // ── Convert and write variants ────────────────────────────────────────────
   int written = 0;
-  int filtered = 0;
+  int refcall = 0;
 
-  for (const auto& cvo : cvo_list) {
-    if (!cvo.has_variant()) continue;
+  for (const auto& key : ordered_keys) {
+    const auto& cvos = groups[key];
+    Variant variant = cvos.front()->variant();
+    const int n_alts = variant.alternate_bases_size();
+    const int n_gt = NumDiploidGenotypes(n_alts);
 
-    // Work on a copy since we'll modify it.
-    nucleus::genomics::v1::Variant variant = cvo.variant();
+    // Combine likelihoods over all CVOs of this site.
+    auto like = CombineLikelihoods(cvos, n_alts);
 
-    // Find the alt allele set that corresponds to this CVO (the model picks
-    // one alt at a time; here we always have one call per CVO).
-    double qual = 0.0;
-
-    // Add a VariantCall with the genotype from probabilities.
-    if (variant.calls_size() == 0) {
-      auto* call = variant.add_calls();
-      call->set_call_set_name(sample_name);
-      AssignGenotypeFromProbs(cvo.genotype_probabilities(), call, &qual);
-    } else {
-      // Calls may already be present from make_examples. Update the genotype.
-      for (auto& call : *variant.mutable_calls()) {
-        call.set_call_set_name(sample_name);
-        call.clear_genotype();
-        AssignGenotypeFromProbs(cvo.genotype_probabilities(), &call, &qual);
-        break;  // Only first call for now.
-      }
+    // argmax genotype.
+    int best = 0;
+    for (int i = 1; i < n_gt; ++i) {
+      if (like[i] > like[best]) best = i;
     }
+    auto [j, k] = GenotypeFromPLIndex(best, n_alts);
+
+    // QUAL = phred-scale of P(0/0).
+    double p_ref = like[0];
+    double qual = (p_ref >= 1.0) ? 0.0
+                                 : std::min(-10.0 * std::log10(p_ref),
+                                            static_cast<double>(kMaxPhred));
+
+    // Set up the VariantCall.
+    if (variant.calls_size() == 0) variant.add_calls();
+    auto* call = variant.mutable_calls(0);
+    call->set_call_set_name(sample_name);
+    call->clear_genotype();
+    call->add_genotype(j);
+    call->add_genotype(k);
+
+    // GQ = quality of the called genotype vs the next-best.
+    double second_best = 0.0;
+    for (int i = 0; i < n_gt; ++i) {
+      if (i != best) second_best = std::max(second_best, like[i]);
+    }
+    int gq = ProbToPhred(second_best);
+    nucleus::SetInfoField("GQ", gq, call);
+
+    // PL = phred-scaled likelihoods for each genotype.
+    std::vector<int> pl(n_gt);
+    int min_pl = kMaxPhred;
+    for (int i = 0; i < n_gt; ++i) {
+      pl[i] = ProbToPhred(like[i]);
+      min_pl = std::min(min_pl, pl[i]);
+    }
+    for (int& v : pl) v -= min_pl;
+    nucleus::SetInfoField("PL", pl, call);
 
     variant.set_quality(qual);
 
-    // Apply QUAL filter — pass if qual >= threshold or threshold == 0.
-    if (qual_filter > 0.0 && qual < qual_filter) {
-      variant.add_filter("lowQUAL");
-      ++filtered;
+    // QUAL filter: low-confidence variants become RefCall.
+    if (best == 0 || qual < qual_filter) {
+      variant.add_filter("RefCall");
+      ++refcall;
     } else {
       variant.add_filter("PASS");
     }
@@ -327,9 +381,12 @@ int RunPostprocessVariants(int argc, char** argv) {
     }
   }
 
-  LOG(INFO) << "postprocess_variants done: " << written << " variants written"
-            << " (" << filtered << " filtered by QUAL).";
+  LOG(INFO) << "postprocess_variants done: " << written << " VCF lines"
+            << " (" << refcall << " RefCall, "
+            << (written - refcall) << " PASS).";
   return 0;
 }
 
 }  // namespace deepvariant
+
+            
