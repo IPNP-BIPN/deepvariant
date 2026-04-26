@@ -227,3 +227,45 @@ Closing the VCF gap is now a pure `make_examples` work-list:
   - Optional: small-model first-pass calls
 None of these change the inference path — they add candidates that
 go through the (already-bit-correct) `call_variants` step.
+
+### Phase 3 follow-on backlog — VCF parity gaps (2026-04-26)
+
+To go from "bit-parity on the inference path" to "bit-parity on the
+final VCF":
+
+1. **Realigner** in `make_examples_main.cc`. We already build the
+   realigner C++ library (deepvariant/realigner/) but don't invoke it.
+   Wiring it into the per-region loop will recover candidates we
+   currently miss in difficult regions (~16 % of variants on the 1 Mb
+   test).
+
+2. **Multi-allelic merge** in `postprocess_main.cc`. Upstream emits
+   one VCF line per (variant, alt-set) tuple at make_examples time
+   (so a tri-allelic site produces 3 examples → 3 CVOs → 3 VCF entries
+   pre-merge), then collapses them into a single multi-allelic VCF
+   line at postprocess time. We currently emit one VCF line per CVO
+   without merging.
+
+3. **gVCF reference blocks**. Upstream's `--output_gvcf` mode emits
+   reference-confidence blocks for non-variant positions. We have the
+   `--output_gvcf` flag wired but no implementation.
+
+4. **GQ / MID / PL FORMAT fields**. Upstream writes
+   `GT:GQ:DP:AD:VAF:MID:PL` per call. We write `GT:DP:AD:VAF`. Adding
+   GQ + PL is a per-CVO computation from the softmax probabilities.
+   `MID` (Model ID — `small_model` vs `big_model`) is only relevant
+   once the small model is wired.
+
+5. **`RefCall` filter** for low-QUAL variants instead of `PASS`. A
+   one-line addition to postprocess: filter QUAL < threshold becomes
+   `RefCall`.
+
+6. **Small model first-pass**. Upstream's `WGS` mode runs a small
+   CNN first; ~80 % of candidates are called by it and skip the big
+   InceptionV3 entirely. Major perf win (and visibility in the `MID`
+   tag), but architecturally optional — without it we just route
+   100 % of candidates through the big model.
+
+Items (1) and (2) close most of the user-visible gap on a real BAM.
+Items (3)–(6) are nice-to-have for upstream-byte-identical VCF output
+but do not change which variants get called.
