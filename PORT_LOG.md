@@ -305,3 +305,46 @@ Phase 3 status:
      remaining gap, would close most of the 391-line VCF count diff)
   ⏳ gVCF reference blocks
   ⏳ Small-model first-pass (perf, optional)
+
+### Phase 3 follow-on: small_model integration roadmap (2026-04-26)
+
+Upstream WGS calls 84 % of variants via the **small_model** (a 70-feature
+MLP, 3 layers dense, ~620 k params), only routing the harder 16 % to
+the big InceptionV3 we already have. This is the source of the QUAL/GQ
+delta we see on PASS calls (small_model gives tighter softmax → higher
+phred scores).
+
+Status:
+- [x] **Convert small_model.keras → Core ML** via Docker (TF 2.16 +
+      coremltools 7.2). Result: `models/wgs_small.mlpackage`. Conversion
+      script: `tools/conversion/convert_small_model.sh`.
+- [ ] **Port the 70-feature extractor** from
+      `deepvariant/small_model/make_small_model_examples.py` (823 LOC)
+      to C++. The features split as:
+        ~13 base features per candidate × 1
+            (num_reads_supports_ref/alt, depths, VAF, mean MQ/BQ,
+             reverse-strand ratio, …)
+         7 variant features
+            (is_snp, is_insertion, is_deletion, lengths, multi-allelic
+             flags)
+        ~50 VAF-context features
+            (variant_allele_frequency_at_minus_25 .. _at_plus_25 from
+             the candidate's `allele_frequency_at_position` map)
+- [ ] **Verify the AlleleCounter populates `ref_support_ext.read_infos`
+      and `allele_support_ext[*].read_infos`** in the DeepVariantCall
+      protos we emit — these per-read structs are what the feature
+      extractor reads (not just aggregate counts). If they're missing,
+      `make_examples_main.cc` needs to wire them up.
+- [ ] **Wire the small_model first pass in `call_variants_main.cc`**:
+        for each candidate, compute features → run small_model → if
+        max(softmax) crosses the GQ threshold (snp=20, indel=28),
+        emit that result with `MID=small_model`; otherwise fall through
+        to InceptionV3 with `MID=deepvariant`.
+- [ ] **Add MID FORMAT field** to postprocess output.
+
+Effect once integrated: identical QUAL/GQ to upstream on the ~84 % of
+candidates that the small_model handles; the remaining 16 % continue
+to use InceptionV3 (already bit-parity).
+
+Conversion is also wired up for variants other than WGS by passing
+the variant name to `convert_small_model.sh wes|pacbio|ont_r104|…`.

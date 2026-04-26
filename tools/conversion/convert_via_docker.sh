@@ -60,3 +60,8 @@ print(\"Saved /out/${OUT_NAME}\")
 '"
 
 echo "==> done — bit-parity vs upstream call_variants confirmed on the chr20 fixture"
+echo
+echo "==> Hint: for the small_model (MLP, 70 features → 3 classes) used by"
+echo "    upstream as a first-pass on ~84% of WGS candidates, the equivalent"
+echo "    .keras file lives at /opt/smallmodels/<variant>/model.keras inside the"
+echo "    Docker image. Convert it with the same recipe but with shape (N, 70)."
