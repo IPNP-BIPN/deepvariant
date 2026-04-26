@@ -600,8 +600,12 @@ int RunPostprocessVariants(int argc, char** argv) {
     if (p_called >= 1.0) {
       gq = kMaxPhred;
     } else {
-      const double err = std::max(1.0 - p_called, 1e-10);  // bounded
-      gq = static_cast<int>(std::round(-10.0 * std::log10(err)));
+      // Mirror upstream's ptrue_to_bounded_phred: floor at 1.25e-10 (so
+      // max phred is -10*log10(1.25e-10) = 99.0309) and round-to-even
+      // (np.around) — std::round would split half-integer ties the wrong
+      // way (35.5 → 36 instead of 36).
+      const double err = std::max(1.0 - p_called, 1.25e-10);
+      gq = static_cast<int>(std::nearbyint(-10.0 * std::log10(err)));
       gq = std::min(std::max(gq, 0), kMaxPhred);
     }
     nucleus::SetInfoField("GQ", gq, call);
