@@ -228,31 +228,43 @@ std::vector<nucleus::genomics::v1::Read> RealignReadsForRegion(
             << region.end();
   if (assembled.empty()) return reads;
 
-  // ── Step 4: assign reads to assembled regions (first-overlap wins) ───────
-  // While assigning, accumulate read_span = min/max alignment span across
-  // all reads in the region — mirror of realigner.py's AssemblyRegion.add().
+  // ── Step 4: assign reads to assembled regions (max-overlap wins) ────────
+  // Mirrors realigner.py:assign_reads_to_assembled_regions. For each read,
+  // pick the assembled region with the maximum reference overlap; first
+  // index wins in case of ties.
   std::vector<bool> read_assigned(reads.size(), false);
-  for (auto& ar : assembled) {
-    bool span_init = false;
-    for (size_t i = 0; i < reads.size(); ++i) {
-      if (read_assigned[i]) continue;
-      if (nucleus::ReadOverlapsRegion(reads[i], ar.region)) {
-        ar.read_indices.push_back(static_cast<int>(i));
-        read_assigned[i] = true;
-        const auto [rs, re] = ReadRefSpan(reads[i]);
-        if (!span_init) {
-          ar.read_span_start = rs;
-          ar.read_span_end   = re;
-          span_init = true;
-        } else {
-          ar.read_span_start = std::min(ar.read_span_start, rs);
-          ar.read_span_end   = std::max(ar.read_span_end,   re);
-        }
+  std::vector<bool> ar_span_init(assembled.size(), false);
+  for (size_t i = 0; i < reads.size(); ++i) {
+    const auto [rs, re] = ReadRefSpan(reads[i]);
+    int best_ar = -1;
+    int64_t best_overlap = 0;
+    for (size_t a = 0; a < assembled.size(); ++a) {
+      const auto& reg = assembled[a].region;
+      const int64_t lo = std::max<int64_t>(rs, reg.start());
+      const int64_t hi = std::min<int64_t>(re, reg.end());
+      const int64_t ov = hi - lo;
+      if (ov > best_overlap) {
+        best_overlap = ov;
+        best_ar = static_cast<int>(a);
       }
     }
-    if (!span_init) {
-      ar.read_span_start = ar.region.start();
-      ar.read_span_end   = ar.region.end();
+    if (best_ar < 0) continue;  // read doesn't overlap any assembled region
+    auto& ar = assembled[best_ar];
+    ar.read_indices.push_back(static_cast<int>(i));
+    read_assigned[i] = true;
+    if (!ar_span_init[best_ar]) {
+      ar.read_span_start = rs;
+      ar.read_span_end   = re;
+      ar_span_init[best_ar] = true;
+    } else {
+      ar.read_span_start = std::min(ar.read_span_start, rs);
+      ar.read_span_end   = std::max(ar.read_span_end,   re);
+    }
+  }
+  for (size_t a = 0; a < assembled.size(); ++a) {
+    if (!ar_span_init[a]) {
+      assembled[a].read_span_start = assembled[a].region.start();
+      assembled[a].read_span_end   = assembled[a].region.end();
     }
   }
 
