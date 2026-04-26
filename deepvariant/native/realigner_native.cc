@@ -298,8 +298,11 @@ std::vector<nucleus::genomics::v1::Read> RealignReadsForRegion(
         std::max<int64_t>(0, span_start - kRefAlignMargin);
     const int64_t ref_end =
         std::min<int64_t>(contig_n_bases, span_end + kRefAlignMargin);
-    if (ref_start >= ar.region.start() || ref_end <= ar.region.end()) {
-      // Can't form a non-empty prefix or suffix; pass reads through.
+    if (ref_end <= ar.region.end()) {
+      // Mirror realigner.py:call_fast_pass_aligner — if the contig is too
+      // short to form a suffix, return the region's reads unchanged. The
+      // prefix can be empty (region at contig start) and FastPassAligner
+      // handles that fine.
       for (int idx : ar.read_indices) out.push_back(reads[idx]);
       continue;
     }
