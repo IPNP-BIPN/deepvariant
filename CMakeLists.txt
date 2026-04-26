@@ -65,6 +65,7 @@ include(protos)  # compile DeepVariant + nucleus + TF-example protos
 # ---------------------------------------------------------------------------
 add_subdirectory(third_party/nucleus)
 add_subdirectory(deepvariant/realigner)
+add_subdirectory(deepvariant)          # upstream C++ libs (Phase 3)
 add_subdirectory(deepvariant/native)   # runtime binary (Phase 2+)
 
 # ---------------------------------------------------------------------------

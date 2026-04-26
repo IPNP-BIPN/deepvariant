@@ -3,6 +3,7 @@
 // Maps TF platform macros to abseil equivalents; also provides commonly
 // used abseil includes that were transitively pulled in by TF in Bazel.
 #pragma once
+#include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/lib/core/status.h"
