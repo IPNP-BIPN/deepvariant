@@ -85,10 +85,13 @@ std::vector<std::string> ExpandShards(const std::string& spec) {
 }
 
 // Convert probability p (in [0,1]) to a phred score, capped at 99.
+// Truncates toward zero (matching upstream's vcf_conversion.cc, which
+// converts the double-valued Log10PErrorToPhred() into a std::vector<int>
+// via implicit narrowing rather than std::round).
 int ProbToPhred(double p) {
   if (p >= 1.0) return 0;
   if (p <= 0.0) return kMaxPhred;
-  int phred = static_cast<int>(std::round(-10.0 * std::log10(p)));
+  int phred = static_cast<int>(-10.0 * std::log10(p));
   return std::min(std::max(phred, 0), kMaxPhred);
 }
 
@@ -210,13 +213,22 @@ std::vector<double> CombineLikelihoods(
     }
   }
 
-  // Normalise across the per-genotype vector.
-  double s = 0;
-  for (double v : like) s += v;
-  if (s <= 0.0) {
-    std::fill(like.begin(), like.end(), 1.0 / n_gt);
-  } else {
-    for (double& v : like) v /= s;
+  // Normalise — but only when product fusion happened across multiple
+  // CVOs. Upstream's merge_predictions returns the raw predictions for
+  // single-CVO sites (the common case in WGS) and only renormalises after
+  // product fusion. For single-CVO sites the FP32 softmax already saturates
+  // some predictions to exactly 1.0; renormalising by the full-precision
+  // sum (=1.0+ε) sneaks the called probability slightly below 1.0, which
+  // pushes ptrue_to_bounded_phred away from the 99-cap and gives
+  // off-by-many GQ values.
+  if (cvos.size() > 1) {
+    double s = 0;
+    for (double v : like) s += v;
+    if (s <= 0.0) {
+      std::fill(like.begin(), like.end(), 1.0 / n_gt);
+    } else {
+      for (double& v : like) v /= s;
+    }
   }
   return like;
 }
@@ -368,6 +380,8 @@ int RunPostprocessVariants(int argc, char** argv) {
   // Tell the writer to read PL from VariantCall.info instead of from the
   // (Float-typed) genotype_likelihood field, which lets us write Integer PL.
   wr_opts.set_retrieve_gl_and_pl_from_info_map(true);
+  // Mirror upstream: print QUAL to 1 decimal (e.g. 39.4, not 39.3745).
+  wr_opts.set_round_qual_values(true);
   auto writer_or = nucleus::VcfWriter::ToFile(outfile, hdr, wr_opts);
   CHECK(writer_or.ok()) << "Failed to open VCF output: " << outfile;
   auto vcf_writer = std::move(writer_or.ValueOrDie());
@@ -472,10 +486,17 @@ int RunPostprocessVariants(int argc, char** argv) {
         }
       }
     }
-    // Renormalise.
-    double sp = 0;
-    for (double v : like_pruned) sp += v;
-    if (sp > 0.0) for (double& v : like_pruned) v /= sp;
+    // Renormalise — but only when alts were actually pruned (the masked
+    // genotypes leave the vector summing to <1). For non-pruned single-CVO
+    // sites the FP32 saturation in the small_model output already means
+    // predictions[0] == 1.0 exactly; renormalising by sum=1.0+ε would push
+    // it below 1, which then makes ptrue_to_bounded_phred miss the 99-cap
+    // and emit GQ=78 instead of 99 for very-confident homref calls.
+    if (!alts_to_remove.empty()) {
+      double sp = 0;
+      for (double v : like_pruned) sp += v;
+      if (sp > 0.0) for (double& v : like_pruned) v /= sp;
+    }
     like = std::move(like_pruned);
 
     // argmax genotype.
