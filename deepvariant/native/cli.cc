@@ -123,6 +123,7 @@ int RunAll(int argc, char** argv) {
       me_args.push_back(absl::StrCat("--small_model_cvo_outfile=",
                                       small_cvo_path));
     }
+    me_args.push_back("--realigner_enabled=true");
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
