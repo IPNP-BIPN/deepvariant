@@ -109,6 +109,10 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   AlleleCounterOptions ac_opts;
   ac_opts.set_partition_size(absl::GetFlag(FLAGS_partition_size));
   *ac_opts.mutable_read_requirements() = read_reqs;
+  // Required so AlleleCounter actually retains REF-supporting reads in
+  // each AlleleCount.read_alleles map (otherwise the small_model sees
+  // num_reads_supports_ref = 0 on every candidate and is biased).
+  ac_opts.set_track_ref_reads(true);
   *opts.mutable_allele_counter_options() = ac_opts;
 
   // Variant caller options.
@@ -391,14 +395,32 @@ int RunMakeExamples(int argc, char** argv) {
     LOG(INFO) << "  read " << reads.size() << " reads from BAM";
     if (reads.empty()) continue;
 
-    // AlleleCounter.
-    AlleleCounter counter(ref_reader.get(), region, {},
-                          opts.allele_counter_options());
-    for (const auto& r : reads) {
-      counter.Add(r, sample_name);
-    }
+    // First pass: find candidate positions (no ref-read tracking yet).
+    AlleleCounter probe(ref_reader.get(), region, {},
+                        opts.allele_counter_options());
+    for (const auto& r : reads) probe.Add(r, sample_name);
+    auto probe_candidates = caller.CallsFromAlleleCounter(probe);
+    if (probe_candidates.empty()) continue;
 
-    // Candidate variants.
+    // Second pass: rerun AlleleCounter with the candidate positions known
+    // up-front. AlleleCounter only retains REF-supporting reads in its
+    // read_alleles map at positions that appear in this list (when
+    // track_ref_reads=true). Without this two-pass shape the small_model
+    // sees num_reads_supports_ref = 0 on every candidate.
+    std::vector<int> candidate_positions;
+    candidate_positions.reserve(probe_candidates.size());
+    for (const auto& c : probe_candidates) {
+      candidate_positions.push_back(static_cast<int>(c.variant().start()));
+    }
+    std::sort(candidate_positions.begin(), candidate_positions.end());
+    candidate_positions.erase(
+        std::unique(candidate_positions.begin(), candidate_positions.end()),
+        candidate_positions.end());
+
+    AlleleCounter counter(ref_reader.get(), region, candidate_positions,
+                          opts.allele_counter_options());
+    for (const auto& r : reads) counter.Add(r, sample_name);
+
     std::vector<DeepVariantCall> candidates =
         caller.CallsFromAlleleCounter(counter);
     if (candidates.empty()) continue;
