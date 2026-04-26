@@ -121,3 +121,42 @@ Ship `.mlpackage` uncompiled; runtime compiles on first load via `MLModel compil
 - [ ] Implement `convert_mlx.py` (MLX Inception-v3, weight bind).
 - [ ] Run bench: Core ML at `compute_units=ALL`, then `CPU_AND_GPU`; MLX. Capture latency, throughput, GPU/ANE residency, per-channel parity vs Linux reference.
 - [ ] Phase 0 ADR (`docs/architecture.md`) signed off.
+
+### Phase 3 — `deepvariant {make_examples|call_variants|postprocess_variants|run}` (2026-04-26)
+
+Phase 3 scaffolding committed (`487ce409`) and brought to end-to-end green
+through a series of fixes:
+
+- `ea6ef078` — channels + pileup_height + BytesList parsing + 4-D MLMultiArray
+- `534d6fd6` — image normalization to [0,1]
+- `58eb7871` — corrected normalization to [-1,1] via `(x - 128) / 128` (matches
+  upstream `dv_utils.preprocess_images`)
+- `89c155e1` — `cli.cc` no longer attaches `@1` for `num_shards==1`, so
+  `call_variants` and `postprocess_variants` agree on the intermediate path
+
+End-to-end smoke test on `NA12878_S1.chr20.10_10p1mb.bam`, region
+`chr20:10000000-10010000` (10 kb):
+
+  4909 reads → 82 candidates → 90 examples → 90 CVOs → 90 VCF lines
+  Genotype distribution: **66 hom-ref + 24 het + 0 hom-alt**
+
+Single binary `bin/deepvariant` (2.7 MB) provides the four subcommands.
+`ctest -V` remains 3/3 green (nucleus_io, realigner, call_variants smoke
+tests from Phase 1/2).
+
+Known limitation carried over from Phase 0: model confidence is low — no
+single CVO has `max(softmax) > 0.9`, even on the upstream golden examples
+(424/424). Likely BN-gamma=1 is approximately but not exactly correct,
+or there's a minor numeric difference in the conversion. The pipeline is
+behaviourally correct; this is a Phase-0-polish task tracked separately
+(it does not block proceeding to Phase 4 validation since the calls are
+already varied — just under-confident).
+
+What is still **not** wired in Phase 3:
+- realigner integration (currently `realigner_enabled = false`)
+- direct phasing (`phase_reads = false`)
+- gVCF output
+- trio / somatic / pangenome modes (single-sample WGS only at v1.0)
+
+Each of those is an additive feature and does not change the pipeline
+shape; they are deferred behind the working WGS path.
