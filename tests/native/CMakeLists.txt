@@ -30,3 +30,4 @@ phase1_test(call_variants_smoke   call_variants_smoke_test.cc   dv_call_variants
 phase1_test(small_model_smoke     small_model_smoke_test.cc     dv_small_model)
 phase1_test(dv_weights_smoke      dv_weights_smoke_test.cc      dv_weights)
 phase1_test(metal_inference_smoke metal_inference_smoke_test.cc dv_metal_inference)
+phase1_test(bnns_finalize_smoke   bnns_finalize_smoke_test.cc   dv_bnns_finalize)
