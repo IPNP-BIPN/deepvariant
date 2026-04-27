@@ -197,9 +197,13 @@ std::vector<nucleus::genomics::v1::Read> RealignReadsForRegion(
     if (!p || !*p) return nullptr;
     auto* f = new std::ofstream(p);
     if (!f->is_open()) return nullptr;
-    *f << "window,k,n_haplotypes,n_reads_in_window\n";
+    *f << "window,k,n_haplotypes,n_reads_in_window,hap_hash\n";
     return f;
   }();
+  // Optional second log: full haplotype strings per window. Enabled by
+  // DV_REALIGNER_DIAG_HAP set to a directory; one file per window with
+  // one haplotype per line.
+  static const char* hap_dump_dir = std::getenv("DV_REALIGNER_DIAG_HAP");
 
   for (const auto& window : windows) {
     auto ref_or = ref_reader.GetBases(window);
@@ -229,9 +233,30 @@ std::vector<nucleus::genomics::v1::Read> RealignReadsForRegion(
       k_used = graph->KmerSize();
     }
     if (diag_csv) {
+      // Hash the sorted haplotype set so we can diff against upstream
+      // beyond just the count. Use a simple fold so the value is stable.
+      uint64_t hap_hash = 1469598103934665603ULL;  // FNV-64 offset
+      for (const auto& h : haplotypes) {
+        for (unsigned char c : h) {
+          hap_hash ^= c;
+          hap_hash *= 1099511628211ULL;
+        }
+        hap_hash ^= '|';
+      }
       *diag_csv << window.reference_name() << ":" << (window.start() + 1)
                 << "-" << window.end() << "," << k_used << ","
-                << haplotypes.size() << "," << win_reads.size() << "\n";
+                << haplotypes.size() << "," << win_reads.size()
+                << "," << hap_hash << "\n";
+    }
+    if (hap_dump_dir && !haplotypes.empty()) {
+      std::string fname = std::string(hap_dump_dir) + "/" +
+          window.reference_name() + ":" +
+          std::to_string(window.start() + 1) + "-" +
+          std::to_string(window.end()) + ".txt";
+      std::ofstream hf(fname);
+      if (hf) {
+        for (const auto& h : haplotypes) hf << h << "\n";
+      }
     }
     if (haplotypes.empty() ||
         (haplotypes.size() == 1 && haplotypes[0] == ref_bases)) {
