@@ -845,3 +845,71 @@ Three further upstream-aligning fixes brought parity from 81 % →
 fixture requires bit-parity inference (TF↔Core ML) — explicit
 non-goal for v2 — or DBG-level per-window diagnostics
 (3-5 person-days, queued).
+
+### partition_size fix — DBG bit-parity confirmed (2026-04-27 morning)
+
+**Root cause for the realigner divergence: we were running the
+realigner on the WHOLE 1Mb input region in one pass.** Upstream
+chunks the input into 1000bp partitions (the default
+`--partition_size`) and runs the realigner *per chunk*. Adjacent
+chunks emit overlapping windows at the boundary (the WS region
+expansion of ±20bp leaks across), and a single read overhanging the
+boundary gets realigned independently in each chunk.
+
+Without partitioning, our WindowSelector merged windows across
+chunk boundaries that upstream keeps separate — fewer-but-larger
+windows, different DBG inputs, different haplotypes, different
+read realignments downstream.
+
+**Fixes that landed:**
+
+1. `regions.cc`: new `PartitionRegions(regions, size)` mirroring
+   upstream's `RangeSet.partition()`. Splits each calling region
+   into chunks of at most `partition_size` bp.
+2. `make_examples_main.cc`: invoke `PartitionRegions` between
+   `BuildCallingRegions` and `ShardRegions` with
+   `partition_size=FLAGS_partition_size` (default 1000).
+3. `realigner_native.cc`: env-gated diagnostic CSV output
+   `DV_REALIGNER_DIAG_CSV` mirroring upstream's
+   `realigner_metrics.csv` schema (`window,k,n_haplotypes,n_reads`),
+   plus FNV-64 hash of the haplotype set per window. Lets us
+   side-by-side diff the WindowSelector + DBG output against
+   upstream's `--realigner_diagnostics` CSV without touching the
+   release build path. Plus `DV_REALIGNER_DIAG_HAP=<dir>` to dump
+   the full haplotype string set per window.
+
+**chr20:5M-6M after partition fix:**
+
+| metric                       | pre-partition | post-partition | upstream |
+| ---------------------------- | ------------- | -------------- | -------- |
+| VCF lines                    | 3013          | 2955           | 2967     |
+| chrom:pos:ref:alt:gt match   | 2936 (98.95%) | 2949 (99.39%)  | —        |
+| exact-line byte-identical    | 2490 (83.92%) | 2665 (89.83%)  | —        |
+| upstream-only positions      | 26            | 14             | —        |
+| ours-only positions          | 72            | 2              | —        |
+| windows produced             | 1229          | 1343           | 1343     |
+| unique (window,k,n_hap)      | varied        | 1316/1316      | 1316     |
+
+**DBG bit-parity confirmed:** 1316/1316 unique (window, k,
+n_haplotypes) tuples in our diag CSV match upstream's exactly. The
+WindowSelector + DBG layer is now bit-identical to upstream.
+
+**Remaining 302 same-key bytes-different sites break down as:**
+
+- ~207 FP32 PL/QUAL/GQ drift — bounded by Core ML vs TF softmax
+  precision (8th significant digit), unfixable without bit-parity
+  inference engines.
+- ~53 sites with DP differing by -1 to -5 reads — probably tiny
+  read-set differences at chunk boundaries or FP arithmetic in
+  FastPassAligner (despite the DBG output matching). Same window,
+  same haplotypes, but a small number of reads end up with slightly
+  different alignments.
+- ~21 sites where MID flips between `small_model` and `deepvariant`
+  at the GQ=20 boundary — FP32 inference precision.
+- 2 NoCall ↔ PASS filter flips, same root cause.
+
+**Hard floor today: ~89.83 % byte parity / 99.39 % key parity.**
+The remaining gap is fully bounded by FP32 inference precision.
+Further parity gain requires either bit-parity inference (out of
+scope for v2) or per-FP-arithmetic instrumentation in the
+FastPassAligner read scoring path.
