@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -68,7 +70,11 @@ ABSL_FLAG(double, vsc_min_fraction_indels, 0.06,
           "Min allele fraction for indels.");
 ABSL_FLAG(int, partition_size, 1000,
           "AlleleCounter partition size (bp per window).");
-ABSL_FLAG(int, min_mapping_quality, 10, "Min read mapping quality.");
+// Default 5 mirrors upstream's make_examples_options.py
+// (`--min_mapping_quality` default = 5). The candidate-emission
+// AlleleCounter uses this; the WindowSelector / DBG apply their own
+// stricter thresholds (20 / 14).
+ABSL_FLAG(int, min_mapping_quality, 5, "Min read mapping quality.");
 ABSL_FLAG(int, min_base_quality, 10, "Min base quality.");
 // Small model first-pass.
 ABSL_FLAG(std::string, small_model, "",
@@ -293,6 +299,10 @@ int RunMakeExamples(int argc, char** argv) {
   auto ref_reader = std::move(ref_or.ValueOrDie());
 
   // ── Infer sample name ─────────────────────────────────────────────────────
+  // Use the same min_mapping_quality (default 5) at the SamReader layer
+  // as the AC / candidate-emission stage, mirroring upstream's
+  // make_examples_options.py. The WindowSelector and DBG apply their own
+  // stricter thresholds (20 / 14) at their respective layers.
   nucleus::genomics::v1::SamReaderOptions sam_opts;
   sam_opts.mutable_read_requirements()->set_min_mapping_quality(
       absl::GetFlag(FLAGS_min_mapping_quality));
@@ -457,6 +467,42 @@ int RunMakeExamples(int argc, char** argv) {
       working_reads =
           RealignReadsForRegion(reads, ws_region, pre, *ref_reader,
                                  realigner_opts);
+      // Optional: dump (qname, contig, pos, mapq, cigar, seq) of
+      // post-realigner reads per chunk so we can side-by-side diff
+      // against upstream's --emit_realigned_reads BAM.
+      static const char* dump_dir = std::getenv("DV_REALIGNED_READS_TSV");
+      if (dump_dir) {
+        std::string fname = std::string(dump_dir) + "/" +
+            region.reference_name() + ":" +
+            std::to_string(region.start()) + "-" +
+            std::to_string(region.end()) + ".tsv";
+        std::ofstream rf(fname);
+        if (rf) {
+          for (const auto& r : working_reads) {
+            rf << r.fragment_name() << '/' << r.read_number() << '\t'
+               << r.alignment().position().reference_name() << '\t'
+               << r.alignment().position().position() << '\t'
+               << r.alignment().mapping_quality() << '\t';
+            for (const auto& cu : r.alignment().cigar()) {
+              rf << cu.operation_length();
+              switch (cu.operation()) {
+                using ::nucleus::genomics::v1::CigarUnit;
+                case CigarUnit::ALIGNMENT_MATCH:    rf << 'M'; break;
+                case CigarUnit::INSERT:             rf << 'I'; break;
+                case CigarUnit::DELETE:             rf << 'D'; break;
+                case CigarUnit::SKIP:               rf << 'N'; break;
+                case CigarUnit::CLIP_SOFT:          rf << 'S'; break;
+                case CigarUnit::CLIP_HARD:          rf << 'H'; break;
+                case CigarUnit::PAD:                rf << 'P'; break;
+                case CigarUnit::SEQUENCE_MATCH:     rf << '='; break;
+                case CigarUnit::SEQUENCE_MISMATCH:  rf << 'X'; break;
+                default: rf << '?';
+              }
+            }
+            rf << '\t' << r.aligned_sequence() << '\n';
+          }
+        }
+      }
     } else {
       working_reads = reads;
     }
