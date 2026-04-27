@@ -213,6 +213,19 @@ target_link_libraries(dv_postprocess_lib PUBLIC
 )
 
 # ---------------------------------------------------------------------------
+# debug_metal — dev-only diagnostic for Phase 5.5 MPSGraph divergence.
+# Compares Metal stem_s1a output to the hand-computed reference for an
+# all-zeros input.
+# ---------------------------------------------------------------------------
+add_executable(debug_metal "${CMAKE_CURRENT_SOURCE_DIR}/debug_metal_main.cc")
+target_include_directories(debug_metal PRIVATE ${ME_INCLUDE_DIRS})
+target_compile_options(debug_metal PRIVATE ${ME_COMPILE_OPTS})
+target_link_libraries(debug_metal PRIVATE
+  dv_metal_inference
+  dv_weights
+)
+
+# ---------------------------------------------------------------------------
 # dump_cvo — dev-only TFRecord dumper for CallVariantsOutput protos.
 # Used to diff our candidate set against upstream's during parity work.
 # ---------------------------------------------------------------------------
