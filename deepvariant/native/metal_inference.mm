@@ -410,6 +410,10 @@ struct MetalInception::Impl {
   MPSGraph* graph = nil;
   MPSGraphTensor* input = nil;
   MPSGraphTensor* output = nil;
+  // Named taps for debugging — keyed by stage name. Populated as the
+  // graph is built, so PredictAtTap() can request a specific stage's
+  // output.
+  NSMutableDictionary<NSString*, MPSGraphTensor*>* taps = nil;
   int feature_dim = 2048;
 };
 
@@ -443,6 +447,7 @@ std::unique_ptr<MetalInception> MetalInception::Create(
   }
 
   I.graph = [MPSGraph new];
+  I.taps = [NSMutableDictionary dictionary];
   // Variable batch dimension. -1 means "any" in MPSGraph shape spec.
   I.input = [I.graph placeholderWithShape:@[@-1, @100, @221, @7]
                                   dataType:MPSDataTypeFloat32
@@ -451,38 +456,47 @@ std::unique_ptr<MetalInception> MetalInception::Create(
   MPSGraphTensor* x = [I.graph transposeTensor:I.input
                                    permutation:@[@0, @3, @1, @2]
                                           name:@"nhwc2nchw"];
+  I.taps[@"input_nchw"] = x;
 
   // Stem
   x = CBR(I.graph, x, *I.weights, 0, 1, 2, 2, false, @"s1a");
   if (!x) return nullptr;
+  I.taps[@"stem_s1a"] = x;
   x = CBR(I.graph, x, *I.weights, 2, 3, 1, 1, false, @"s2a");
+  I.taps[@"stem_s2a"] = x;
   x = CBR(I.graph, x, *I.weights, 4, 5, 1, 1, true,  @"s2b");
+  I.taps[@"stem_s2b"] = x;
   x = MaxPool3x3s2Valid(I.graph, x, @"mp3a");
+  I.taps[@"stem_mp3a"] = x;
   x = CBR(I.graph, x, *I.weights, 6, 7, 1, 1, false, @"s3b");
+  I.taps[@"stem_s3b"] = x;
   x = CBR(I.graph, x, *I.weights, 8, 9, 1, 1, false, @"s4a");
+  I.taps[@"stem_s4a"] = x;
   x = MaxPool3x3s2Valid(I.graph, x, @"mp5a");
+  I.taps[@"stem_mp5a"] = x;
 
   // InceptionA
-  x = Mixed_5b(I.graph, x, *I.weights);
-  x = Mixed_5c(I.graph, x, *I.weights);
-  x = Mixed_5d(I.graph, x, *I.weights);
+  x = Mixed_5b(I.graph, x, *I.weights); I.taps[@"5b"] = x;
+  x = Mixed_5c(I.graph, x, *I.weights); I.taps[@"5c"] = x;
+  x = Mixed_5d(I.graph, x, *I.weights); I.taps[@"5d"] = x;
   // Reduction-A
-  x = Mixed_6a(I.graph, x, *I.weights);
+  x = Mixed_6a(I.graph, x, *I.weights); I.taps[@"6a"] = x;
   // InceptionB
-  x = Mixed_6b(I.graph, x, *I.weights);
-  x = Mixed_6c(I.graph, x, *I.weights);
-  x = Mixed_6d(I.graph, x, *I.weights);
-  x = Mixed_6e(I.graph, x, *I.weights);
+  x = Mixed_6b(I.graph, x, *I.weights); I.taps[@"6b"] = x;
+  x = Mixed_6c(I.graph, x, *I.weights); I.taps[@"6c"] = x;
+  x = Mixed_6d(I.graph, x, *I.weights); I.taps[@"6d"] = x;
+  x = Mixed_6e(I.graph, x, *I.weights); I.taps[@"6e"] = x;
   // Reduction-B
-  x = Mixed_7a(I.graph, x, *I.weights);
+  x = Mixed_7a(I.graph, x, *I.weights); I.taps[@"7a"] = x;
   // InceptionC
-  x = Mixed_7b(I.graph, x, *I.weights);
-  x = Mixed_7c(I.graph, x, *I.weights);
+  x = Mixed_7b(I.graph, x, *I.weights); I.taps[@"7b"] = x;
+  x = Mixed_7c(I.graph, x, *I.weights); I.taps[@"7c"] = x;
 
   // Global avg pool over (H, W) → (N, 2048, 1, 1)
   x = [I.graph meanOfTensor:x axes:@[@2, @3] name:@"gap"];
   // Reshape to (N, 2048)
   x = [I.graph reshapeTensor:x withShape:@[@-1, @2048] name:@"squeeze"];
+  I.taps[@"gap"] = x;
 
   I.output = x;
   return self;
@@ -490,13 +504,28 @@ std::unique_ptr<MetalInception> MetalInception::Create(
 
 bool MetalInception::Predict(const float* input, int batch_size,
                               float* output) {
+  int unused = 0;
+  return PredictAtTap("gap", input, batch_size, output, &unused);
+}
+
+bool MetalInception::PredictAtTap(const std::string& tap_name,
+                                   const float* input, int batch_size,
+                                   float* output,
+                                   int* out_total_elems_per_image) {
   if (!input || !output || batch_size <= 0) {
-    LOG(ERROR) << "MetalInception::Predict: bad args";
+    LOG(ERROR) << "MetalInception::PredictAtTap: bad args";
     return false;
   }
   auto& I = *impl_;
 
   @autoreleasepool {
+    NSString* tap_ns = [NSString stringWithUTF8String:tap_name.c_str()];
+    MPSGraphTensor* tap = I.taps[tap_ns];
+    if (!tap) {
+      LOG(ERROR) << "MetalInception: unknown tap '" << tap_name << "'";
+      return false;
+    }
+
     const NSUInteger n_in = (NSUInteger)batch_size * 100 * 221 * 7;
     NSData* in_data = [NSData dataWithBytes:input
                                      length:n_in * sizeof(float)];
@@ -510,17 +539,23 @@ bool MetalInception::Predict(const float* input, int batch_size,
         @{I.input: in_td};
     NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* results =
         [I.graph runWithFeeds:feeds
-                targetTensors:@[I.output]
+                targetTensors:@[tap]
              targetOperations:nil];
 
-    MPSGraphTensorData* out_td = results[I.output];
+    MPSGraphTensorData* out_td = results[tap];
     if (!out_td) {
-      LOG(ERROR) << "MetalInception::Predict: no result tensor returned";
+      LOG(ERROR) << "MetalInception::PredictAtTap: no result for tap "
+                 << tap_name;
       return false;
     }
-    [out_td.mpsndarray
-        readBytes:output
-       strideBytes:nil];
+    NSArray<NSNumber*>* shape = out_td.shape;
+    NSUInteger total = 1;
+    for (NSNumber* d in shape) total *= [d unsignedIntegerValue];
+    if (out_total_elems_per_image && batch_size > 0) {
+      *out_total_elems_per_image =
+          static_cast<int>(total / (NSUInteger)batch_size);
+    }
+    [out_td.mpsndarray readBytes:output strideBytes:nil];
   }
   return true;
 }

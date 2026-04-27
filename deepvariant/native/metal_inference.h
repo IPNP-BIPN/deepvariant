@@ -48,6 +48,28 @@ class MetalInception {
   // Returns false on dispatch error.
   bool Predict(const float* input, int batch_size, float* output);
 
+  // Debug-only: run the graph but stop at one of the named tap points
+  // and return that tensor's output instead of the global-avg-pool
+  // features. Used by tools/debug_metal_layer.cc to localise where
+  // Metal output diverges from the Core ML / TF reference.
+  //
+  // Tap names (in order of execution):
+  //   "stem_s1a"   — output of CBR(conv=0, bn=1) — shape (B, 32, 49, 110)
+  //   "stem_s2a"   — output of CBR(conv=2, bn=3) — (B, 32, 47, 108)
+  //   "stem_s2b"   — CBR(4,5) — (B, 64, 47, 108)
+  //   "stem_mp3a"  — maxpool — (B, 64, 23, 53)
+  //   "stem_s3b"   — CBR(6,7) — (B, 80, 21, 51)
+  //   "stem_s4a"   — CBR(8,9) — (B, 192, 19, 49)
+  //   "stem_mp5a"  — maxpool — (B, 192, 9, 24)
+  //   "5b" / "5c" / "5d" / "6a" / "6b" / "6c" / "6d" / "6e" / "7a" / "7b" / "7c"
+  //   "gap"        — global avg pool — (B, 2048)  (default Predict tap)
+  //
+  // The output buffer must be sized for the requested tap. Returns
+  // false on unknown tap name or dispatch error.
+  bool PredictAtTap(const std::string& tap_name,
+                    const float* input, int batch_size,
+                    float* output, int* out_total_elems_per_image);
+
   // Number of feature dimensions in Predict() output (= 2048 for
   // standard WGS Inception-v3).
   int FeatureDim() const;
