@@ -40,6 +40,24 @@ int main(int argc, char** argv) {
               << v.reference_bases();
     for (const auto& a : v.alternate_bases()) std::cout << '\t' << a;
     std::cout << '\t' << argmax;
+    // AD and DP from the first call's info, so we can diff variant_caller
+    // output between us and upstream at the candidate-emission layer.
+    if (v.calls_size() > 0) {
+      const auto& info = v.calls(0).info();
+      auto it_dp = info.find("DP");
+      auto it_ad = info.find("AD");
+      std::cout << "\tDP=";
+      if (it_dp != info.end() && it_dp->second.values_size() > 0) {
+        std::cout << it_dp->second.values(0).int_value();
+      }
+      std::cout << "\tAD=";
+      if (it_ad != info.end()) {
+        for (int i = 0; i < it_ad->second.values_size(); ++i) {
+          if (i) std::cout << ',';
+          std::cout << it_ad->second.values(i).int_value();
+        }
+      }
+    }
     // Append all probabilities at full precision so we can diff against
     // upstream's intermediate CVOs at the postprocess input layer.
     for (int i = 0; i < cvo.genotype_probabilities_size(); ++i) {
