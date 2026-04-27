@@ -39,3 +39,4 @@ testdata/reference/large/
 *.bed
 .DS_Store
 validation/work/
+validation/output/
