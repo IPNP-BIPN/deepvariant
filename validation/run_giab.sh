@@ -46,7 +46,7 @@ echo "==> hap.py vs GIAB truth (Docker linux/amd64)"
 docker run --rm --platform linux/amd64 \
   -v "${DATA}:/data:ro" \
   -v "$(realpath "${OUT}"):/work" \
-  pkrusche/hap.py:latest \
+  jmcdani20/hap.py:v0.3.12 \
   /opt/hap.py/bin/hap.py \
     /data/truth.vcf.gz \
     /work/our.vcf.gz \
