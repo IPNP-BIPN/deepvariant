@@ -234,11 +234,18 @@ bool IsSnpAlt(const nucleus::genomics::v1::Variant& v, int alt_idx) {
          v.alternate_bases(alt_idx).size() == 1;
 }
 
-// Phred = -10 * log10(p).  Capped at 99.
+// Phred = -10 * log10(p), truncated toward zero. Capped at 99.
+//
+// Truncation (not std::round) matches upstream's small_model
+// passes_confidence_threshold(ptrue_to_bounded_phred(max_p) >= threshold)
+// at the boundary: a phred of 19.5 should *fail* a threshold of 20 (which
+// floor-rounds it down to 19), but std::round would push 19.5 up to 20
+// and pass — flipping a candidate from big-model dispatch to a
+// small_model emit.
 int ProbToPhred(double p) {
   if (p <= 0.0) return 99;
   if (p >= 1.0) return 0;
-  return std::min(static_cast<int>(std::round(-10.0 * std::log10(p))), 99);
+  return std::min(static_cast<int>(-10.0 * std::log10(p)), 99);
 }
 
 // Build a CallVariantsOutput proto for a single (candidate, alt_idx) pair
