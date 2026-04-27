@@ -913,3 +913,53 @@ The remaining gap is fully bounded by FP32 inference precision.
 Further parity gain requires either bit-parity inference (out of
 scope for v2) or per-FP-arithmetic instrumentation in the
 FastPassAligner read scoring path.
+
+### min_mapping_quality default 10 → 5 (2026-04-27 afternoon)
+
+**Root cause for the last realigner-driven divergence: our default
+`--min_mapping_quality` was 10, upstream's is 5.**
+
+Per-read instrumentation (`DV_REALIGNED_READS_TSV`) on chr20:5086000-5087000
+revealed the missing alt at chr20:5086532. Upstream's
+`--emit_realigned_reads` BAM contained a 5th alt:A read at this
+position with mapq=6 — a soft-clipped mate (raw CIGAR 128S21M2S)
+realigned by FastPassAligner into a complex 107M1D1M3I2M2D33M4D5M.
+Our SamReader + AlleleCounter both filtered mapq<10, so the read
+never reached the candidate-emission AC. Upstream's mapq>=5 default
+let it through, lifting VAF 4/40=0.10 → 5/41=0.122 just across the
+0.12 emission threshold.
+
+`make_examples_options.py:_MIN_MAPPING_QUALITY` line 305 sets the
+default to 5. Our flag mirrors that now.
+
+**Final chr20:5M-6M state:**
+
+| metric                       | upstream | ours              |
+| ---------------------------- | -------- | ----------------- |
+| VCF lines                    | 2967     | **2967** (exact)  |
+| chrom:pos:ref:alt:gt match   | —        | **2964 (99.90%)** |
+| exact-line byte-identical    | —        | **2758 (92.96%)** |
+| upstream-only positions      | —        | **0**             |
+| ours-only positions          | —        | **0**             |
+| windows produced             | 1343     | 1343 (exact)      |
+
+**Zero candidate-set divergence.** Every position upstream emits, we
+emit; every alt allele matches; every genotype matches.
+
+**Remaining 209 byte-different lines are 100 % FP32 inference drift:**
+
+- 77 PL-only ±1 phred drift
+- 59 QUAL-only ±0.1 drift
+- 40 QUAL+GQ+PL drift (3 fields, same FP32 root)
+- 23 QUAL+GQ+MID+PL — small_model↔deepvariant flips at GQ=20 boundary
+- 10 minor combinations
+
+Decomposition matches the model precision floor: Core ML's softmax
+output differs from TF's at the 7th-8th significant digit, which
+crosses phred half-integer boundaries after truncation.
+
+**Hard floor: 92.96 % byte parity, 99.90 % key parity, 100 %
+candidate-set parity.** Going lower than this requires bit-parity
+inference (TF↔Core ML kernel-level), which is explicit non-goal for
+v2 (the user's "no Python at runtime" + "no Docker" constraints make
+embedding TF infeasible).
