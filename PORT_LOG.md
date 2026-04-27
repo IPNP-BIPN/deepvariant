@@ -791,3 +791,57 @@ parity / 81 % byte parity, with the remaining gap bounded by FP32
 softmax precision (TF↔Core ML) and by the realigner's DBG haplotype
 divergence. Inference path is bit-identical to upstream at the
 argmax level (508/508, max-abs softmax 2e-6 from the Phase-0 bench).
+
+### Late-night final push (2026-04-27 morning)
+
+Three further upstream-aligning fixes brought parity from 81 % →
+83.9 % byte-identical / 98.75 % → 98.95 % key match:
+
+1. **realigner: max-overlap read assignment** (`e6975ae4`). Mirror
+   `realigner.py:assign_reads_to_assembled_regions` — each read goes
+   to the assembled region with maximum reference overlap, not the
+   first-overlapping one. +76 byte-identical lines, -9 ours-only
+   sites.
+2. **realigner: only check ref_end ≤ region.end** (`9c4a23a7`).
+   Mirror `call_fast_pass_aligner` — empty-prefix is fine; only the
+   suffix-too-short case skips realignment.
+3. **postprocess: GQ banker's rounding + 1.25e-10 phred floor**
+   (`cc77cb79`). Mirror `np.around` and `_MAX_CONFIDENCE`.
+4. **make_examples: small_model GQ threshold uses truncation**
+   (`78b31aa9`). At a phred of 19.5, std::round→20 passes a
+   threshold of 20; upstream's float `>=` comparison treats 19.5 < 20
+   → fail. Truncating in our gating ProbToPhred matches upstream.
+   +10 byte-identical lines.
+
+**Final chr20:5M-6M state.**
+
+| metric                       | start of session | end of session | upstream |
+| ---------------------------- | ---------------- | -------------- | -------- |
+| VCF lines                    | 2698             | 3013           | 2967     |
+| chrom:pos:ref:alt:gt match   | 2566 (86.5%)     | 2936 (98.95%)  | —        |
+| exact-line byte-identical    | 0 (0%)           | 2490 (83.92%)  | —        |
+| upstream-only positions      | 373              | 26             | —        |
+| ours-only positions          | 104              | 72             | —        |
+
+**Remaining ~477 same-key bytes-different sites break down as:**
+
+- ~250 FP32 ±1 phred drift on PL/QUAL/GQ — Core ML's softmax
+  outputs differ from TF's at the 7th-8th significant digit, which
+  crosses phred half-integer boundaries after truncation. Bounded
+  by the inference engine; not closeable without bit-parity TF↔Core
+  ML kernels.
+- ~100 sites with DP/AD differences — DBG-haplotype divergence
+  in the realigner. Both pipelines call the same C++ DBG code; the
+  drift is in path enumeration / pruning order under FP32. Closeable
+  only by per-window diagnostic instrumentation + side-by-side diff
+  against `upstream --realigner_diagnostics`.
+- ~32 sites with `MID` flips between `small_model` and `deepvariant`
+  — the small_model GQ is exactly at the 20.0 threshold, FP32
+  precision tips the call.
+- 2 filter flips at chr20:5054732 / 5871805 (NoCall ↔ PASS/RefCall),
+  same FP32 root cause.
+
+**Hard floor today: ~83.9 % byte parity.** Further gain on this
+fixture requires bit-parity inference (TF↔Core ML) — explicit
+non-goal for v2 — or DBG-level per-window diagnostics
+(3-5 person-days, queued).
