@@ -28,6 +28,26 @@ target_link_libraries(dv_weights PUBLIC
 )
 
 # ---------------------------------------------------------------------------
+# dv_metal_inference — Phase 5.5 MPSGraph + BNNS Inception-v3 backend
+# (Obj-C++ + Metal Performance Shaders Graph; consumes .dvw weights)
+# ---------------------------------------------------------------------------
+add_library(dv_metal_inference STATIC metal_inference.mm)
+set_source_files_properties(metal_inference.mm PROPERTIES
+  COMPILE_FLAGS "-fobjc-arc"
+)
+target_include_directories(dv_metal_inference PUBLIC
+  "${CMAKE_SOURCE_DIR}"
+  "${ABSL_PREFIX}/include"
+)
+target_link_libraries(dv_metal_inference PUBLIC
+  dv_weights
+  absl::log
+  "-framework Metal"
+  "-framework MetalPerformanceShadersGraph"
+  "-framework Foundation"
+)
+
+# ---------------------------------------------------------------------------
 # dv_coreml — Obj-C++ Core ML inference wrapper
 # (Obj-C++ requires macOS frameworks; no Python, no TF)
 # ---------------------------------------------------------------------------
