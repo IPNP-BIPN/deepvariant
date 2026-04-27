@@ -963,3 +963,62 @@ candidate-set parity.** Going lower than this requires bit-parity
 inference (TF↔Core ML kernel-level), which is explicit non-goal for
 v2 (the user's "no Python at runtime" + "no Docker" constraints make
 embedding TF infeasible).
+
+### Phase 4 — GIAB hap.py F1 PASS (2026-04-27 evening)
+
+Direct upstream-Docker comparison on full HG002 chr20 + same
+GIAB v4.2.1 truth:
+
+|  Type | Ours F1   | Upstream F1 | Δ           | Threshold | Status |
+| ----- | --------- | ----------- | ----------- | --------- | ------ |
+| SNP   | 99.7402 % | 99.7402 %   | **0.0000 %** | ≥ −0.05 % | PASS ✓ |
+| INDEL | 99.5942 % | 99.5985 %   | **−0.0043 %** | ≥ −0.10 % | PASS ✓ |
+
+TP / FN counts identical to upstream on both classes (11187 INDEL TP,
+71008 SNP TP). Single observable difference: +1 indel FP in our
+output (23 vs 22) — within the candidate-set parity band.
+
+Wall-time: 13 m 23 s (ours, native arm64) vs ~17 m (upstream Docker
+under macOS Rosetta 2). Plan stop-point #4 cleared; release gate is
+now Phase 5.5 bit-parity.
+
+### Phase 5.5 — Metal Shaders + BNNS bit-parity (started 2026-04-27)
+
+First three deliverables landed:
+
+1. `tools/conversion/extract_weights.py` — packs TF SavedModel
+   TensorBundle into a single `.dvw` file (deterministic byte layout,
+   sha256-reproducible). 378 FP32 tensors × 87.24 MB for WGS.
+2. `deepvariant/native/dv_weights.{h,cc}` — mmap loader for `.dvw`,
+   zero-copy access keyed by source variable name. 5/5 ctest green.
+3. `deepvariant/native/metal_inference.{h,mm}` — MPSGraph builder
+   for the Inception-v3 backbone (188 conv + BN + ReLU pairs,
+   pre-fused on CPU at graph-build), mirrors
+   `tools/conversion/inception_v3_mil.py` layer-for-layer.
+4. `deepvariant/native/bnns_finalize.{h,mm}` — deterministic CPU
+   dense (2048 → 3) + softmax with sequential FP32 reduction.
+5. `call_variants_main.cc` learned `--inference_backend=metal`
+   for end-to-end dispatch.
+
+End-to-end pipeline runs on chr20:5M-6M (709 examples, 1.9 s
+including MPSGraph compilation). All smoke tests green.
+
+**Known issue (debugging in progress):** Metal output diverges from
+Core ML by orders of magnitude — output softmax probabilities for
+the same input differ by factor of ~100× (Core ML (0.003, 0.993,
+0.003) vs Metal (0.179, 0.129, 0.692) for the same example). The
+argmax can flip. Setting MPSGraph's `includeZeroPadToAverage=NO`
+(to match Keras `count_include_pad=False`) had no observable effect.
+Root cause not yet localised; suspects in priority order:
+
+- MPSGraph TF_SAME asymmetric padding doesn't match TF for stride-1
+  3×3 convs in inception branches
+- MPSGraph `averagePooling2DWithSourceTensor` doesn't honour
+  `includeZeroPadToAverage=NO` on macOS 26
+- BatchNorm fusion sign/scale assumption (verified on paper but the
+  output suggests a sign flip somewhere)
+- Conv weight layout transpose (HWIO → OIHW) byte ordering
+
+Next debugging step: add a `DV_METAL_DUMP_LAYER_N` env var that dumps
+the activations after layer N (say 0, 5, 10) and diff against TF
+reference layer-by-layer to localise where divergence starts.
