@@ -118,6 +118,8 @@ target_compile_options(dv_call_variants_lib PRIVATE
 target_link_libraries(dv_call_variants_lib PUBLIC
   dv_tfrecord
   dv_coreml
+  dv_metal_inference
+  dv_bnns_finalize
   proto_dv
   proto_nucleus
   absl::flags

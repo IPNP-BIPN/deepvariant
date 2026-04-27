@@ -26,7 +26,9 @@
 #include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
 
+#include "deepvariant/native/bnns_finalize.h"
 #include "deepvariant/native/coreml_inference.h"
+#include "deepvariant/native/metal_inference.h"
 #include "deepvariant/native/tfrecord.h"
 #include "deepvariant/protos/deepvariant.pb.h"
 #include "third_party/nucleus/protos/struct.pb.h"
@@ -34,11 +36,18 @@
 #include "third_party/nucleus/util/utils.h"
 
 ABSL_FLAG(std::string, examples,  "", "Input TFRecord file(s) of tf.train.Example.");
-ABSL_FLAG(std::string, checkpoint, "", ".mlpackage path for the inference model.");
+ABSL_FLAG(std::string, checkpoint, "",
+          "Inference model path. With --inference_backend=coreml, a "
+          ".mlpackage. With --inference_backend=metal, a .dvw weight "
+          "bundle (see tools/conversion/extract_weights.py).");
 ABSL_FLAG(std::string, outfile,   "", "Output TFRecord file for CallVariantsOutput.");
 ABSL_FLAG(int,    batch_size, 128, "Inference batch size.");
 ABSL_FLAG(std::string, compute_units, "all",
-          "Core ML compute units: all (default), cpu_gpu, cpu_only.");
+          "Core ML compute units: all (default), cpu_gpu, cpu_only. "
+          "Only applies when --inference_backend=coreml.");
+ABSL_FLAG(std::string, inference_backend, "coreml",
+          "Inference backend: coreml (Phase 2 default, Core ML .mlpackage) "
+          "or metal (Phase 5.5 bit-parity, MPSGraph + BNNS .dvw).");
 
 namespace deepvariant {
 
@@ -202,19 +211,43 @@ int RunCallVariants(int argc, char** argv) {
     return 2;
   }
 
-  // Load model.
-  LOG(INFO) << "Loading model: " << checkpoint_path;
-  auto model = CoreMLModel::Load(checkpoint_path, compute_units);
-  if (!model) {
-    LOG(ERROR) << "Failed to load Core ML model: " << checkpoint_path;
-    return 1;
+  // Pick inference backend.
+  const std::string backend = absl::GetFlag(FLAGS_inference_backend);
+  std::unique_ptr<CoreMLModel> coreml_model;
+  std::unique_ptr<MetalInception> metal_model;
+  std::unique_ptr<BnnsFinalize> metal_finalize;
+  int H = 0, W = 0, C = 0, K = 0;
+  if (backend == "coreml") {
+    LOG(INFO) << "Loading Core ML model: " << checkpoint_path;
+    coreml_model = CoreMLModel::Load(checkpoint_path, compute_units);
+    if (!coreml_model) {
+      LOG(ERROR) << "Failed to load Core ML model: " << checkpoint_path;
+      return 1;
+    }
+    H = coreml_model->InputHeight();
+    W = coreml_model->InputWidth();
+    C = coreml_model->InputChannels();
+    K = coreml_model->NumClasses();
+  } else if (backend == "metal") {
+    LOG(INFO) << "Loading Metal/BNNS model: " << checkpoint_path;
+    metal_model = MetalInception::Create(checkpoint_path);
+    metal_finalize = BnnsFinalize::Create(checkpoint_path);
+    if (!metal_model || !metal_finalize) {
+      LOG(ERROR) << "Failed to load Metal/BNNS model: " << checkpoint_path;
+      return 1;
+    }
+    // The Metal backbone uses fixed Inception-v3 input geometry.
+    H = 100;
+    W = 221;
+    C = 7;
+    K = 3;
+  } else {
+    LOG(ERROR) << "Unknown --inference_backend=" << backend
+               << " (expected 'coreml' or 'metal')";
+    return 2;
   }
-  const int H = model->InputHeight();
-  const int W = model->InputWidth();
-  const int C = model->InputChannels();
-  const int K = model->NumClasses();
   LOG(INFO) << "Model input (" << H << "," << W << "," << C
-            << ") → " << K << " classes";
+            << ") → " << K << " classes  [backend=" << backend << "]";
 
   // Open TFRecord reader + writer.
   auto reader = TFRecordReader::New(examples_path);
@@ -272,7 +305,21 @@ int RunCallVariants(int argc, char** argv) {
 
     // Run inference.
     std::vector<float> probs(n * K);
-    if (!model->Predict(images.data(), n, H, W, C, probs.data(), K)) {
+    bool ok = false;
+    if (coreml_model) {
+      ok = coreml_model->Predict(images.data(), n, H, W, C,
+                                  probs.data(), K);
+    } else if (metal_model && metal_finalize) {
+      // Two-stage Metal/BNNS path: GPU MPSGraph for backbone, CPU BNNS
+      // for the final dense + softmax (deterministic FP32 reduction
+      // = bit-parity with TF CPU).
+      std::vector<float> features(static_cast<size_t>(n) *
+                                   metal_model->FeatureDim());
+      if (metal_model->Predict(images.data(), n, features.data())) {
+        ok = metal_finalize->ApplyBatch(features.data(), n, probs.data());
+      }
+    }
+    if (!ok) {
       LOG(ERROR) << "Inference failed on batch " << total_batches;
       return false;
     }

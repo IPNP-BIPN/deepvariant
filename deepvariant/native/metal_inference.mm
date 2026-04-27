@@ -186,8 +186,11 @@ MPSGraphTensor* AvgCBR(MPSGraph* g, MPSGraphTensor* x,
                           strideInY:1
                        paddingStyle:MPSGraphPaddingStyleTF_SAME
                          dataLayout:MPSGraphTensorNamedDataLayoutNCHW];
-  // Keras default for AvgPool is exclude_padding_from_average=True; MPSGraph's
-  // averagePooling2D matches this when paddingStyle is TF_SAME.
+  // Keras AvgPool2D / DeepVariant Inception-v3 default is
+  // count_include_pad=False (i.e. divide by the number of *real* kernel
+  // positions, not by kernel area). MPSGraph defaults to YES, so we
+  // override.
+  pdesc.includeZeroPadToAverage = NO;
   MPSGraphTensor* p = [g avgPooling2DWithSourceTensor:x
                                             descriptor:pdesc
                                                   name:[name stringByAppendingString:@"_ap"]];
