@@ -16,6 +16,18 @@ target_link_libraries(dv_tfrecord PUBLIC
 )
 
 # ---------------------------------------------------------------------------
+# dv_weights — .dvw mmap loader (Phase 5.5; consumed by Metal/BNNS path)
+# ---------------------------------------------------------------------------
+add_library(dv_weights STATIC dv_weights.cc)
+target_include_directories(dv_weights PUBLIC
+  "${CMAKE_SOURCE_DIR}"
+  "${ABSL_PREFIX}/include"
+)
+target_link_libraries(dv_weights PUBLIC
+  absl::log
+)
+
+# ---------------------------------------------------------------------------
 # dv_coreml — Obj-C++ Core ML inference wrapper
 # (Obj-C++ requires macOS frameworks; no Python, no TF)
 # ---------------------------------------------------------------------------
