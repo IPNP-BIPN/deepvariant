@@ -28,6 +28,23 @@ target_link_libraries(dv_weights PUBLIC
 )
 
 # ---------------------------------------------------------------------------
+# dv_bnns_finalize — Phase 5.5 deterministic CPU dense + softmax
+# (sequential FP32 reduction, designed to bit-match TF CPU output)
+# ---------------------------------------------------------------------------
+add_library(dv_bnns_finalize STATIC bnns_finalize.mm)
+set_source_files_properties(bnns_finalize.mm PROPERTIES
+  COMPILE_FLAGS "-fobjc-arc"
+)
+target_include_directories(dv_bnns_finalize PUBLIC
+  "${CMAKE_SOURCE_DIR}"
+  "${ABSL_PREFIX}/include"
+)
+target_link_libraries(dv_bnns_finalize PUBLIC
+  dv_weights
+  absl::log
+)
+
+# ---------------------------------------------------------------------------
 # dv_metal_inference — Phase 5.5 MPSGraph + BNNS Inception-v3 backend
 # (Obj-C++ + Metal Performance Shaders Graph; consumes .dvw weights)
 # ---------------------------------------------------------------------------
