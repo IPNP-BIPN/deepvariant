@@ -325,7 +325,16 @@ int RunMakeExamples(int argc, char** argv) {
     }
   }
   auto all_regions = BuildCallingRegions(contigs, inc_regions, exc_regions);
-  auto shard_regions = ShardRegions(all_regions, task_id, num_shards);
+  // Partition into chunks of partition_size bp (default 1000), then shard.
+  // Mirrors upstream's `regions.partition()` step. Required for realigner
+  // window-set parity: each chunk runs the WindowSelector + DBG
+  // independently, and adjacent chunks emit overlapping windows at the
+  // chunk boundary — without partitioning we'd merge windows across chunk
+  // boundaries that upstream keeps separate.
+  const int64_t partition_size_bp =
+      static_cast<int64_t>(absl::GetFlag(FLAGS_partition_size));
+  auto partitioned = PartitionRegions(all_regions, partition_size_bp);
+  auto shard_regions = ShardRegions(partitioned, task_id, num_shards);
 
   LOG(INFO) << "Processing " << shard_regions.size() << " regions (shard "
             << task_id << "/" << num_shards << ")";

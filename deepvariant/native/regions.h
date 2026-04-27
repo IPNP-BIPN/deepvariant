@@ -32,4 +32,13 @@ std::vector<nucleus::genomics::v1::Range> ShardRegions(
     const std::vector<nucleus::genomics::v1::Range>& calling_regions,
     int task_id, int num_shards);
 
+// Split each calling region into chunks of at most `partition_size`
+// basepairs. Mirrors upstream's `regions.partition()` — required for
+// realigner parity, since the WindowSelector + DBG run independently
+// on each chunk and adjacent chunks emit overlapping windows at the
+// chunk boundary.
+std::vector<nucleus::genomics::v1::Range> PartitionRegions(
+    const std::vector<nucleus::genomics::v1::Range>& calling_regions,
+    int64_t partition_size);
+
 }  // namespace deepvariant

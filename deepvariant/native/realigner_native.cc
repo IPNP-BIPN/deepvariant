@@ -1,6 +1,8 @@
 #include "deepvariant/native/realigner_native.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -186,6 +188,19 @@ std::vector<nucleus::genomics::v1::Read> RealignReadsForRegion(
         nucleus::ConstProtoPtr<const nucleus::genomics::v1::Read>(&r));
   }
 
+  // Optional per-window CSV diagnostic output, mirroring the columns
+  // upstream's DiagnosticLogger writes when --realigner_diagnostics is on:
+  // window, k, n_haplotypes, n_reads_in_window. Enabled by setting
+  // DV_REALIGNER_DIAG_CSV to a path; a header row is written on first call.
+  static std::ofstream* diag_csv = []() -> std::ofstream* {
+    const char* p = std::getenv("DV_REALIGNER_DIAG_CSV");
+    if (!p || !*p) return nullptr;
+    auto* f = new std::ofstream(p);
+    if (!f->is_open()) return nullptr;
+    *f << "window,k,n_haplotypes,n_reads_in_window\n";
+    return f;
+  }();
+
   for (const auto& window : windows) {
     auto ref_or = ref_reader.GetBases(window);
     if (!ref_or.ok()) continue;
@@ -208,8 +223,15 @@ std::vector<nucleus::genomics::v1::Read> RealignReadsForRegion(
     auto graph = DeBruijnGraph::Build(ref_bases, win_reads_copy,
                                        options.dbg_config());
     std::vector<std::string> haplotypes;
+    int k_used = -1;
     if (graph) {
       haplotypes = graph->CandidateHaplotypes();
+      k_used = graph->KmerSize();
+    }
+    if (diag_csv) {
+      *diag_csv << window.reference_name() << ":" << (window.start() + 1)
+                << "-" << window.end() << "," << k_used << ","
+                << haplotypes.size() << "," << win_reads.size() << "\n";
     }
     if (haplotypes.empty() ||
         (haplotypes.size() == 1 && haplotypes[0] == ref_bases)) {
@@ -221,6 +243,7 @@ std::vector<nucleus::genomics::v1::Read> RealignReadsForRegion(
     ar.haplotypes = std::move(haplotypes);
     assembled.push_back(std::move(ar));
   }
+  if (diag_csv) diag_csv->flush();
 
   LOG(INFO) << "  realigner: " << assembled.size()
             << " assembled regions in "

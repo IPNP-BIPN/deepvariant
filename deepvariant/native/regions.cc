@@ -182,4 +182,24 @@ std::vector<nucleus::genomics::v1::Range> ShardRegions(
   return shard_regions;
 }
 
+std::vector<nucleus::genomics::v1::Range> PartitionRegions(
+    const std::vector<nucleus::genomics::v1::Range>& calling_regions,
+    int64_t partition_size) {
+  std::vector<nucleus::genomics::v1::Range> out;
+  if (partition_size <= 0) return calling_regions;
+  for (const auto& r : calling_regions) {
+    int64_t s = r.start();
+    while (s < r.end()) {
+      const int64_t e = std::min<int64_t>(s + partition_size, r.end());
+      nucleus::genomics::v1::Range chunk;
+      chunk.set_reference_name(r.reference_name());
+      chunk.set_start(s);
+      chunk.set_end(e);
+      out.push_back(std::move(chunk));
+      s = e;
+    }
+  }
+  return out;
+}
+
 }  // namespace deepvariant
