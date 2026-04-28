@@ -9,12 +9,15 @@
 # input mount, RW output mount, tools/conversion mounted at /work so
 # the script can `import` shared helpers).
 #
-# Usage: ./dump_tf_per_layer.sh <savedmodel_dir> <out_dir>
+# Usage:
+#   ./dump_tf_per_layer.sh <savedmodel_dir> <out_dir>             # seed-0
+#   ./dump_tf_per_layer.sh <savedmodel_dir> <out_dir> <input.npy> # real input
 
 set -euo pipefail
 
-MODEL_DIR="${1:?usage: $0 <savedmodel_dir> <out_dir>}"
-OUT_DIR="${2:?usage: $0 <savedmodel_dir> <out_dir>}"
+MODEL_DIR="${1:?usage: $0 <savedmodel_dir> <out_dir> [input.npy]}"
+OUT_DIR="${2:?usage: $0 <savedmodel_dir> <out_dir> [input.npy]}"
+INPUT_NPY="${3:-}"
 DV_VERSION="${DV_VERSION:-1.10.0}"
 
 if [[ ! -f "${MODEL_DIR}/saved_model.pb" ]]; then
@@ -32,11 +35,28 @@ echo "    model:  ${MODEL_DIR_ABS}"
 echo "    out:    ${OUT_DIR_ABS}"
 echo "    image:  google/deepvariant:${DV_VERSION}"
 
-docker run --rm --platform linux/amd64 \
-  -v "${MODEL_DIR_ABS}:/in:ro" \
-  -v "${OUT_DIR_ABS}:/out" \
-  -v "${WORK_DIR_ABS}:/work:ro" \
-  "google/deepvariant:${DV_VERSION}" \
-  python3 /work/dump_tf_per_layer.py /in /out
+if [[ -n "${INPUT_NPY}" ]]; then
+  if [[ ! -f "${INPUT_NPY}" ]]; then
+    echo "error: input.npy not found: ${INPUT_NPY}" >&2
+    exit 1
+  fi
+  INPUT_DIR_ABS="$(cd "$(dirname "${INPUT_NPY}")" && pwd)"
+  INPUT_NAME="$(basename "${INPUT_NPY}")"
+  echo "    input:  ${INPUT_DIR_ABS}/${INPUT_NAME}"
+  docker run --rm --platform linux/amd64 \
+    -v "${MODEL_DIR_ABS}:/in:ro" \
+    -v "${OUT_DIR_ABS}:/out" \
+    -v "${WORK_DIR_ABS}:/work:ro" \
+    -v "${INPUT_DIR_ABS}:/inp:ro" \
+    "google/deepvariant:${DV_VERSION}" \
+    python3 /work/dump_tf_per_layer.py /in /out "/inp/${INPUT_NAME}"
+else
+  docker run --rm --platform linux/amd64 \
+    -v "${MODEL_DIR_ABS}:/in:ro" \
+    -v "${OUT_DIR_ABS}:/out" \
+    -v "${WORK_DIR_ABS}:/work:ro" \
+    "google/deepvariant:${DV_VERSION}" \
+    python3 /work/dump_tf_per_layer.py /in /out
+fi
 
 echo "==> done"

@@ -84,15 +84,19 @@ OUTPUT_TENSOR = "Identity:0"  # final softmax wrapped as Identity
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
+    if len(argv) not in (3, 4):
         print(
-            f"usage: {argv[0]} <savedmodel_dir> <out_dir>",
+            f"usage: {argv[0]} <savedmodel_dir> <out_dir> [input.npy]\n"
+            "  Without [input.npy], a fixed seed-0 random batch is used.\n"
+            "  With [input.npy], it must be FP32 NHWC of shape (B, H, W, C)\n"
+            "  matching the model's expected input geometry.",
             file=sys.stderr,
         )
         return 2
 
     model_dir = Path(argv[1])
     out_dir = Path(argv[2])
+    in_npy = Path(argv[3]) if len(argv) == 4 else None
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Auto-detect input shape from upstream's example_info.json.
@@ -102,11 +106,23 @@ def main(argv: list[str]) -> int:
         H, W, C = int(sh[0]), int(sh[1]), int(sh[2])
     else:
         H, W, C = 100, 221, 7
-    print(f"input shape: (1, {H}, {W}, {C})")
 
-    # Fixed-seed deterministic input.
-    rng = np.random.default_rng(0)
-    x = rng.uniform(0.0, 255.0, (1, H, W, C)).astype(np.float32)
+    # Either load real pileup batch (preferred for drift profiling) or
+    # fall back to fixed-seed random.
+    if in_npy is not None:
+        x = np.load(in_npy).astype(np.float32)
+        if x.ndim != 4 or x.shape[1:] != (H, W, C):
+            print(
+                f"input.npy shape mismatch: got {x.shape}, "
+                f"expected (B, {H}, {W}, {C})",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"loaded input from {in_npy}: shape={x.shape}")
+    else:
+        rng = np.random.default_rng(0)
+        x = rng.uniform(0.0, 255.0, (1, H, W, C)).astype(np.float32)
+        print(f"input shape: {x.shape} (seed-0 random)")
     np.save(out_dir / "_input.npy", x)
 
     # 1) Canonical SavedModel signature forward (gold reference).
