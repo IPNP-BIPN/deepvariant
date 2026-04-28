@@ -1022,3 +1022,98 @@ Root cause not yet localised; suspects in priority order:
 Next debugging step: add a `DV_METAL_DUMP_LAYER_N` env var that dumps
 the activations after layer N (say 0, 5, 10) and diff against TF
 reference layer-by-layer to localise where divergence starts.
+
+---
+
+## Phase 5.5a + 5.5b — root cause + fix (2026-04-28)
+
+The "channel-permutation" / "softmax noise" symptom from Phase 5.5
+turned out to be a chain of three bugs, none of them in MPSGraph
+itself. Investigation took ~2 days; the resolution is summarised
+here so it doesn't re-occur.
+
+### Bug 1: stale `.dvw`
+
+`validation/work/wgs.dvw` was extracted weeks earlier with an older
+version of `tools/conversion/extract_weights.py` /
+`tools/conversion/tensor_bundle_reader.py` that produced corrupted
+bytes (verified by reading the .dvw header + first 8 floats and
+comparing to the bundle: bundle says `[0.00579, 0.00183, 0.069, …]`
+for `layer_with_weights-0/kernel`, the stale .dvw said `[-0.0197,
+0.0049, -0.0453, …]` — totally different bytes for the same
+variable).
+
+**Fix:** re-run `extract_weights.py models/wgs validation/work/wgs.dvw`
+with the current code. Fresh .dvw matches the bundle byte-for-byte.
+
+This alone unblocked stem CBR — `stem_s1a` jumped from max-abs ≈1500
+(catastrophic) to max-abs ≈7e-4 (1 ULP) vs TF reference.
+
+### Bug 2: wrong `(conv_n, bn_n)` pairs in `inception_v3_mil.py`
+
+The hand-coded recipe assumed Keras's `tf.keras.applications.
+InceptionV3` enumerated layers in strict (conv, bn, conv, bn, …)
+order. **False for Inception-v3:** parallel branches are interleaved
+in TrackableObjectGraph traversal, so e.g. `conv2d_5` (the first
+1×1 conv attached for Mixed_5b's branch1x1) is `layer_with_weights-16`,
+not `layer_with_weights-10`. Several pairs were swapped in 5b/c/d
+and 6b/c/d/e.
+
+**Fix:** authoritative pairs derived programmatically by byte-matching
+each frozen-graph kernel const against bundle `layer_with_weights-K`
+entries. See `tools/conversion/dump_authoritative_pairs.py` (runs
+inside `google/deepvariant:1.10.0` Docker, uses
+`convert_variables_to_constants_v2` to inline `StatefulPartitionedCall`,
+walks every `inceptionv3/conv2d_M/Conv2D` op, reads its weight const,
+matches by shape + first-8 floats to a bundle layer). All 94 pairs
+auto-generated, all `Mixed_*` functions in `metal_inference.mm`
+regenerated.
+
+After Bug 2 fix: 19/19 taps match TF reference within FP32 cumulative
+drift (max-abs ≤ 1.5e-3 across 188 layers; mean-abs ≤ 1e-4; gap
+output max-abs 2.4e-4).
+
+### Bug 3: `deepvariant` binary not relinked
+
+While iterating, `cmake --build build-macos` didn't auto-relink the
+`deepvariant` executable when only `dv_metal_inference` (a static
+`.a` lib) had changed. The executable kept loading old objects and
+producing garbage softmax `[0.37, 0.43, 0.20]` despite the source
+being correct.
+
+**Fix:** explicitly `cmake --build build-macos --target deepvariant`
+after every change to a transitive lib. (Or `--target all`.)
+
+### Phase 5.5b result (chr20 partial: chr20:200997..299145, 424
+examples through deepvariant big-model)
+
+| FILTER pair | Count | Notes                                  |
+|-------------|-------|----------------------------------------|
+| PASS / PASS | 255   | ✅ identical                            |
+| RefCall / RefCall | 108 | ✅ identical                          |
+| NoCall / NoCall | 16  | ✅ identical                            |
+| NoCall / RefCall | 2  | borderline drift (no PASS impact)      |
+| **Total mismatches** | **2 / 381 (0.52 %)**             |
+
+**100 % parity on PASS variant set vs `google/deepvariant:1.10.0`
+Docker.** The 2 borderline drifts are NoCall↔RefCall flips from
+FP32 cumulative drift over 188 conv layers, no impact on the called
+variant set.
+
+Next: full-chr20 measurement and extension to all model variants
+(WES / PacBio / ONT / pangenome / DeepTrio / DeepSomatic).
+
+### Tooling shipped this phase
+
+- `tools/conversion/dump_tf_per_layer.py` + `.sh` — TF reference
+  dumper (frozen-graph + v1 Session, runs in conversion Docker).
+- `deepvariant/native/microtest_main.mm` (`microtest_metal` binary)
+  — 7 hand-verifiable MPSGraph conv tests: 1×1, 3×3 stride-1,
+  3×3 stride-2, 7→32 multi-channel, the exact stem_s1a shape on
+  large input (100×221×7), and a real-bundle-weights test. All
+  PASS bit-exact. This is how we eliminated MPSGraph itself as
+  the bug source.
+- `deepvariant/native/debug_metal_main.cc --compare-to-reference`
+  — NPY reader + ULP-diff per tap.
+- `tools/conversion/dump_authoritative_pairs.py` — byte-matching
+  script that produces the canonical (M, conv_n, bn_n) table.
