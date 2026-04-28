@@ -1117,3 +1117,51 @@ Next: full-chr20 measurement and extension to all model variants
   — NPY reader + ULP-diff per tap.
 - `tools/conversion/dump_authoritative_pairs.py` — byte-matching
   script that produces the canonical (M, conv_n, bn_n) table.
+
+### Phase 5.5b — full chr20 measurement (2026-04-28)
+
+After fixing two follow-up bugs in `cli.cc` (per-shard examples files
+to avoid concurrent writes; propagate `--inference_backend` and
+`--checkpoint` to the call_variants stage), the full chr20 pipeline
+runs end-to-end in **4:11 wall-time** on M4 Max (16 cores, 14
+parallel make_examples shards via posix_spawn, ~392 % avg CPU).
+
+Stage breakdown:
+- make_examples (CPU, 14 shards): ~3:30 (84 % wall-time)
+- call_variants (Metal/GPU): ~30 s (12 %)
+- postprocess_variants: ~11 s (4 %)
+
+FILTER comparison vs `google/deepvariant:1.10.0` Docker on full chr20
+(210 372 sites in our output, 210 390 in Docker's; 209 526 shared):
+
+| FILTER pair       | Count   | Status |
+|-------------------|---------|--------|
+| PASS ↔ PASS       | 106 702 | match  |
+| RefCall ↔ RefCall |  78 619 | match  |
+| NoCall ↔ NoCall   |  21 838 | match  |
+| RefCall vs NoCall |   1 249 | DIFF (no PASS impact) |
+| NoCall vs RefCall |     583 | DIFF (no PASS impact) |
+| PASS vs NoCall    |     250 | **DIFF — PASS↔non-PASS** |
+| NoCall vs PASS    |     214 | **DIFF — PASS↔non-PASS** |
+| RefCall vs PASS   |      41 | **DIFF — PASS↔non-PASS** |
+| PASS vs RefCall   |      30 | **DIFF — PASS↔non-PASS** |
+| **Total mismatch**| **2 367** | **1.13 %** |
+
+PASS-set parity:
+- Ours: 107 139 PASS sites
+- Docker: 107 113 PASS sites
+- Intersection (called by both): **106 702**
+- Missing PASS in ours (Docker calls, we miss): 411
+- Extra PASS in ours (we call, Docker misses): 437
+
+The 1.13 % mismatch rate matches the Phase-4 Core ML measurement
+exactly (535 PASS↔non-PASS flips), confirming that the Metal/MPSGraph
+FP32 path produces functionally equivalent classifications to Core ML.
+The remaining drift is FP32 cumulative rounding over 188 conv layers
+hitting borderline sites near the FILTER thresholds — same root cause
+identified in Phase 5.5 release-gate analysis.
+
+For strict 100 % FILTER parity (the release gate), the 535 PASS-class
+flips need closing. Options: BNNS-CPU final dense (already partially
+done; covers softmax determinism), or a deterministic-reduction conv
+kernel for the 5-15 layers where drift is most amplified.
