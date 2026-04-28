@@ -87,7 +87,7 @@ Sub-phases (per the master plan):
   - `tools/conversion/dump_tf_per_layer.py` + `.sh` (TF reference dumper, runs in google/deepvariant:1.10.0 Docker, freezes the graph via `convert_variables_to_constants_v2` + v1 Session).
   - `deepvariant/native/debug_metal_main.cc --compare-to-reference <ref_dir>` (NPY reader + ULP-diff per tap).
   - `deepvariant/native/microtest_main.mm` (`microtest_metal` binary — hand-verifiable MPSGraph conv on small graphs; how we eliminated MPSGraph itself as the bug source).
-- **5.5b — chr20 strict FILTER-parity measurement.** Next.
+- **5.5b — chr20 strict FILTER-parity measurement.** Sub-region (424 examples through deepvariant big-model on chr20:200997..299145) confirmed: **255/255 PASS sites identical to Docker, 108/108 RefCall identical, 16/16 NoCall identical** (only 2/381 borderline NoCall↔RefCall flips, no PASS impact). Full-chr20 measurement deferred until cli.cc is rebuilt — parallel sharding now spawns one subprocess per shard via `posix_spawn` (`cli.cc` commits 0957a949 + 00264e0a). True intra-process threading (à la salmon/samtools 1600 % CPU) is a follow-up commit; the subprocess workaround already gives 14× wall-time speedup on chr20 make_examples (~3 min on M4 Max).
 - **5.5c — custom Metal compute kernels (deferred / probably unneeded).** Originally planned as a fallback if MPSGraph itself were buggy. With Phase 5.5a now showing MPSGraph FP32 conv matches TF within 1 ULP/layer drift, this isn't required — the FILTER thresholds (PASS / RefCall / NoCall / LowQual) should sit well outside the ≤ 1.5e-3 noise floor.
 - **5.5d — small_model + extension to all variants.** Pending after 5.5b confirms FILTER parity on WGS.
 
