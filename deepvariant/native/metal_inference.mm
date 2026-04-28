@@ -15,6 +15,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
+#import <MetalPerformanceShadersGraph/MPSGraphImToColOps.h>
 
 #include <cmath>
 #include <memory>
@@ -92,14 +93,20 @@ FusedConv FoldConvBn(const DvwWeights& dvw, int conv_n, int bn_n) {
   }
   out.bias = std::move(offset);
 
-  // Native HWIO; multiply by scale[o] along the O axis.
+  // Native HWIO; multiply by scale[o] along the O axis. Optionally
+  // flip H and W axes ("true convolution" vs cross-correlation) — see
+  // the diagnostic experiment in PORT_LOG. TF uses cross-correlation.
   out.weights_hwio.resize((size_t)Hk * Wk * Ik * Ok);
+  const bool flip_spatial = false;  // TF/MPS conv is cross-correlation, no flip
   for (size_t h = 0; h < (size_t)Hk; ++h) {
+    const size_t h_src = flip_spatial ? (Hk - 1 - h) : h;
     for (size_t w = 0; w < (size_t)Wk; ++w) {
+      const size_t w_src = flip_spatial ? (Wk - 1 - w) : w;
       for (size_t i = 0; i < (size_t)Ik; ++i) {
         for (size_t o = 0; o < (size_t)Ok; ++o) {
-          const size_t idx = ((h * Wk + w) * Ik + i) * Ok + o;
-          out.weights_hwio[idx] = k->data[idx] * scale[o];
+          const size_t dst_idx = ((h * Wk + w) * Ik + i) * Ok + o;
+          const size_t src_idx = ((h_src * Wk + w_src) * Ik + i) * Ok + o;
+          out.weights_hwio[dst_idx] = k->data[src_idx] * scale[o];
         }
       }
     }
@@ -119,41 +126,154 @@ MPSGraphTensor* ConstFloat32(MPSGraph* g, const float* data,
                     dataType:MPSDataTypeFloat32];
 }
 
-// Build a Conv2D + bias-add op given a fused conv/bias.
+// Build a Conv2D + bias-add as **imToCol + matrixMultiplication**.
+//
+// Why: MPSGraph's native `convolution2DWithSourceTensor:` permutes
+// output channels in FP32 on this network (Phase 5.5a investigation,
+// reproducible across OIHW/HWIO/NCHW/NHWC layouts; same family as
+// pytorch/pytorch#84206). The im2col + GEMM decomposition uses two
+// MPSGraph ops that don't share the buggy code path, so we get FP32-
+// accurate output while staying entirely inside MPSGraph (no custom
+// Metal kernels needed).
+//
+// Recipe (NHWC throughout — imToCol's NHWC layout is supported on
+// macOS 14+):
+//
+//   1. imToCol unfolds NHWC input (N, H, W, C_in) into
+//      (N, H_out * W_out, kH * kW * C_in) — one row per output
+//      position, columns = the kH×kW×C_in receptive-field flattened.
+//   2. Reshape the HWIO kernel (kH, kW, C_in, C_out) to a 2D matrix
+//      (kH * kW * C_in, C_out).
+//   3. matrixMultiplication: (N, M, K) × (K, N_out) → (N, M, N_out)
+//      where M = H_out * W_out, K = kH * kW * C_in, N_out = C_out.
+//      MPSGraph broadcasts the leading batch dim of the left operand
+//      against the rank-2 right operand.
+//   4. Reshape back to NHWC: (N, H_out, W_out, C_out).
+//   5. Add bias (broadcast over the channel axis).
+//
+// Padding: imToCol takes explicit padding only (no TF-style SAME
+// shortcut), so we compute it on the host the same way TF does.
 MPSGraphTensor* AddConv(MPSGraph* g, MPSGraphTensor* x,
                         const FusedConv& fc,
                         int stride_y, int stride_x,
                         bool same_padding,  // true = "same", false = "valid"
                         NSString* name) {
-  // HWIO layout (TF-native).
-  NSArray* w_shape = @[@(fc.H), @(fc.W), @(fc.I), @(fc.O)];
-  MPSGraphTensor* W = ConstFloat32(g, fc.weights_hwio.data(), w_shape,
-                                   [name stringByAppendingString:@"_w"]);
+  // ---- 1) Padding on the host (TF semantics) ----
+  // For SAME with stride 1 on odd kernels: pad = (k-1)/2 each side.
+  // For SAME with arbitrary stride/kernel we'd compute output-size-
+  // first then derive padding; this network only uses SAME at stride 1
+  // (Inception 1×1 / 3×3 / 5×5 / 1×7 / 7×1) and VALID elsewhere — keep
+  // the simple branch.
+  NSUInteger pad_top = 0, pad_bottom = 0, pad_left = 0, pad_right = 0;
+  if (same_padding) {
+    pad_top = pad_bottom = (NSUInteger)((fc.H - 1) / 2);
+    pad_left = pad_right = (NSUInteger)((fc.W - 1) / 2);
+    if ((fc.H - 1) % 2 != 0) pad_bottom += 1;  // asymmetric for even k
+    if ((fc.W - 1) % 2 != 0) pad_right += 1;
+  }
+
+  // ---- 2) imToCol: unfold the input ----
+  MPSGraphImToColOpDescriptor* iDesc =
+      [MPSGraphImToColOpDescriptor
+          descriptorWithKernelWidth:(NSUInteger)fc.W
+                       kernelHeight:(NSUInteger)fc.H
+                          strideInX:(NSUInteger)stride_x
+                          strideInY:(NSUInteger)stride_y
+                    dilationRateInX:1
+                    dilationRateInY:1
+                        paddingLeft:pad_left
+                       paddingRight:pad_right
+                         paddingTop:pad_top
+                      paddingBottom:pad_bottom
+                         dataLayout:MPSGraphTensorNamedDataLayoutNHWC];
+  MPSGraphTensor* unfolded =
+      [g imToColWithSourceTensor:x
+                       descriptor:iDesc
+                             name:[name stringByAppendingString:@"_im2col"]];
+
+  // ---- 3) Reshape kernel to (K, N_out) with K-order matching imToCol ----
+  // MPSGraph's imToCol orders the unfolded K axis as
+  // `(c_in, kh, kw)` (channels-outer; observed empirically via the
+  // permutation pattern in stem_s1a). To match, we transpose the
+  // bundle's HWIO kernel (h, w, i, o) → (i, h, w, o) = IHWO before
+  // flattening into (K, O).
+  NSArray* w_hwio_shape = @[@(fc.H), @(fc.W), @(fc.I), @(fc.O)];
+  MPSGraphTensor* W_hwio = ConstFloat32(g, fc.weights_hwio.data(),
+                                        w_hwio_shape,
+                                        [name stringByAppendingString:@"_w"]);
+  // permutation (2, 0, 1, 3): [H, W, I, O] -> [I, H, W, O]
+  MPSGraphTensor* W_ihwo = [g transposeTensor:W_hwio
+                                   permutation:@[@2, @0, @1, @3]
+                                          name:[name stringByAppendingString:@"_wt"]];
+  const NSInteger K = (NSInteger)fc.H * (NSInteger)fc.W * (NSInteger)fc.I;
+  MPSGraphTensor* W_mat = [g reshapeTensor:W_ihwo
+                                  withShape:@[@(K), @(fc.O)]
+                                       name:[name stringByAppendingString:@"_wmat"]];
+
+  // ---- 4) Compute H_out, W_out on the host (TF-style) ----
+  NSArray<NSNumber*>* x_shape = x.shape;
+  if (x_shape.count != 4) {
+    LOG(ERROR) << "AddConv: source tensor has rank " << x_shape.count
+               << " (expected 4 NHWC)";
+    return nullptr;
+  }
+  NSInteger H_in = [x_shape[1] integerValue];
+  NSInteger W_in = [x_shape[2] integerValue];
+  NSInteger H_eff = H_in + (NSInteger)(pad_top + pad_bottom) - fc.H;
+  NSInteger W_eff = W_in + (NSInteger)(pad_left + pad_right) - fc.W;
+  NSInteger H_out = H_eff / stride_y + 1;
+  NSInteger W_out = W_eff / stride_x + 1;
+  if (H_out <= 0 || W_out <= 0) {
+    LOG(ERROR) << "AddConv: invalid output spatial dims H_out=" << H_out
+               << " W_out=" << W_out;
+    return nullptr;
+  }
+  const NSInteger M = H_out * W_out;
+
+  // ---- 5) Reshape unfolded to rank-4 (N, M, K, 1) for einsum-style MUL+REDUCE ----
+  // We bypass `matrixMultiplicationWithPrimaryTensor:` to prevent
+  // MPSGraph's optimiser from fusing imToCol + matmul back into the
+  // (buggy) `convolution2DWithSourceTensor` op. Broadcasting MUL across
+  // the K axis followed by reduceSum is mathematically identical to a
+  // matmul but doesn't trigger the conv-fusion pattern.
+  MPSGraphTensor* unfolded4 =
+      [g reshapeTensor:unfolded
+              withShape:@[@(-1), @(M), @(K), @1]
+                   name:[name stringByAppendingString:@"_im2col_r4"]];
+  MPSGraphTensor* W_mat4 =
+      [g reshapeTensor:W_mat
+              withShape:@[@1, @1, @(K), @(fc.O)]
+                   name:[name stringByAppendingString:@"_wmat4"]];
+
+  // ---- 6) Einsum-style: (N, M, K, 1) * (1, 1, K, O) -> (N, M, K, O) ----
+  MPSGraphTensor* prod =
+      [g multiplicationWithPrimaryTensor:unfolded4
+                          secondaryTensor:W_mat4
+                                     name:[name stringByAppendingString:@"_prod"]];
+  // Reduce sum over K (axis 2). Output: (N, M, 1, O).
+  MPSGraphTensor* y3d =
+      [g reductionSumWithTensor:prod
+                            axis:2
+                            name:[name stringByAppendingString:@"_rsum"]];
+  // Squeeze axis 2 → (N, M, O)
+  MPSGraphTensor* y =
+      [g squeezeTensor:y3d
+                  axis:2
+                  name:[name stringByAppendingString:@"_sq"]];
+
+  // ---- 7) Reshape back to NHWC (N, H_out, W_out, N_out) ----
+  MPSGraphTensor* y4 =
+      [g reshapeTensor:y
+              withShape:@[@(-1), @(H_out), @(W_out), @(fc.O)]
+                   name:[name stringByAppendingString:@"_y4"]];
+
+  // ---- 7) Bias broadcast and add ----
   MPSGraphTensor* b = ConstFloat32(g, fc.bias.data(), @[@(fc.O)],
                                    [name stringByAppendingString:@"_b"]);
-
-  MPSGraphConvolution2DOpDescriptor* desc =
-      [MPSGraphConvolution2DOpDescriptor
-          descriptorWithStrideInX:stride_x
-                        strideInY:stride_y
-                  dilationRateInX:1
-                  dilationRateInY:1
-                           groups:1
-                     paddingStyle:same_padding
-                                      ? MPSGraphPaddingStyleTF_SAME
-                                      : MPSGraphPaddingStyleTF_VALID
-                       dataLayout:MPSGraphTensorNamedDataLayoutNHWC
-                    weightsLayout:MPSGraphTensorNamedDataLayoutHWIO];
-  MPSGraphTensor* y = [g convolution2DWithSourceTensor:x
-                                          weightsTensor:W
-                                             descriptor:desc
-                                                   name:name];
-  // Bias broadcast along channel dim. Bias shape (O,) needs reshape to
-  // (1, 1, 1, O) for NHWC broadcasting.
   MPSGraphTensor* b_reshaped = [g reshapeTensor:b
                                        withShape:@[@1, @1, @1, @(fc.O)]
                                             name:[name stringByAppendingString:@"_br"]];
-  return [g additionWithPrimaryTensor:y
+  return [g additionWithPrimaryTensor:y4
                        secondaryTensor:b_reshaped
                                   name:[name stringByAppendingString:@"_bias"]];
 }
@@ -411,6 +531,12 @@ struct MetalInception::Impl {
   // graph is built, so PredictAtTap() can request a specific stage's
   // output.
   NSMutableDictionary<NSString*, MPSGraphTensor*>* taps = nil;
+  // Compiled executable with optimizationLevel=Level0 (GPU-only,
+  // no ANE placement pass). Lazily filled per tap on first request.
+  MPSGraphCompilationDescriptor* compileDesc = nil;
+  NSMutableDictionary<NSString*, MPSGraphExecutable*>* execCache = nil;
+  // Ordered list of tap tensors compiled into the gap executable
+  // (used for the full-network forward — Predict()).
   int feature_dim = 2048;
 };
 
@@ -444,6 +570,18 @@ std::unique_ptr<MetalInception> MetalInception::Create(
   }
 
   I.graph = [MPSGraph new];
+  // Compilation descriptor: optimizationLevel=Level0 disables the
+  // "placement pass dispatching across NeuralEngine and CPU along
+  // with the GPU" (per MPSGraph.h). Default Level1 silently picks
+  // mixed-precision paths (e.g. FP16 Winograd intermediates) and
+  // off-GPU placements for ops where it thinks it's safe — which
+  // produces channel-permuted output for our FP32 Inception-v3 conv.
+  // Level0 forces GPU-only, full-precision execution at the cost of
+  // some perf optimisations.
+  I.compileDesc = [MPSGraphCompilationDescriptor new];
+  I.compileDesc.optimizationLevel = MPSGraphOptimizationLevel0;
+  I.compileDesc.waitForCompilationCompletion = YES;
+  I.execCache = [NSMutableDictionary dictionary];
   I.taps = [NSMutableDictionary dictionary];
   // Variable batch dimension. -1 means "any" in MPSGraph shape spec.
   I.input = [I.graph placeholderWithShape:@[@-1, @100, @221, @7]
@@ -523,6 +661,32 @@ bool MetalInception::PredictAtTap(const std::string& tap_name,
       return false;
     }
 
+    // Compile (and cache) an executable for this specific tap with
+    // optimizationLevel=Level0 — only path that gives correct FP32
+    // output (Phase 5.5a investigation).
+    MPSGraphExecutable* exe = I.execCache[tap_ns];
+    if (!exe) {
+      MPSShape* in_shape =
+          @[@(batch_size), @100, @221, @7];
+      MPSGraphShapedType* in_st =
+          [[MPSGraphShapedType alloc] initWithShape:in_shape
+                                            dataType:MPSDataTypeFloat32];
+      NSDictionary<MPSGraphTensor*, MPSGraphShapedType*>* feeds_shape =
+          @{I.input: in_st};
+      exe = [I.graph compileWithDevice:[MPSGraphDevice deviceWithMTLDevice:I.device]
+                                  feeds:feeds_shape
+                          targetTensors:@[tap]
+                       targetOperations:nil
+                  compilationDescriptor:I.compileDesc];
+      if (!exe) {
+        LOG(ERROR) << "MetalInception::PredictAtTap: compile failed for "
+                   << tap_name;
+        return false;
+      }
+      I.execCache[tap_ns] = exe;
+    }
+
+    // Wrap input as MPSGraphTensorData.
     const NSUInteger n_in = (NSUInteger)batch_size * 100 * 221 * 7;
     NSData* in_data = [NSData dataWithBytes:input
                                      length:n_in * sizeof(float)];
@@ -532,19 +696,20 @@ bool MetalInception::PredictAtTap(const std::string& tap_name,
                  shape:@[@(batch_size), @100, @221, @7]
               dataType:MPSDataTypeFloat32];
 
-    NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feeds =
-        @{I.input: in_td};
-    NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* results =
-        [I.graph runWithFeeds:feeds
-                targetTensors:@[tap]
-             targetOperations:nil];
-
-    MPSGraphTensorData* out_td = results[tap];
-    if (!out_td) {
-      LOG(ERROR) << "MetalInception::PredictAtTap: no result for tap "
-                 << tap_name;
+    MPSGraphExecutableExecutionDescriptor* runDesc =
+        [MPSGraphExecutableExecutionDescriptor new];
+    runDesc.waitUntilCompleted = YES;
+    NSArray<MPSGraphTensorData*>* outs =
+        [exe runWithMTLCommandQueue:I.queue
+                        inputsArray:@[in_td]
+                       resultsArray:nil
+                executionDescriptor:runDesc];
+    if (!outs || outs.count != 1) {
+      LOG(ERROR) << "MetalInception::PredictAtTap: run produced "
+                 << (outs ? outs.count : 0) << " results (expected 1)";
       return false;
     }
+    MPSGraphTensorData* out_td = outs[0];
     NSArray<NSNumber*>* shape = out_td.shape;
     NSUInteger total = 1;
     for (NSNumber* d in shape) total *= [d unsignedIntegerValue];
