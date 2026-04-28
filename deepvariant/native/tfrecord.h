@@ -10,7 +10,16 @@
 
 namespace deepvariant {
 
+// Render `spec` ("name@N") to the per-shard filename for `task_id`:
+// "name-NNNNN-of-NNNNN". Plain paths (no '@') pass through unchanged.
+std::string ShardName(const std::string& spec, int task_id);
+
 // Read TFRecord files sequentially.  One instance is NOT thread-safe.
+//
+// The path passed to New() may be a plain file or a "name@N" shard spec.
+// Shard specs are expanded to {name-00000-of-NNNNN, ..., name-(N-1)-of-NNNNN}
+// and read in order — GetNext() transparently advances across shard
+// boundaries.
 class TFRecordReader {
  public:
   // Valid compression_type: "" (none). GZIP/ZLIB not supported.

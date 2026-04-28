@@ -10,11 +10,15 @@
 #include "deepvariant/native/make_examples_main.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -90,6 +94,13 @@ ABSL_FLAG(int, small_model_indel_gq_threshold, 28,
 ABSL_FLAG(bool, realigner_enabled, false,
           "Enable upstream's realigner (DeBruijnGraph + FastPassAligner) "
           "to recover candidates in indel-rich regions.");
+ABSL_FLAG(int, threads, 1,
+          "Worker threads inside this process. >1 enables true intra-process "
+          "parallelism (one process showing N×100 % CPU). Each worker opens "
+          "its own SamReader / IndexedFastaReader / ExamplesGenerator / "
+          "SmallModel and writes to a per-thread file; results are "
+          "concatenated into the final --examples / --small_model_cvo_outfile "
+          "paths after all workers join.");
 
 namespace deepvariant {
 
@@ -277,6 +288,14 @@ CallVariantsOutput MakeSmallModelCvo(
 
 }  // namespace
 
+// Per-thread accumulators returned to the main thread for summing.
+struct WorkerStats {
+  int64_t total_candidates = 0;
+  int64_t total_examples = 0;
+  int64_t total_small_hits = 0;
+  int64_t total_big_dispatched = 0;
+};
+
 int RunMakeExamples(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
 
@@ -291,36 +310,38 @@ int RunMakeExamples(int argc, char** argv) {
 
   const int task_id = absl::GetFlag(FLAGS_task_id);
   const int num_shards = std::max(1, absl::GetFlag(FLAGS_num_shards));
+  const int n_threads = std::max(1, absl::GetFlag(FLAGS_threads));
 
-  // ── Open reference (for AlleleCounter) ────────────────────────────────────
+  // ── Open shared reference (only used for header / contigs / sample name
+  //     inference). Per-thread workers reopen their own IndexedFastaReader
+  //     so AlleleCounter calls into htslib stay thread-local. ──────────────
   auto ref_or = nucleus::IndexedFastaReader::FromFile(
       ref_path, absl::StrCat(ref_path, ".fai"));
   CHECK(ref_or.ok()) << "Failed to open reference: " << ref_path;
-  auto ref_reader = std::move(ref_or.ValueOrDie());
+  auto ref_reader_main = std::move(ref_or.ValueOrDie());
 
-  // ── Infer sample name ─────────────────────────────────────────────────────
-  // Use the same min_mapping_quality (default 5) at the SamReader layer
-  // as the AC / candidate-emission stage, mirroring upstream's
-  // make_examples_options.py. The WindowSelector and DBG apply their own
-  // stricter thresholds (20 / 14) at their respective layers.
+  // ── Infer sample name from the BAM header (cheap, single read). ──────────
   nucleus::genomics::v1::SamReaderOptions sam_opts;
   sam_opts.mutable_read_requirements()->set_min_mapping_quality(
       absl::GetFlag(FLAGS_min_mapping_quality));
-  auto sam_or = nucleus::SamReader::FromFile(reads_path, sam_opts);
-  CHECK(sam_or.ok()) << "Failed to open BAM: " << reads_path;
-  auto sam_reader = std::move(sam_or.ValueOrDie());
-
-  std::string sample_name = absl::GetFlag(FLAGS_sample_name);
-  if (sample_name.empty()) {
-    sample_name = InferSampleName(sam_reader->Header());
-    LOG(INFO) << "Inferred sample name: " << sample_name;
+  {
+    auto sam_or = nucleus::SamReader::FromFile(reads_path, sam_opts);
+    CHECK(sam_or.ok()) << "Failed to open BAM: " << reads_path;
+    auto tmp_reader = std::move(sam_or.ValueOrDie());
+    std::string sn = absl::GetFlag(FLAGS_sample_name);
+    if (sn.empty()) {
+      sn = InferSampleName(tmp_reader->Header());
+      LOG(INFO) << "Inferred sample name: " << sn;
+      absl::SetFlag(&FLAGS_sample_name, sn);
+    }
   }
+  const std::string sample_name = absl::GetFlag(FLAGS_sample_name);
 
   // ── Build MakeExamplesOptions ─────────────────────────────────────────────
   const MakeExamplesOptions opts = BuildOptions(sample_name, task_id, num_shards);
 
   // ── Build calling regions ─────────────────────────────────────────────────
-  const auto& contigs = ref_reader->Contigs();
+  const auto& contigs = ref_reader_main->Contigs();
   std::vector<std::string> inc_regions, exc_regions;
   {
     const std::string regions_str = absl::GetFlag(FLAGS_regions);
@@ -347,59 +368,89 @@ int RunMakeExamples(int argc, char** argv) {
   auto shard_regions = ShardRegions(partitioned, task_id, num_shards);
 
   LOG(INFO) << "Processing " << shard_regions.size() << " regions (shard "
-            << task_id << "/" << num_shards << ")";
+            << task_id << "/" << num_shards << ", threads=" << n_threads
+            << ")";
 
-  // ── ExamplesGenerator ─────────────────────────────────────────────────────
-  const std::unordered_map<std::string, std::string> example_filenames = {
-      {"sample", examples_path}};
-  ExamplesGenerator generator(opts, example_filenames);
-
-  // ── Variant caller ────────────────────────────────────────────────────────
-  // Single-sample variant_calling.cc — the multi-sample variant emits ~4×
-  // more candidates than upstream's pipeline does at the same options,
-  // which we don't want. variant_calling.cc has been patched to populate
-  // mapping_quality / average_base_quality / is_reverse_strand on the
-  // ReadSupport entries (mirror of what multisample does) so the
-  // small_model's per-read features aren't saturated at 0.
-  // PopulateVafContext below fills in allele_frequency_at_position which
-  // the small_model uses for its 51 VAF-context features.
-  vcf_candidate_importer::VariantCaller caller(
-      opts.sample_options(0).variant_caller_options());
-
-  // ── Optional: small model first-pass ──────────────────────────────────────
-  std::unique_ptr<SmallModel> small_model;
-  std::unique_ptr<TFRecordWriter> small_cvo_writer;
   const std::string small_path = absl::GetFlag(FLAGS_small_model);
   const std::string small_cvo_path =
       absl::GetFlag(FLAGS_small_model_cvo_outfile);
   const int snp_gq_threshold = absl::GetFlag(FLAGS_small_model_snp_gq_threshold);
   const int indel_gq_threshold =
       absl::GetFlag(FLAGS_small_model_indel_gq_threshold);
-  if (!small_path.empty()) {
-    if (small_cvo_path.empty()) {
-      LOG(ERROR) << "--small_model requires --small_model_cvo_outfile";
-      return 1;
-    }
-    small_model = SmallModel::Load(small_path);
-    if (!small_model) {
-      LOG(ERROR) << "Failed to load small_model at " << small_path;
-      return 1;
-    }
-    small_cvo_writer = TFRecordWriter::New(small_cvo_path);
-    if (!small_cvo_writer) {
-      LOG(ERROR) << "Failed to open small CVO writer: " << small_cvo_path;
-      return 1;
-    }
-    LOG(INFO) << "Small model active: " << small_path;
+  if (!small_path.empty() && small_cvo_path.empty()) {
+    LOG(ERROR) << "--small_model requires --small_model_cvo_outfile";
+    return 1;
   }
 
-  // ── Main loop ─────────────────────────────────────────────────────────────
-  int64_t total_candidates = 0;
-  int64_t total_examples = 0;
-  int64_t total_small_hits = 0;
-  int64_t total_big_dispatched = 0;
+  // ── Atomic region cursor: workers fetch_add to claim regions. ────────────
+  std::atomic<size_t> next_region{0};
 
-  for (const auto& region : shard_regions) {
+  // Per-thread output paths. We use the standard `name-NNNNN-of-NNNNN`
+  // shard naming so downstream stages that already understand the `@N`
+  // shard spec (call_variants / postprocess via TFRecordReader) can read
+  // the per-thread files directly — no end-of-stage concat needed.
+  //
+  // examples_path: if it already carries an `@N` suffix, we honour the
+  // caller's N; otherwise we synthesise `examples_path@n_threads` and
+  // shard from it. n_threads==1 collapses to the plain path.
+  std::string examples_spec = examples_path;
+  std::string small_cvo_spec = small_cvo_path;
+  if (n_threads > 1) {
+    if (examples_spec.find('@') == std::string::npos) {
+      examples_spec = absl::StrCat(examples_path, "@", n_threads);
+    }
+    if (!small_cvo_spec.empty() &&
+        small_cvo_spec.find('@') == std::string::npos) {
+      small_cvo_spec = absl::StrCat(small_cvo_path, "@", n_threads);
+    }
+  }
+  auto thread_examples_path = [&](int t) {
+    return n_threads == 1 ? examples_path : ShardName(examples_spec, t);
+  };
+  auto thread_small_cvo_path = [&](int t) {
+    return n_threads == 1 ? small_cvo_path : ShardName(small_cvo_spec, t);
+  };
+
+  // Worker function: opens its own SamReader/IndexedFastaReader/
+  // ExamplesGenerator/SmallModel, then loops fetching regions from
+  // `next_region` until the queue is exhausted. Writes only to its own
+  // per-thread files; no inter-thread mutation.
+  auto run_worker = [&](int tid, WorkerStats* out_stats) {
+    auto t_ref_or = nucleus::IndexedFastaReader::FromFile(
+        ref_path, absl::StrCat(ref_path, ".fai"));
+    CHECK(t_ref_or.ok()) << "thread " << tid << ": ref reopen failed";
+    auto ref_reader = std::move(t_ref_or.ValueOrDie());
+
+    auto t_sam_or = nucleus::SamReader::FromFile(reads_path, sam_opts);
+    CHECK(t_sam_or.ok()) << "thread " << tid << ": BAM reopen failed";
+    auto sam_reader = std::move(t_sam_or.ValueOrDie());
+
+    vcf_candidate_importer::VariantCaller caller(
+        opts.sample_options(0).variant_caller_options());
+
+    const std::unordered_map<std::string, std::string> example_filenames = {
+        {"sample", thread_examples_path(tid)}};
+    ExamplesGenerator generator(opts, example_filenames);
+
+    std::unique_ptr<SmallModel> small_model;
+    std::unique_ptr<TFRecordWriter> small_cvo_writer;
+    if (!small_path.empty()) {
+      small_model = SmallModel::Load(small_path);
+      CHECK(small_model) << "thread " << tid << ": small_model load failed";
+      small_cvo_writer = TFRecordWriter::New(thread_small_cvo_path(tid));
+      CHECK(small_cvo_writer)
+          << "thread " << tid << ": small CVO writer open failed";
+    }
+
+    int64_t total_candidates = 0;
+    int64_t total_examples = 0;
+    int64_t total_small_hits = 0;
+    int64_t total_big_dispatched = 0;
+
+    while (true) {
+      const size_t i = next_region.fetch_add(1, std::memory_order_relaxed);
+      if (i >= shard_regions.size()) break;
+      const auto& region = shard_regions[i];
     LOG(INFO) << "Region: " << region.reference_name() << ":"
               << region.start() << "-" << region.end();
 
@@ -631,15 +682,48 @@ int RunMakeExamples(int argc, char** argv) {
 
     auto n_it = stats.find("n_examples");
     if (n_it != stats.end()) total_examples += n_it->second;
+    }  // end while next_region
+
+    generator.SignalShardFinished();
+    if (small_cvo_writer) small_cvo_writer->Close();
+
+    out_stats->total_candidates = total_candidates;
+    out_stats->total_examples = total_examples;
+    out_stats->total_small_hits = total_small_hits;
+    out_stats->total_big_dispatched = total_big_dispatched;
+  };  // end run_worker lambda
+
+  // ── Dispatch workers ─────────────────────────────────────────────────────
+  std::vector<WorkerStats> stats_per_thread(n_threads);
+  if (n_threads == 1) {
+    run_worker(0, &stats_per_thread[0]);
+  } else {
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads);
+    for (int t = 0; t < n_threads; ++t) {
+      workers.emplace_back([&, t] { run_worker(t, &stats_per_thread[t]); });
+    }
+    for (auto& w : workers) w.join();
   }
 
-  generator.SignalShardFinished();
-  if (small_cvo_writer) small_cvo_writer->Close();
+  // ── Sum per-thread stats ─────────────────────────────────────────────────
+  WorkerStats agg;
+  for (const auto& s : stats_per_thread) {
+    agg.total_candidates    += s.total_candidates;
+    agg.total_examples      += s.total_examples;
+    agg.total_small_hits    += s.total_small_hits;
+    agg.total_big_dispatched += s.total_big_dispatched;
+  }
 
-  LOG(INFO) << "make_examples done: " << total_candidates << " candidates, "
-            << total_examples << " examples written"
-            << " (small_model_hits=" << total_small_hits
-            << ", big_model_dispatched=" << total_big_dispatched << ").";
+  // No end-of-stage concat: workers wrote sharded `name-NNNNN-of-NNNNN`
+  // files that downstream stages read directly via TFRecordReader's
+  // `@N` shard spec expansion.
+
+  LOG(INFO) << "make_examples done: " << agg.total_candidates << " candidates, "
+            << agg.total_examples << " examples written"
+            << " (small_model_hits=" << agg.total_small_hits
+            << ", big_model_dispatched=" << agg.total_big_dispatched
+            << ", threads=" << n_threads << ").";
   return 0;
 }
 

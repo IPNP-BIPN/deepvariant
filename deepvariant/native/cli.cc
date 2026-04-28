@@ -1,10 +1,6 @@
 #include "deepvariant/native/cli.h"
 
-#include <spawn.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-#include <cstring>
+#include <algorithm>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -14,9 +10,8 @@
 #include "absl/log/globals.h"
 #include "absl/log/initialize.h"
 #include "absl/log/log.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
-
-extern char** environ;
 
 // `run` subcommand flags. Reuse flags declared in the subcommand files
 // (--reads, --ref, --regions, --batch_size, --num_shards, etc.) to avoid
@@ -92,24 +87,24 @@ int RunAll(int argc, char** argv) {
     return 1;
   }
 
-  // For num_shards == 1 we use a plain path (no @1 suffix); for >1 shards
-  // make_examples writes to one file per task_id and the shard expansion
-  // happens later by convention "path-NNNNN-of-NNNNN".
-  std::string examples_pattern;
-  std::string cvo_pattern;
-  std::string small_cvo_path;
-  std::string merged_cvo_path;
-  if (num_shards <= 1) {
-    examples_pattern = absl::StrCat(tmp_dir, "/examples.tfrecord");
-    cvo_pattern      = absl::StrCat(tmp_dir, "/cvo.tfrecord");
-    small_cvo_path   = absl::StrCat(tmp_dir, "/small_cvo.tfrecord");
-    merged_cvo_path  = absl::StrCat(tmp_dir, "/merged_cvo.tfrecord");
-  } else {
-    examples_pattern = absl::StrCat(tmp_dir, "/examples.tfrecord@", num_shards);
-    cvo_pattern      = absl::StrCat(tmp_dir, "/cvo.tfrecord@",      num_shards);
-    small_cvo_path   = absl::StrCat(tmp_dir, "/small_cvo.tfrecord");
-    merged_cvo_path  = absl::StrCat(tmp_dir, "/merged_cvo.tfrecord");
-  }
+  // Single-process pipeline: one make_examples call (using --threads=N for
+  // intra-process parallelism, writing sharded `name-NNNNN-of-NNNNN`
+  // files), one call_variants call (sharded examples in, single cvo out),
+  // one postprocess.
+  const int n_threads = std::max(1, num_shards);
+  const std::string examples_base =
+      absl::StrCat(tmp_dir, "/examples.tfrecord");
+  const std::string examples_pattern =
+      n_threads > 1 ? absl::StrCat(examples_base, "@", n_threads)
+                    : examples_base;
+  const std::string cvo_pattern    = absl::StrCat(tmp_dir, "/cvo.tfrecord");
+  const std::string small_cvo_base = absl::StrCat(tmp_dir, "/small_cvo.tfrecord");
+  const std::string small_cvo_path =
+      n_threads > 1 ? absl::StrCat(small_cvo_base, "@", n_threads)
+                    : small_cvo_base;
+  const std::string merged_cvo_path =
+      absl::StrCat(tmp_dir, "/merged_cvo.tfrecord");
+
   // For --inference_backend=metal, the user passes a `.dvw` weight bundle
   // via --checkpoint; for coreml (Phase 2), the bundle is a `.mlpackage`
   // resolved by --model or the default ModelPath(model_type) lookup.
@@ -127,106 +122,40 @@ int RunAll(int argc, char** argv) {
   }
   const std::string small_model_path = absl::GetFlag(FLAGS_small_model_path);
 
-  // ── Stage 1: make_examples (parallel via posix_spawn) ────────────────────
-  // Each shard runs as a subprocess (`<argv[0]> make_examples ...`) so the
-  // absl::Flag / ParseCommandLine globals are isolated. Shards process
-  // disjoint genome partitions and write to one TFRecord shard each, so the
-  // final output is byte-identical to the sequential equivalent — only
-  // wall-time changes.
-  LOG(INFO) << "Stage 1: make_examples × " << num_shards << " shards (parallel)";
-  const std::string self_exe = (argv && argv[0]) ? std::string(argv[0])
-                                                  : std::string("deepvariant");
-  std::vector<pid_t> pids;
-  pids.reserve(num_shards);
-  for (int shard = 0; shard < num_shards; ++shard) {
-    // Per-shard output file (avoids concurrent writes to one file —
-    // ExamplesGenerator writes opaque TFRecord and doesn't internally
-    // split by task_id, so we give each shard its own filename and
-    // concatenate them after).
-    const std::string shard_examples = (num_shards <= 1)
-        ? examples_pattern
-        : absl::StrCat(tmp_dir, "/examples_", shard, ".tfrecord");
-    // Assemble the argv for the child: <self_exe> make_examples ...
-    std::vector<std::string> args = {
-        self_exe,
-        "make_examples",
+  // ── Stage 1: make_examples (single in-process call, --threads=N) ─────────
+  // Internally fans out N worker threads (each with its own
+  // SamReader / IndexedFastaReader / ExamplesGenerator / SmallModel) writing
+  // sharded `name-NNNNN-of-NNNNN` files. Downstream stages read them
+  // directly via TFRecordReader's `@N` shard expansion — no end-of-stage
+  // concat. One process = ~N×100 % CPU under `top`, mirroring
+  // salmon/samtools.
+  LOG(INFO) << "Stage 1: make_examples (--threads=" << n_threads
+            << ", in-process)";
+  {
+    std::vector<std::string> me_args = {
         absl::StrCat("--reads=", reads_flag),
         absl::StrCat("--ref=", ref_flag),
-        absl::StrCat("--examples=", shard_examples),
-        absl::StrCat("--task_id=", shard),
-        absl::StrCat("--num_shards=", num_shards),
+        absl::StrCat("--examples=", examples_pattern),
+        absl::StrCat("--threads=", n_threads),
+        // task_id=0/num_shards=1 => the single in-process call owns the
+        // whole region set; the worker pool partitions it via atomic.
+        "--task_id=0",
+        "--num_shards=1",
+        "--realigner_enabled=true",
     };
     if (!regions_flag.empty()) {
-      args.push_back(absl::StrCat("--regions=", regions_flag));
+      me_args.push_back(absl::StrCat("--regions=", regions_flag));
     }
     if (!small_model_path.empty()) {
-      args.push_back(absl::StrCat("--small_model=", small_model_path));
-      // Per-shard small_cvo to avoid concurrent writes; concatenated below.
-      args.push_back(absl::StrCat("--small_model_cvo_outfile=",
-                                  tmp_dir, "/small_cvo_", shard, ".tfrecord"));
+      me_args.push_back(absl::StrCat("--small_model=", small_model_path));
+      me_args.push_back(absl::StrCat("--small_model_cvo_outfile=",
+                                      small_cvo_path));
     }
-    args.push_back("--realigner_enabled=true");
-
-    // Build char* argv terminated by nullptr.
-    std::vector<char*> cargv;
-    cargv.reserve(args.size() + 1);
-    for (auto& s : args) cargv.push_back(s.data());
-    cargv.push_back(nullptr);
-
-    pid_t pid = -1;
-    int rc = posix_spawn(&pid, self_exe.c_str(), nullptr, nullptr,
-                         cargv.data(), environ);
-    if (rc != 0) {
-      LOG(ERROR) << "posix_spawn failed for shard " << shard
-                 << ": " << std::strerror(rc);
+    auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
+    int n = static_cast<int>(argv_me.size()) - 1;
+    if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
+      LOG(ERROR) << "make_examples failed";
       return rc;
-    }
-    pids.push_back(pid);
-  }
-  // Wait for all shards.
-  bool any_failed = false;
-  for (size_t i = 0; i < pids.size(); ++i) {
-    int status = 0;
-    if (waitpid(pids[i], &status, 0) < 0) {
-      LOG(ERROR) << "waitpid failed for shard " << i;
-      any_failed = true;
-      continue;
-    }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-      LOG(ERROR) << "make_examples failed (shard " << i
-                 << ", status=" << status << ")";
-      any_failed = true;
-    }
-  }
-  if (any_failed) return 1;
-
-  // Concat per-shard small_cvo files into the single small_cvo_path expected
-  // by postprocess_variants.
-  if (!small_model_path.empty()) {
-    std::ofstream out(small_cvo_path, std::ios::binary | std::ios::trunc);
-    for (int shard = 0; shard < num_shards; ++shard) {
-      const std::string p = absl::StrCat(tmp_dir, "/small_cvo_", shard,
-                                          ".tfrecord");
-      std::ifstream in(p, std::ios::binary);
-      out << in.rdbuf();
-    }
-  }
-
-  // Concat per-shard examples files into a single examples_pattern.
-  // (TFRecord allows naive byte concatenation since each record is
-  // self-delimiting.) Only for num_shards>1 — otherwise the single
-  // shard already wrote directly to examples_pattern.
-  if (num_shards > 1) {
-    std::ofstream out(examples_pattern, std::ios::binary | std::ios::trunc);
-    if (!out) {
-      LOG(ERROR) << "Cannot open merged examples file: " << examples_pattern;
-      return 1;
-    }
-    for (int shard = 0; shard < num_shards; ++shard) {
-      const std::string p = absl::StrCat(tmp_dir, "/examples_", shard,
-                                          ".tfrecord");
-      std::ifstream in(p, std::ios::binary);
-      out << in.rdbuf();
     }
   }
 
@@ -250,20 +179,42 @@ int RunAll(int argc, char** argv) {
 
   // ── Stage 2.5: merge small_cvo + big_cvo into a single file ──────────────
   // postprocess takes one --infile so we concatenate the (already valid)
-  // TFRecord files. TFRecord allows naive byte concatenation since each
-  // record is self-delimiting.
+  // TFRecord files. TFRecord allows naive byte copy since each record is
+  // self-delimiting.
+  // small_cvo may be a `name@N` shard spec (one file per make_examples
+  // worker thread); expand and concat each shard.
   std::string postprocess_input = cvo_pattern;
   if (!small_model_path.empty()) {
     LOG(INFO) << "Stage 2.5: merge small_cvo + big_cvo → " << merged_cvo_path;
-    std::ifstream sm(small_cvo_path, std::ios::binary);
-    std::ifstream bg(cvo_pattern,    std::ios::binary);
-    std::ofstream out(merged_cvo_path, std::ios::binary);
+    std::ofstream out(merged_cvo_path, std::ios::binary | std::ios::trunc);
     if (!out) {
       LOG(ERROR) << "Cannot open merged CVO: " << merged_cvo_path;
       return 1;
     }
-    if (sm) out << sm.rdbuf();
-    if (bg) out << bg.rdbuf();
+    auto append_path = [&](const std::string& p) {
+      std::ifstream in(p, std::ios::binary);
+      if (in) out << in.rdbuf();
+    };
+    // small_cvo: expand "@N" → per-shard files.
+    auto at = small_cvo_path.find('@');
+    if (at == std::string::npos) {
+      append_path(small_cvo_path);
+    } else {
+      const std::string prefix = small_cvo_path.substr(0, at);
+      int nshard = 0;
+      if (!absl::SimpleAtoi(small_cvo_path.substr(at + 1), &nshard) ||
+          nshard <= 0) {
+        LOG(ERROR) << "Bad small_cvo shard spec: " << small_cvo_path;
+        return 1;
+      }
+      for (int i = 0; i < nshard; ++i) {
+        append_path(absl::StrCat(prefix, "-",
+                                  absl::Dec(i, absl::kZeroPad5),
+                                  "-of-", absl::Dec(nshard, absl::kZeroPad5)));
+      }
+    }
+    // big_cvo: single file (call_variants writes once).
+    append_path(cvo_pattern);
     out.close();
     postprocess_input = merged_cvo_path;
   }
