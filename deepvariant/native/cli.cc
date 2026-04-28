@@ -40,6 +40,8 @@ ABSL_DECLARE_FLAG(std::string, ref);
 ABSL_DECLARE_FLAG(std::string, regions);
 ABSL_DECLARE_FLAG(int, num_shards);
 ABSL_DECLARE_FLAG(int, batch_size);
+ABSL_DECLARE_FLAG(std::string, inference_backend);
+ABSL_DECLARE_FLAG(std::string, checkpoint);
 
 namespace deepvariant {
 
@@ -108,7 +110,21 @@ int RunAll(int argc, char** argv) {
     small_cvo_path   = absl::StrCat(tmp_dir, "/small_cvo.tfrecord");
     merged_cvo_path  = absl::StrCat(tmp_dir, "/merged_cvo.tfrecord");
   }
-  const std::string model_path = ModelPath(model_type);
+  // For --inference_backend=metal, the user passes a `.dvw` weight bundle
+  // via --checkpoint; for coreml (Phase 2), the bundle is a `.mlpackage`
+  // resolved by --model or the default ModelPath(model_type) lookup.
+  const std::string inference_backend =
+      absl::GetFlag(FLAGS_inference_backend);
+  const std::string user_checkpoint = absl::GetFlag(FLAGS_checkpoint);
+  const std::string user_model = absl::GetFlag(FLAGS_model);
+  std::string model_path;
+  if (!user_checkpoint.empty()) {
+    model_path = user_checkpoint;
+  } else if (!user_model.empty()) {
+    model_path = user_model;
+  } else {
+    model_path = ModelPath(model_type);
+  }
   const std::string small_model_path = absl::GetFlag(FLAGS_small_model_path);
 
   // ── Stage 1: make_examples (parallel via posix_spawn) ────────────────────
@@ -123,13 +139,20 @@ int RunAll(int argc, char** argv) {
   std::vector<pid_t> pids;
   pids.reserve(num_shards);
   for (int shard = 0; shard < num_shards; ++shard) {
+    // Per-shard output file (avoids concurrent writes to one file —
+    // ExamplesGenerator writes opaque TFRecord and doesn't internally
+    // split by task_id, so we give each shard its own filename and
+    // concatenate them after).
+    const std::string shard_examples = (num_shards <= 1)
+        ? examples_pattern
+        : absl::StrCat(tmp_dir, "/examples_", shard, ".tfrecord");
     // Assemble the argv for the child: <self_exe> make_examples ...
     std::vector<std::string> args = {
         self_exe,
         "make_examples",
         absl::StrCat("--reads=", reads_flag),
         absl::StrCat("--ref=", ref_flag),
-        absl::StrCat("--examples=", examples_pattern),
+        absl::StrCat("--examples=", shard_examples),
         absl::StrCat("--task_id=", shard),
         absl::StrCat("--num_shards=", num_shards),
     };
@@ -189,6 +212,24 @@ int RunAll(int argc, char** argv) {
     }
   }
 
+  // Concat per-shard examples files into a single examples_pattern.
+  // (TFRecord allows naive byte concatenation since each record is
+  // self-delimiting.) Only for num_shards>1 — otherwise the single
+  // shard already wrote directly to examples_pattern.
+  if (num_shards > 1) {
+    std::ofstream out(examples_pattern, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      LOG(ERROR) << "Cannot open merged examples file: " << examples_pattern;
+      return 1;
+    }
+    for (int shard = 0; shard < num_shards; ++shard) {
+      const std::string p = absl::StrCat(tmp_dir, "/examples_", shard,
+                                          ".tfrecord");
+      std::ifstream in(p, std::ios::binary);
+      out << in.rdbuf();
+    }
+  }
+
   // ── Stage 2: call_variants ────────────────────────────────────────────────
   LOG(INFO) << "Stage 2: call_variants";
   {
@@ -197,6 +238,7 @@ int RunAll(int argc, char** argv) {
         absl::StrCat("--outfile=", cvo_pattern),
         absl::StrCat("--checkpoint=", model_path),
         absl::StrCat("--batch_size=", absl::GetFlag(FLAGS_batch_size)),
+        absl::StrCat("--inference_backend=", inference_backend),
     };
     auto argv_cv = MakeArgv("deepvariant_call_variants", cv_args);
     int n = static_cast<int>(argv_cv.size()) - 1;
