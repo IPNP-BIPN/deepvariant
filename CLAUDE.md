@@ -17,6 +17,7 @@ Running log: `PORT_LOG.md`.
 - **Scientific accuracy preserved**: SNP F1 ≥ reference − 0.05 %, INDEL F1 ≥ reference − 0.10 %. Argmax 100 % agreement on the 1000-example Phase 0 bench. Max-abs softmax ≤ 1e-3.
 - **GPU truly engaged**: verified by `powermetrics --samplers gpu_power,ane_power` showing non-zero residency.
 - **Speedup ≥ 2.5×** vs published Linux x86 reference (`call_variants` stage, Phase 0 gate).
+- **Strict 100 % FILTER-class parity vs `google/deepvariant:1.10.0` Docker** is the Homebrew-ship gate (Phase 5.5d). Every site's classification (PASS / RefCall / NoCall / LowQual) must match Docker on chr20 full and on the Phase-7 virgin-machine matrix. Set 2026-04-28; revised from byte-parity (unreachable on GPU due to FP32 non-associativity) and from variant-set-only parity (looser, lets non-PASS classes drift).
 
 ## Working rules
 
@@ -54,10 +55,7 @@ If any of the following happen, stop, write a report in `PORT_LOG.md`, and surfa
 
 ## Where the project actually stands (rolling status)
 
-Phases 0–2 done. Phase 3 has shippable WGS single-sample only. Phases 4–7
-not started. Honest backlog tracked in `PORT_LOG.md` under the
-"Honest assessment" section. Each item below has a real (not hand-wavy)
-effort estimate:
+Phases 0–4 done (Phase 4 PASS: F1 within thresholds vs Linux x86 ref on HG002 chr20). Phase 5.5 in progress — see "Phase 5.5 status" below. Phases 5/6/7 not started. Honest backlog tracked in `PORT_LOG.md` under the "Honest assessment" section. Each item below has a real (not hand-wavy) effort estimate:
 
 - DeepTrio orchestration (3-BAM make_examples, 6-channel pileup): ~1 wk
 - DeepSomatic orchestration (tumor + normal, somatic filtering): ~1-2 wk
@@ -75,12 +73,26 @@ effort estimate:
 A claim "near release-ready" requires those gates met, not just a
 working WGS pipeline at 84% match.
 
+## Phase 5.5 status (2026-04-28)
+
+Sub-phases (per the master plan):
+
+- **5.5a — fix the MPSGraph builder.** Tooling done: `tools/conversion/dump_tf_per_layer.py` + `.sh` (TF reference dumper, runs in google/deepvariant:1.10.0 Docker, freezes the graph via `convert_variables_to_constants_v2` + v1 Session, dumps every Metal tap to `<out>/<tap>.npy`). `debug_metal --compare-to-reference <ref_dir>` extends the C++ debugger with an NPY reader and ULP-diff per tap. **Investigation result**: bundle weights, BN fold, input transfer, output shapes are all correct (verified against TF reference); the bug is in MPSGraph's `convolution2DWithSourceTensor` itself — output channels are permuted vs TF (Metal: ch 12,14 zero / TF: ch 4,10,24 zero), reproducible across OIHW/HWIO and NCHW/NHWC layouts. See [pytorch/pytorch#84206](https://github.com/pytorch/pytorch/issues/84206). 5.5a is therefore **not solvable inside MPSGraph** — pivoting to 5.5c.
+- **5.5b — chr20 strict FILTER-parity measurement.** Pending until 5.5c lands.
+- **5.5c — replace MPSGraph conv with im2col Metal kernel + MPSMatrixMultiplication GEMM** (= what MLX does, see [mlx/backend/metal/conv.cpp](https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/conv.cpp)). FP32 throughout, GPU-resident, deterministic per-tile. **In progress.**
+- **5.5d — small_model + extension to all variants.** Pending.
+
 ## Pitfalls already known (mine before re-discovering)
 
 - **`tensorflow-metal` is dead** — unmaintained since mid-2024, frozen at TF 2.16, M-series ReLU bugs. Dropped from the v2 bench.
-- **TensorFlow is banned in our venvs.** `setup_venvs.sh` enforces `import tensorflow` failing. SavedModel reading uses a pure-protobuf parser in `tools/conversion/savedmodel_reader.py` (vendored TF `.proto` files compiled via `protoc --python_out`). Core ML emit goes through PyTorch (`coremltools.convert(traced_torch_model, source="pytorch")`) instead of the TF path.
+- **TensorFlow is banned in our venvs.** `setup_venvs.sh` enforces `import tensorflow` failing. SavedModel reading uses a pure-protobuf parser in `tools/conversion/savedmodel_reader.py` (vendored TF `.proto` files compiled via `protoc --python_out`). Core ML emit goes through PyTorch (`coremltools.convert(traced_torch_model, source="pytorch")`) instead of the TF path. **Inside the conversion Docker (google/deepvariant:1.10.0), TF is available and we do use it** — for `dump_tf_per_layer.py` and the per-layer reference flow.
+- **MPSGraph `convolution2DWithSourceTensor` permutes output channels in FP32** — verified empirically on the WGS Inception-v3 stem (Phase 5.5a). Same bug behind [pytorch#84206](https://github.com/pytorch/pytorch/issues/84206) "Source and weight input channels mismatch" — Apple's GPU FP32 conv2D path has known issues with non-standard channel counts. Workaround: skip MPSGraph's conv entirely — do it via im2col compute kernel + MPSMatrixMultiplication GEMM (what MLX does). The other MPSGraph ops (pool / concat / reduce / matmul / softmax) are fine.
+- **Keras `BatchNormalization` default epsilon is 1e-3, NOT 1e-4.** Inception-v3 SavedModels are trained with epsilon=1e-3. Using 1e-4 in our fold gives a subtle scale mismatch on channels with small variance. Fixed in `metal_inference.mm`.
+- **MPSGraph `OIHW` is genuinely O,I,H,W (not OHWI).** Documented behavior is correct — passing shape `(O, H, W, I)` with `weightsLayout=OIHW` triggers an explicit "Source and weight input channels mismatch" assertion in `GPUConvolutionOps.mm`. Don't try to be clever with the layout label — match the documented memory layout.
+- **`tf.saved_model.load(...)` is not the same as `tf.keras.models.load_model(...)`.** DV models are saved via `tf.saved_model.save` (no Keras metadata). To get intermediate outputs, load with `tf.saved_model.load`, freeze with `convert_variables_to_constants_v2`, then re-import the frozen GraphDef into a v1 Graph for `Session.run` with named tensor fetches. This is the pattern in `dump_tf_per_layer.py`.
+- **Inside the SavedModel inner function**: tensor names look like `StatefulPartitionedCall/inceptionv3/<keras_layer_name>/<op>:0`. Stem CBR tap = `activation_N/Relu:0` (N=0..4). Inception block output tap = `mixed{0..10}/concat:0`. Global avg pool = `global_average_pooling2d/Mean:0`. The signature output is `Identity:0` (final softmax wrapped).
 - **ANE prefers 4-channel image-shaped tensors.** Our model is 7- or 12-channel. ANE may refuse — accept GPU-only fallback. Core ML's `.all` compute units do this fallback automatically op-by-op.
-- **Metal compute is not bitwise reproducible** across some ops/reboots. Validate via softmax tolerance (≤1e-3) + argmax agreement (100 %), not bit-equality.
+- **Metal compute is not bitwise reproducible** across some ops/reboots. Validate via softmax tolerance (≤1e-3) + argmax agreement (100 %), not bit-equality. The strict-FILTER gate works because thresholds (PASS / RefCall / NoCall / LowQual) sit far enough from typical softmax noise that ≤ 1e-5 drift doesn't flip class.
 - **`build-prereq.sh` is Linux-only.** v2 ships `scripts/build-prereq-macos.sh`.
 - **8.5 GB of model artifacts** can't fit in a single Homebrew bottle alongside the binary. Split into `deepvariant-models` formula.
 - **Xcode CLT is enough — no full Xcode required.** Ship `.mlpackage` uncompiled; runtime compiles on first load via `MLModel compileModelAtURL:error:`. Avoid `xcrun coremlcompiler` (full Xcode only).
