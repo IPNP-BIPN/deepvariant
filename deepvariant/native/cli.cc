@@ -1,5 +1,9 @@
 #include "deepvariant/native/cli.h"
 
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -11,6 +15,8 @@
 #include "absl/log/initialize.h"
 #include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
+
+extern char** environ;
 
 // `run` subcommand flags. Reuse flags declared in the subcommand files
 // (--reads, --ref, --regions, --batch_size, --num_shards, etc.) to avoid
@@ -105,10 +111,22 @@ int RunAll(int argc, char** argv) {
   const std::string model_path = ModelPath(model_type);
   const std::string small_model_path = absl::GetFlag(FLAGS_small_model_path);
 
-  // ── Stage 1: make_examples ────────────────────────────────────────────────
-  LOG(INFO) << "Stage 1: make_examples";
+  // ── Stage 1: make_examples (parallel via posix_spawn) ────────────────────
+  // Each shard runs as a subprocess (`<argv[0]> make_examples ...`) so the
+  // absl::Flag / ParseCommandLine globals are isolated. Shards process
+  // disjoint genome partitions and write to one TFRecord shard each, so the
+  // final output is byte-identical to the sequential equivalent — only
+  // wall-time changes.
+  LOG(INFO) << "Stage 1: make_examples × " << num_shards << " shards (parallel)";
+  const std::string self_exe = (argv && argv[0]) ? std::string(argv[0])
+                                                  : std::string("deepvariant");
+  std::vector<pid_t> pids;
+  pids.reserve(num_shards);
   for (int shard = 0; shard < num_shards; ++shard) {
-    std::vector<std::string> me_args = {
+    // Assemble the argv for the child: <self_exe> make_examples ...
+    std::vector<std::string> args = {
+        self_exe,
+        "make_examples",
         absl::StrCat("--reads=", reads_flag),
         absl::StrCat("--ref=", ref_flag),
         absl::StrCat("--examples=", examples_pattern),
@@ -116,19 +134,58 @@ int RunAll(int argc, char** argv) {
         absl::StrCat("--num_shards=", num_shards),
     };
     if (!regions_flag.empty()) {
-      me_args.push_back(absl::StrCat("--regions=", regions_flag));
+      args.push_back(absl::StrCat("--regions=", regions_flag));
     }
     if (!small_model_path.empty()) {
-      me_args.push_back(absl::StrCat("--small_model=", small_model_path));
-      me_args.push_back(absl::StrCat("--small_model_cvo_outfile=",
-                                      small_cvo_path));
+      args.push_back(absl::StrCat("--small_model=", small_model_path));
+      // Per-shard small_cvo to avoid concurrent writes; concatenated below.
+      args.push_back(absl::StrCat("--small_model_cvo_outfile=",
+                                  tmp_dir, "/small_cvo_", shard, ".tfrecord"));
     }
-    me_args.push_back("--realigner_enabled=true");
-    auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
-    int n = static_cast<int>(argv_me.size()) - 1;
-    if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
-      LOG(ERROR) << "make_examples failed (shard " << shard << ")";
+    args.push_back("--realigner_enabled=true");
+
+    // Build char* argv terminated by nullptr.
+    std::vector<char*> cargv;
+    cargv.reserve(args.size() + 1);
+    for (auto& s : args) cargv.push_back(s.data());
+    cargv.push_back(nullptr);
+
+    pid_t pid = -1;
+    int rc = posix_spawn(&pid, self_exe.c_str(), nullptr, nullptr,
+                         cargv.data(), environ);
+    if (rc != 0) {
+      LOG(ERROR) << "posix_spawn failed for shard " << shard
+                 << ": " << std::strerror(rc);
       return rc;
+    }
+    pids.push_back(pid);
+  }
+  // Wait for all shards.
+  bool any_failed = false;
+  for (size_t i = 0; i < pids.size(); ++i) {
+    int status = 0;
+    if (waitpid(pids[i], &status, 0) < 0) {
+      LOG(ERROR) << "waitpid failed for shard " << i;
+      any_failed = true;
+      continue;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      LOG(ERROR) << "make_examples failed (shard " << i
+                 << ", status=" << status << ")";
+      any_failed = true;
+    }
+  }
+  if (any_failed) return 1;
+
+  // Concat per-shard small_cvo files into the single small_cvo_path expected
+  // by postprocess_variants.
+  if (!small_model_path.empty()) {
+    std::ofstream out(small_cvo_path, std::ios::binary | std::ios::trunc);
+    for (int shard = 0; shard < num_shards; ++shard) {
+      const std::string p = absl::StrCat(tmp_dir, "/small_cvo_", shard,
+                                          ".tfrecord");
+      std::ifstream in(p, std::ios::binary);
+      out << in.rdbuf();
     }
   }
 
