@@ -226,6 +226,26 @@ target_link_libraries(debug_metal PRIVATE
 )
 
 # ---------------------------------------------------------------------------
+# microtest_metal — hand-verifiable MPSGraph conv micro-tests for
+# Phase 5.5a investigation. Builds tiny graphs (1×1 and 3×3) with
+# inputs / weights small enough to compute the expected output by
+# pencil-and-paper, and prints PASS/FAIL per test.
+# ---------------------------------------------------------------------------
+add_executable(microtest_metal
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_main.mm"
+)
+set_source_files_properties(
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_main.mm" PROPERTIES
+  COMPILE_FLAGS "-fobjc-arc"
+)
+target_include_directories(microtest_metal PRIVATE ${ME_INCLUDE_DIRS})
+target_link_libraries(microtest_metal PRIVATE
+  "-framework Metal"
+  "-framework MetalPerformanceShadersGraph"
+  "-framework Foundation"
+)
+
+# ---------------------------------------------------------------------------
 # dump_cvo — dev-only TFRecord dumper for CallVariantsOutput protos.
 # Used to diff our candidate set against upstream's during parity work.
 # ---------------------------------------------------------------------------
