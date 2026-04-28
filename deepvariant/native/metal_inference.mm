@@ -28,7 +28,13 @@ namespace deepvariant {
 
 namespace {
 
-constexpr float kBNEpsilon = 1e-4f;
+// Keras `BatchNormalization` defaults to epsilon=1e-3 (NOT 1e-4) and that
+// is the value Inception-v3 SavedModels were trained with. Using 1e-4
+// produces a subtle scale mismatch on channels where var is small enough
+// that the +eps term changes magnitude — large enough to flip the sign
+// of post-ReLU activations on those channels, which manifests as
+// channel-level mismatch vs TF reference.
+constexpr float kBNEpsilon = 1e-3f;
 
 // Build the layer-N variable name used by extract_weights.py.
 std::string AttrCpp(int n, const char* attr) {
@@ -37,9 +43,10 @@ std::string AttrCpp(int n, const char* attr) {
 }
 
 // Fold a Conv (HWIO, FP32) and a BN (gamma=1, beta, mean, var, epsilon)
-// into a fused (W', b') pair in OIHW layout, ready for MPSGraph.
+// into a fused (W', b') pair in HWIO layout (TF-native — no host-side
+// transpose; passed straight into MPSGraph with weightsLayout=HWIO).
 struct FusedConv {
-  std::vector<float> weights_oihw;  // [O, I, H, W]
+  std::vector<float> weights_hwio;  // [H, W, I, O]
   std::vector<float> bias;          // [O]
   int O = 0, I = 0, H = 0, W = 0;
 };
@@ -85,19 +92,14 @@ FusedConv FoldConvBn(const DvwWeights& dvw, int conv_n, int bn_n) {
   }
   out.bias = std::move(offset);
 
-  // Convert HWIO → OIHW, multiplying by scale[o] along the way.
-  out.weights_oihw.resize((size_t)Ok * Ik * Hk * Wk);
-  for (int o = 0; o < Ok; ++o) {
-    const float s = scale[o];
-    for (int i = 0; i < Ik; ++i) {
-      for (int h = 0; h < Hk; ++h) {
-        for (int w = 0; w < Wk; ++w) {
-          // Source index in HWIO: (((h * Wk) + w) * Ik + i) * Ok + o
-          const size_t src = ((size_t)h * Wk + w) * Ik * Ok +
-                             (size_t)i * Ok + o;
-          // Dest index in OIHW: (((o * Ik) + i) * Hk + h) * Wk + w
-          const size_t dst = (((size_t)o * Ik + i) * Hk + h) * Wk + w;
-          out.weights_oihw[dst] = k->data[src] * s;
+  // Native HWIO; multiply by scale[o] along the O axis.
+  out.weights_hwio.resize((size_t)Hk * Wk * Ik * Ok);
+  for (size_t h = 0; h < (size_t)Hk; ++h) {
+    for (size_t w = 0; w < (size_t)Wk; ++w) {
+      for (size_t i = 0; i < (size_t)Ik; ++i) {
+        for (size_t o = 0; o < (size_t)Ok; ++o) {
+          const size_t idx = ((h * Wk + w) * Ik + i) * Ok + o;
+          out.weights_hwio[idx] = k->data[idx] * scale[o];
         }
       }
     }
@@ -123,8 +125,9 @@ MPSGraphTensor* AddConv(MPSGraph* g, MPSGraphTensor* x,
                         int stride_y, int stride_x,
                         bool same_padding,  // true = "same", false = "valid"
                         NSString* name) {
-  NSArray* w_shape = @[@(fc.O), @(fc.I), @(fc.H), @(fc.W)];
-  MPSGraphTensor* W = ConstFloat32(g, fc.weights_oihw.data(), w_shape,
+  // HWIO layout (TF-native).
+  NSArray* w_shape = @[@(fc.H), @(fc.W), @(fc.I), @(fc.O)];
+  MPSGraphTensor* W = ConstFloat32(g, fc.weights_hwio.data(), w_shape,
                                    [name stringByAppendingString:@"_w"]);
   MPSGraphTensor* b = ConstFloat32(g, fc.bias.data(), @[@(fc.O)],
                                    [name stringByAppendingString:@"_b"]);
@@ -138,23 +141,17 @@ MPSGraphTensor* AddConv(MPSGraph* g, MPSGraphTensor* x,
                            groups:1
                      paddingStyle:same_padding
                                       ? MPSGraphPaddingStyleTF_SAME
-                                      : MPSGraphPaddingStyleExplicit
-                       dataLayout:MPSGraphTensorNamedDataLayoutNCHW
-                    weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
-  if (!same_padding) {
-    desc.paddingLeft = 0;
-    desc.paddingRight = 0;
-    desc.paddingTop = 0;
-    desc.paddingBottom = 0;
-  }
+                                      : MPSGraphPaddingStyleTF_VALID
+                       dataLayout:MPSGraphTensorNamedDataLayoutNHWC
+                    weightsLayout:MPSGraphTensorNamedDataLayoutHWIO];
   MPSGraphTensor* y = [g convolution2DWithSourceTensor:x
                                           weightsTensor:W
                                              descriptor:desc
                                                    name:name];
   // Bias broadcast along channel dim. Bias shape (O,) needs reshape to
-  // (1, O, 1, 1) for NCHW broadcasting.
+  // (1, 1, 1, O) for NHWC broadcasting.
   MPSGraphTensor* b_reshaped = [g reshapeTensor:b
-                                       withShape:@[@1, @(fc.O), @1, @1]
+                                       withShape:@[@1, @1, @1, @(fc.O)]
                                             name:[name stringByAppendingString:@"_br"]];
   return [g additionWithPrimaryTensor:y
                        secondaryTensor:b_reshaped
@@ -169,7 +166,7 @@ MPSGraphTensor* CBR(MPSGraph* g, MPSGraphTensor* x,
                     bool same_padding,
                     NSString* name) {
   FusedConv fc = FoldConvBn(dvw, conv_n, bn_n);
-  if (fc.weights_oihw.empty()) return nullptr;
+  if (fc.weights_hwio.empty()) return nullptr;
   MPSGraphTensor* y = AddConv(g, x, fc, stride_y, stride_x, same_padding, name);
   return [g reLUWithTensor:y name:[name stringByAppendingString:@"_r"]];
 }
@@ -185,7 +182,7 @@ MPSGraphTensor* AvgCBR(MPSGraph* g, MPSGraphTensor* x,
                           strideInX:1
                           strideInY:1
                        paddingStyle:MPSGraphPaddingStyleTF_SAME
-                         dataLayout:MPSGraphTensorNamedDataLayoutNCHW];
+                         dataLayout:MPSGraphTensorNamedDataLayoutNHWC];
   // Keras AvgPool2D / DeepVariant Inception-v3 default is
   // count_include_pad=False (i.e. divide by the number of *real* kernel
   // positions, not by kernel area). MPSGraph defaults to YES, so we
@@ -206,7 +203,7 @@ MPSGraphTensor* MaxPool3x3s2Valid(MPSGraph* g, MPSGraphTensor* x,
                           strideInX:2
                           strideInY:2
                        paddingStyle:MPSGraphPaddingStyleExplicit
-                         dataLayout:MPSGraphTensorNamedDataLayoutNCHW];
+                         dataLayout:MPSGraphTensorNamedDataLayoutNHWC];
   pdesc.paddingLeft = 0;
   pdesc.paddingRight = 0;
   pdesc.paddingTop = 0;
@@ -227,7 +224,7 @@ MPSGraphTensor* Mixed_5b(MPSGraph* g, MPSGraphTensor* x,
   b3 = CBR(g, b3, d, 13, 15, 1, 1, true, @"5b_3b");
   b3 = CBR(g, b3, d, 18, 22, 1, 1, true, @"5b_3c");
   MPSGraphTensor* bp = AvgCBR(g, x, d, 19, 23, @"5b_p");
-  return [g concatTensors:@[b1, b5, b3, bp] dimension:1 name:@"5b"];
+  return [g concatTensors:@[b1, b5, b3, bp] dimension:3 name:@"5b"];
 }
 
 MPSGraphTensor* Mixed_5c(MPSGraph* g, MPSGraphTensor* x,
@@ -239,7 +236,7 @@ MPSGraphTensor* Mixed_5c(MPSGraph* g, MPSGraphTensor* x,
   b3 = CBR(g, b3, d, 27, 29, 1, 1, true, @"5c_3b");
   b3 = CBR(g, b3, d, 32, 36, 1, 1, true, @"5c_3c");
   MPSGraphTensor* bp = AvgCBR(g, x, d, 33, 37, @"5c_p");
-  return [g concatTensors:@[b1, b5, b3, bp] dimension:1 name:@"5c"];
+  return [g concatTensors:@[b1, b5, b3, bp] dimension:3 name:@"5c"];
 }
 
 MPSGraphTensor* Mixed_5d(MPSGraph* g, MPSGraphTensor* x,
@@ -251,7 +248,7 @@ MPSGraphTensor* Mixed_5d(MPSGraph* g, MPSGraphTensor* x,
   b3 = CBR(g, b3, d, 41, 43, 1, 1, true, @"5d_3b");
   b3 = CBR(g, b3, d, 46, 50, 1, 1, true, @"5d_3c");
   MPSGraphTensor* bp = AvgCBR(g, x, d, 47, 51, @"5d_p");
-  return [g concatTensors:@[b1, b5, b3, bp] dimension:1 name:@"5d"];
+  return [g concatTensors:@[b1, b5, b3, bp] dimension:3 name:@"5d"];
 }
 
 MPSGraphTensor* Mixed_6a(MPSGraph* g, MPSGraphTensor* x,
@@ -261,7 +258,7 @@ MPSGraphTensor* Mixed_6a(MPSGraph* g, MPSGraphTensor* x,
   bd = CBR(g, bd, d, 54, 55, 1, 1, true, @"6a_db");
   bd = CBR(g, bd, d, 57, 59, 2, 2, false, @"6a_dc");
   MPSGraphTensor* bp = MaxPool3x3s2Valid(g, x, @"6a_mp");
-  return [g concatTensors:@[b3, bd, bp] dimension:1 name:@"6a"];
+  return [g concatTensors:@[b3, bd, bp] dimension:3 name:@"6a"];
 }
 
 // Generic InceptionB block (factorized 7×1 / 1×7).
@@ -277,7 +274,7 @@ MPSGraphTensor* Mixed_6b(MPSGraph* g, MPSGraphTensor* x,
   b7b = CBR(g, b7b, d, 69, 71, 1, 1, true, @"6b_7bd");
   b7b = CBR(g, b7b, d, 74, 78, 1, 1, true, @"6b_7be");
   MPSGraphTensor* bp = AvgCBR(g, x, d, 75, 79, @"6b_p");
-  return [g concatTensors:@[b1, b7a, b7b, bp] dimension:1 name:@"6b"];
+  return [g concatTensors:@[b1, b7a, b7b, bp] dimension:3 name:@"6b"];
 }
 
 MPSGraphTensor* Mixed_6c(MPSGraph* g, MPSGraphTensor* x,
@@ -292,7 +289,7 @@ MPSGraphTensor* Mixed_6c(MPSGraph* g, MPSGraphTensor* x,
   b7b = CBR(g, b7b, d, 89, 91, 1, 1, true, @"6c_7bd");
   b7b = CBR(g, b7b, d, 94, 98, 1, 1, true, @"6c_7be");
   MPSGraphTensor* bp = AvgCBR(g, x, d, 95, 99, @"6c_p");
-  return [g concatTensors:@[b1, b7a, b7b, bp] dimension:1 name:@"6c"];
+  return [g concatTensors:@[b1, b7a, b7b, bp] dimension:3 name:@"6c"];
 }
 
 MPSGraphTensor* Mixed_6d(MPSGraph* g, MPSGraphTensor* x,
@@ -307,7 +304,7 @@ MPSGraphTensor* Mixed_6d(MPSGraph* g, MPSGraphTensor* x,
   b7b = CBR(g, b7b, d, 109, 111, 1, 1, true, @"6d_7bd");
   b7b = CBR(g, b7b, d, 114, 118, 1, 1, true, @"6d_7be");
   MPSGraphTensor* bp = AvgCBR(g, x, d, 115, 119, @"6d_p");
-  return [g concatTensors:@[b1, b7a, b7b, bp] dimension:1 name:@"6d"];
+  return [g concatTensors:@[b1, b7a, b7b, bp] dimension:3 name:@"6d"];
 }
 
 MPSGraphTensor* Mixed_6e(MPSGraph* g, MPSGraphTensor* x,
@@ -322,7 +319,7 @@ MPSGraphTensor* Mixed_6e(MPSGraph* g, MPSGraphTensor* x,
   b7b = CBR(g, b7b, d, 129, 131, 1, 1, true, @"6e_7bd");
   b7b = CBR(g, b7b, d, 134, 138, 1, 1, true, @"6e_7be");
   MPSGraphTensor* bp = AvgCBR(g, x, d, 135, 139, @"6e_p");
-  return [g concatTensors:@[b1, b7a, b7b, bp] dimension:1 name:@"6e"];
+  return [g concatTensors:@[b1, b7a, b7b, bp] dimension:3 name:@"6e"];
 }
 
 MPSGraphTensor* Mixed_7a(MPSGraph* g, MPSGraphTensor* x,
@@ -334,7 +331,7 @@ MPSGraphTensor* Mixed_7a(MPSGraph* g, MPSGraphTensor* x,
   b7 = CBR(g, b7, d, 145, 147, 1, 1, true, @"7a_7c");
   b7 = CBR(g, b7, d, 149, 151, 2, 2, false, @"7a_7d");
   MPSGraphTensor* bp = MaxPool3x3s2Valid(g, x, @"7a_mp");
-  return [g concatTensors:@[b3, b7, bp] dimension:1 name:@"7a"];
+  return [g concatTensors:@[b3, b7, bp] dimension:3 name:@"7a"];
 }
 
 // Generic InceptionC block: 6-way concat.
@@ -372,7 +369,7 @@ MPSGraphTensor* InceptionC(MPSGraph* g, MPSGraphTensor* x,
   MPSGraphTensor* bp = AvgCBR(g, x, d, I.bp_c, I.bp_n,
                               [name stringByAppendingString:@"_p"]);
   return [g concatTensors:@[b1, b3a_1x3, b3a_3x1, b3b_1x3, b3b_3x1, bp]
-                dimension:1 name:name];
+                dimension:3 name:name];
 }
 
 MPSGraphTensor* Mixed_7b(MPSGraph* g, MPSGraphTensor* x,
@@ -452,11 +449,11 @@ std::unique_ptr<MetalInception> MetalInception::Create(
   I.input = [I.graph placeholderWithShape:@[@-1, @100, @221, @7]
                                   dataType:MPSDataTypeFloat32
                                       name:@"input_nhwc"];
-  // NHWC → NCHW
-  MPSGraphTensor* x = [I.graph transposeTensor:I.input
-                                   permutation:@[@0, @3, @1, @2]
-                                          name:@"nhwc2nchw"];
-  I.taps[@"input_nchw"] = x;
+  // Stay in NHWC throughout — TF native layout. (Earlier OIHW/NCHW path
+  // produced channel-permuted output despite a hand-rolled transpose
+  // matching TF; switching to NHWC end-to-end resolved it.)
+  MPSGraphTensor* x = I.input;
+  I.taps[@"input_nchw"] = x;  // tap kept under the old name; layout = NHWC now
 
   // Stem
   x = CBR(I.graph, x, *I.weights, 0, 1, 2, 2, false, @"s1a");
@@ -493,7 +490,7 @@ std::unique_ptr<MetalInception> MetalInception::Create(
   x = Mixed_7c(I.graph, x, *I.weights); I.taps[@"7c"] = x;
 
   // Global avg pool over (H, W) → (N, 2048, 1, 1)
-  x = [I.graph meanOfTensor:x axes:@[@2, @3] name:@"gap"];
+  x = [I.graph meanOfTensor:x axes:@[@1, @2] name:@"gap"];
   // Reshape to (N, 2048)
   x = [I.graph reshapeTensor:x withShape:@[@-1, @2048] name:@"squeeze"];
   I.taps[@"gap"] = x;
