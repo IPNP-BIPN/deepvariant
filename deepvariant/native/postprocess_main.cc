@@ -161,6 +161,14 @@ std::set<std::string> AltsToRemove(
 // Combine all CVOs for one site into a per-genotype likelihood vector.
 // Mirror of postprocess_variants.py:merge_predictions "product" mode.
 //
+// CVOs whose alt-set intersects `alts_to_remove` are SKIPPED (they're
+// "for pruned alleles"; upstream merge_predictions ignores them at line
+// 1247-1248: `if is_for_pruned_allele: continue`). After pruning the
+// last G alt, only the C-alt CVO contributes → predictions are exactly
+// that CVO's softmax, not a multi-CVO product. This is what upstream
+// does and matters for GQ at multi-allelic sites where ALL but one alt
+// gets pruned.
+//
 // For each diploid genotype (allele1, allele2), each CVO contributes
 // cvo.probs[overlap] where overlap = #{alleles in cvo's alt set}, computed
 // per allele1, allele2 ∈ {ref, alt1, alt2, …}. Per-CVO contributions are
@@ -168,7 +176,8 @@ std::set<std::string> AltsToRemove(
 //
 // PL ordering (VCF "G" Number): F(j/k) = k*(k+1)/2 + j  (j ≤ k).
 std::vector<double> CombineLikelihoods(
-    const std::vector<const CallVariantsOutput*>& cvos, int n_alts) {
+    const std::vector<const CallVariantsOutput*>& cvos, int n_alts,
+    const std::set<std::string>& alts_to_remove) {
   const int n_gt = NumDiploidGenotypes(n_alts);
   std::vector<double> like(n_gt, 1.0);  // multiplicative identity
 
@@ -184,24 +193,35 @@ std::vector<double> CombineLikelihoods(
 
   // Genotype 0 = REF, alleles 1..n_alts = alternate_bases[0..n_alts-1].
   // For the "in this CVO's alt set" check we need each cvo's set of alt
-  // strings (from alt_allele_indices).
+  // strings (from alt_allele_indices). Filter out CVOs that touch a
+  // pruned alt.
   std::vector<std::set<std::string>> per_cvo_alts;
+  std::vector<bool> per_cvo_kept;
   per_cvo_alts.reserve(cvos.size());
+  per_cvo_kept.reserve(cvos.size());
+  size_t n_kept = 0;
   for (const auto* cvo : cvos) {
     std::set<std::string> s;
+    bool touches_pruned = false;
     for (int idx : cvo->alt_allele_indices().indices()) {
-      if (idx >= 0 && idx < alts.size()) s.insert(alts[idx]);
+      if (idx >= 0 && idx < alts.size()) {
+        s.insert(alts[idx]);
+        if (alts_to_remove.count(alts[idx])) touches_pruned = true;
+      }
     }
     per_cvo_alts.push_back(std::move(s));
+    per_cvo_kept.push_back(!touches_pruned);
+    if (!touches_pruned) ++n_kept;
   }
 
-  // For every diploid genotype, fuse probabilities across CVOs by product.
+  // For every diploid genotype, fuse probabilities across kept CVOs.
   for (int k = 0; k <= n_alts; ++k) {
     for (int j = 0; j <= k; ++j) {
       const std::string a1 = (j == 0) ? "" : alts[j - 1];  // "" = REF
       const std::string a2 = (k == 0) ? "" : alts[k - 1];
       double fused = 1.0;
       for (size_t ci = 0; ci < cvos.size(); ++ci) {
+        if (!per_cvo_kept[ci]) continue;
         const auto& probs = cvos[ci]->genotype_probabilities();
         if (probs.size() < 3) continue;
         const int overlap = (a1.empty() ? 0 : per_cvo_alts[ci].count(a1)) +
@@ -213,15 +233,14 @@ std::vector<double> CombineLikelihoods(
     }
   }
 
-  // Normalise — but only when product fusion happened across multiple
-  // CVOs. Upstream's merge_predictions returns the raw predictions for
-  // single-CVO sites (the common case in WGS) and only renormalises after
-  // product fusion. For single-CVO sites the FP32 softmax already saturates
-  // some predictions to exactly 1.0; renormalising by the full-precision
-  // sum (=1.0+ε) sneaks the called probability slightly below 1.0, which
-  // pushes ptrue_to_bounded_phred away from the 99-cap and gives
-  // off-by-many GQ values.
-  if (cvos.size() > 1) {
+  // Normalise — only when product fusion crossed multiple kept CVOs.
+  // Upstream's merge_predictions returns the raw predictions for single-
+  // CVO sites and only renormalises after product fusion. For single-CVO
+  // sites the FP32 softmax may saturate to exactly 1.0; renormalising by
+  // the full-precision sum (=1.0+ε) sneaks the called probability
+  // slightly below 1.0, which pushes ptrue_to_bounded_phred away from
+  // the 99-cap and gives off-by-many GQ values.
+  if (n_kept > 1) {
     double s = 0;
     for (double v : like) s += v;
     if (s <= 0.0) {
@@ -404,8 +423,14 @@ int RunPostprocessVariants(int argc, char** argv) {
     // best genotype.
     const auto alts_to_remove = AltsToRemove(cvos, qual_filter);
 
-    // Combine likelihoods over the ORIGINAL alt list.
-    auto like = CombineLikelihoods(cvos, orig_n_alts);
+    // Combine likelihoods over the ORIGINAL alt list, skipping CVOs
+    // whose alt-set touches a pruned allele (mirrors upstream
+    // postprocess_variants.py:merge_predictions step "is_for_pruned_allele:
+    // continue"). After the call, `like[g]` for any genotype that
+    // includes a pruned alt is still 1.0 (multiplicative identity since
+    // every kept CVO sees `overlap=0` for pruned-alt-only genotypes — but
+    // those genotypes are masked out below in any case).
+    auto like = CombineLikelihoods(cvos, orig_n_alts, alts_to_remove);
 
     // Mask out genotypes whose alleles are in alts_to_remove. Setting
     // their likelihood to 0 makes them not selectable as argmax.
