@@ -45,6 +45,26 @@ target_link_libraries(dv_bnns_finalize PUBLIC
 )
 
 # ---------------------------------------------------------------------------
+# dv_metal_conv_serial — Phase 5.5c deterministic-reduction-order Conv2D
+# kernel (compiled at runtime via newLibraryWithSource:). Used to
+# selectively replace MPSGraph convolution2D for layers that drift
+# beyond the FILTER-threshold sensitivity vs Docker.
+# ---------------------------------------------------------------------------
+add_library(dv_metal_conv_serial STATIC metal_conv_serial.mm)
+set_source_files_properties(metal_conv_serial.mm PROPERTIES
+  COMPILE_FLAGS "-fobjc-arc"
+)
+target_include_directories(dv_metal_conv_serial PUBLIC
+  "${CMAKE_SOURCE_DIR}"
+  "${ABSL_PREFIX}/include"
+)
+target_link_libraries(dv_metal_conv_serial PUBLIC
+  absl::log
+  "-framework Metal"
+  "-framework Foundation"
+)
+
+# ---------------------------------------------------------------------------
 # dv_metal_inference — Phase 5.5 MPSGraph + BNNS Inception-v3 backend
 # (Obj-C++ + Metal Performance Shaders Graph; consumes .dvw weights)
 # ---------------------------------------------------------------------------
@@ -58,6 +78,7 @@ target_include_directories(dv_metal_inference PUBLIC
 )
 target_link_libraries(dv_metal_inference PUBLIC
   dv_weights
+  dv_metal_conv_serial
   absl::log
   "-framework Metal"
   "-framework MetalPerformanceShadersGraph"
@@ -224,6 +245,54 @@ target_link_libraries(debug_metal PRIVATE
   dv_metal_inference
   dv_weights
 )
+
+# ---------------------------------------------------------------------------
+# microtest_conv_serial — Phase 5.5c hand-verifiable test for the
+# deterministic Conv2D kernel. Compares GPU dispatch output against a
+# scalar (kh,kw,c_in)-order CPU reference using std::fma — bit-exact
+# match expected on healthy build.
+# ---------------------------------------------------------------------------
+add_executable(microtest_conv_serial
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_conv_serial.mm"
+)
+set_source_files_properties(
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_conv_serial.mm" PROPERTIES
+  COMPILE_FLAGS "-fobjc-arc"
+)
+target_include_directories(microtest_conv_serial PRIVATE
+  ${ME_INCLUDE_DIRS}
+  "${CMAKE_SOURCE_DIR}"
+  "${ABSL_PREFIX}/include"
+)
+target_link_libraries(microtest_conv_serial PRIVATE
+  dv_metal_conv_serial
+  absl::log
+  "-framework Metal"
+  "-framework Foundation"
+)
+
+# ---------------------------------------------------------------------------
+# extract_pileup_npy — dev-only profiling tool for Phase 5.5c per-layer
+# drift work. Reads N pileup images from a TFRecord (or `name@N` shard
+# spec) and writes a NumPy `(N, 100, 221, 7)` FP32 NHWC array. The
+# resulting `.npy` is consumed by `dump_tf_per_layer.py` (Docker) and
+# `debug_metal --compare-to-reference` to profile drift on real data.
+# ---------------------------------------------------------------------------
+add_executable(extract_pileup_npy
+  "${CMAKE_CURRENT_SOURCE_DIR}/extract_pileup_npy_main.cc"
+)
+target_include_directories(extract_pileup_npy PRIVATE ${ME_INCLUDE_DIRS})
+target_link_libraries(extract_pileup_npy PRIVATE dv_tfrecord)
+
+# extract_pileup_at_pos — locate a specific (chrom, start, ref, alt)
+# in an examples.tfrecord and dump that single pileup as a (1,100,221,7)
+# NHWC FP32 .npy. Used to byte-compare our pileup vs Docker's at a
+# PASS-flip site (Phase 5.5c diagnostic).
+add_executable(extract_pileup_at_pos
+  "${CMAKE_CURRENT_SOURCE_DIR}/extract_pileup_at_pos_main.cc"
+)
+target_include_directories(extract_pileup_at_pos PRIVATE ${ME_INCLUDE_DIRS})
+target_link_libraries(extract_pileup_at_pos PRIVATE dv_tfrecord)
 
 # ---------------------------------------------------------------------------
 # microtest_metal — hand-verifiable MPSGraph conv micro-tests for

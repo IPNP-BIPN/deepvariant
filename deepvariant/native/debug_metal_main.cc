@@ -322,8 +322,8 @@ int CompareToReference(MetalInception& inf, const std::string& ref_dir) {
   // 1) Load input batch.
   NpyData input;
   if (!LoadNpyFp32(ref_dir + "/_input.npy", &input)) return 1;
-  if (input.shape.size() != 4 || input.shape[0] != 1) {
-    std::fprintf(stderr, "input shape must be (1, H, W, C); got rank %zu\n",
+  if (input.shape.size() != 4 || input.shape[0] < 1) {
+    std::fprintf(stderr, "input shape must be (B, H, W, C); got rank %zu\n",
                  input.shape.size());
     return 1;
   }

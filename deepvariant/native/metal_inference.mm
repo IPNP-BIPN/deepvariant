@@ -18,12 +18,17 @@
 #import <MetalPerformanceShadersGraph/MPSGraphImToColOps.h>
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "absl/log/log.h"
+#include "absl/strings/str_split.h"
 #include "deepvariant/native/dv_weights.h"
+#include "deepvariant/native/metal_conv_serial.h"
 
 namespace deepvariant {
 
@@ -485,6 +490,31 @@ MPSGraphTensor* Mixed_7c(MPSGraph* g, MPSGraphTensor* x,
 // Impl: holds device, queue, graph, and the cached executable.
 // ---------------------------------------------------------------------------
 
+// Deterministic-stage params. Either a Conv2D (with weights+bias) or a
+// MaxPool2D (no weights). Populated when DV_METAL_DET_LAYERS names a
+// stage. Each stage takes the previous stage's output as input and
+// writes its own output to a dst buffer at Predict time.
+struct DetLayer {
+  std::string tap_name;     // "stem_s1a" / "stem_mp3a" — output tap name
+  enum Kind { kConv, kMaxPool } kind = kConv;
+  // Common geometry:
+  int C_in = 0, C_out = 0;
+  int H_in = 0, W_in = 0;
+  int H_out = 0, W_out = 0;
+  // Conv-specific (kind == kConv):
+  ConvDesc conv_desc{};
+  id<MTLBuffer> weights_buf = nil;
+  id<MTLBuffer> bias_buf = nil;
+  // MaxPool-specific (kind == kMaxPool):
+  MaxPoolDesc pool_desc{};
+  // The MPSGraph "post-graph" — only populated on the LAST det stage in
+  // the chain. Takes that stage's output as placeholder, runs through
+  // gap.
+  MPSGraph* post_graph = nil;
+  MPSGraphTensor* post_input = nil;
+  MPSGraphTensor* post_output = nil;
+};
+
 struct MetalInception::Impl {
   std::unique_ptr<DvwWeights> weights;
   id<MTLDevice> device = nil;
@@ -503,6 +533,18 @@ struct MetalInception::Impl {
   // Ordered list of tap tensors compiled into the gap executable
   // (used for the full-network forward — Predict()).
   int feature_dim = 2048;
+
+  // ── Phase 5.5c — deterministic-reduction-order stem path ──────────
+  // When det_layers is empty, Predict() takes the original full-graph
+  // path. When non-empty, Predict() runs: det kernels in chain → post-
+  // graph → gap. Det stages are a contiguous prefix of the network's
+  // first 7 layers (s1a, s2a, s2b, mp3a, s3b, s4a, mp5a).
+  std::unique_ptr<MetalConvSerial> conv_serial;
+  std::unique_ptr<MetalMaxPool> max_pool;
+  std::vector<DetLayer> det_layers;
+  // Cached post-graph executable per batch size (the post-graph itself is
+  // already in det_layers[0].post_graph).
+  NSMutableDictionary<NSNumber*, MPSGraphExecutable*>* post_exec_cache = nil;
 };
 
 MetalInception::MetalInception() : impl_(std::make_unique<Impl>()) {}
@@ -599,13 +641,296 @@ std::unique_ptr<MetalInception> MetalInception::Create(
   I.taps[@"gap"] = x;
 
   I.output = x;
+
+  // ── Phase 5.5c: optional deterministic kernel for stem_s1a ─────────
+  // DV_METAL_DET_LAYERS=stem_s1a triggers a parallel inference path
+  // where the first conv (CBR(0,1) stride 2-2 valid 7→32) is replaced
+  // by a deterministic-reduction-order Metal compute kernel and the
+  // network from stem_s2a through gap is run via a separate MPSGraph
+  // that takes the s1a output as a placeholder. Other layer names are
+  // ignored for now (extension to additional CBR layers is a follow-up).
+  const char* det_env = std::getenv("DV_METAL_DET_LAYERS");
+  std::set<std::string> det_set;
+  if (det_env && *det_env) {
+    for (absl::string_view s : absl::StrSplit(det_env, ',')) {
+      if (!s.empty()) det_set.emplace(s.data(), s.size());
+    }
+  }
+  // Det layers must form a contiguous chain starting at the head of
+  // the stem. Supported stages (in order):
+  //   stem_s1a (CBR 0,1) stride 2 VALID 7→32  : (B,100,221,7) → (B,49,110,32)
+  //   stem_s2a (CBR 2,3) stride 1 VALID 32→32 : (B,49,110,32) → (B,47,108,32)
+  //   stem_s2b (CBR 4,5) stride 1 SAME  32→64 : (B,47,108,32) → (B,47,108,64)
+  //   stem_mp3a maxpool 3×3 stride 2 VALID    : (B,47,108,64) → (B,23,53,64)
+  //   stem_s3b (CBR 6,7) stride 1 VALID 64→80 : (B,23,53,64) → (B,23,53,80)
+  //   stem_s4a (CBR 8,9) stride 1 VALID 80→192: (B,23,53,80) → (B,21,51,192)
+  //   stem_mp5a maxpool 3×3 stride 2 VALID    : (B,21,51,192)→ (B,10,25,192)
+  // Convenience: DV_METAL_DET_LAYERS=stem expands to all 7.
+  enum StemKind { kSCBR, kSPool };
+  struct StemStage { const char* tap; StemKind kind;
+                      // CBR-only:
+                      int conv; int bn; int sy; int sx; bool same;
+                      // Geometry (always set):
+                      int C_in; int C_out;
+                      int H_in; int W_in; int H_out; int W_out; };
+  static const StemStage kStemChain[] = {
+      {"stem_s1a",  kSCBR, 0, 1, 2, 2, false,    7,  32, 100, 221, 49, 110},
+      {"stem_s2a",  kSCBR, 2, 3, 1, 1, false,   32,  32,  49, 110, 47, 108},
+      {"stem_s2b",  kSCBR, 4, 5, 1, 1, true,    32,  64,  47, 108, 47, 108},
+      {"stem_mp3a", kSPool, 0, 0, 2, 2, false,  64,  64,  47, 108, 23,  53},
+      {"stem_s3b",  kSCBR, 6, 7, 1, 1, false,   64,  80,  23,  53, 23,  53},
+      {"stem_s4a",  kSCBR, 8, 9, 1, 1, false,   80, 192,  23,  53, 21,  51},
+      {"stem_mp5a", kSPool, 0, 0, 2, 2, false, 192, 192,  21,  51, 10,  25},
+  };
+  // "stem" alias enables ALL 7 stages.
+  if (det_set.count("stem") > 0) {
+    for (const auto& s : kStemChain) det_set.insert(s.tap);
+  }
+  int chain_len = 0;
+  for (const auto& s : kStemChain) {
+    if (det_set.count(s.tap) > 0) {
+      if (chain_len == &s - kStemChain) ++chain_len;
+      else {
+        LOG(ERROR)
+            << "DV_METAL_DET_LAYERS: must be contiguous from stem_s1a; "
+               "got non-contiguous set";
+        return nullptr;
+      }
+    }
+  }
+  if (chain_len > 0) {
+    LOG(INFO) << "Metal det path: " << chain_len
+              << " stem stage(s) → deterministic kernel chain";
+
+    I.conv_serial = MetalConvSerial::Create();
+    I.max_pool = MetalMaxPool::Create();
+    if (!I.conv_serial || !I.max_pool) {
+      LOG(ERROR) << "MetalInception::Create: kernel pipeline creation failed";
+      return nullptr;
+    }
+    I.post_exec_cache = [NSMutableDictionary dictionary];
+
+    // Build a det entry for each stage in the chain.
+    for (int li = 0; li < chain_len; ++li) {
+      const StemStage& s = kStemChain[li];
+      DetLayer det{};
+      det.tap_name = s.tap;
+      det.kind = (s.kind == kSCBR) ? DetLayer::kConv : DetLayer::kMaxPool;
+      det.C_in = s.C_in;
+      det.C_out = s.C_out;
+      det.H_in = s.H_in;
+      det.W_in = s.W_in;
+      det.H_out = s.H_out;
+      det.W_out = s.W_out;
+      if (s.kind == kSCBR) {
+        FusedConv fc = FoldConvBn(*I.weights, s.conv, s.bn);
+        if (fc.weights_hwio.empty()) {
+          LOG(ERROR) << "MetalInception::Create: failed to fold "
+                     << s.tap << " weights";
+          return nullptr;
+        }
+        det.conv_desc.C_in = fc.I;
+        det.conv_desc.C_out = fc.O;
+        det.conv_desc.Kh = fc.H;
+        det.conv_desc.Kw = fc.W;
+        det.conv_desc.stride_h = s.sy;
+        det.conv_desc.stride_w = s.sx;
+        det.conv_desc.pad_h = s.same ? (fc.H - 1) / 2 : 0;
+        det.conv_desc.pad_w = s.same ? (fc.W - 1) / 2 : 0;
+        det.conv_desc.relu = true;
+        det.weights_buf =
+            [I.device newBufferWithBytes:fc.weights_hwio.data()
+                                  length:fc.weights_hwio.size() * sizeof(float)
+                                 options:MTLResourceStorageModeShared];
+        det.bias_buf =
+            [I.device newBufferWithBytes:fc.bias.data()
+                                  length:fc.bias.size() * sizeof(float)
+                                 options:MTLResourceStorageModeShared];
+        if (!det.weights_buf || !det.bias_buf) {
+          LOG(ERROR) << "MetalInception::Create: alloc failed for " << s.tap;
+          return nullptr;
+        }
+      } else {
+        // MaxPool: 3×3 stride-2 VALID, no learned params.
+        det.pool_desc.C = s.C_in;
+        det.pool_desc.Kh = 3;
+        det.pool_desc.Kw = 3;
+        det.pool_desc.stride_h = s.sy;
+        det.pool_desc.stride_w = s.sx;
+        det.pool_desc.pad_h = 0;
+        det.pool_desc.pad_w = 0;
+      }
+      I.det_layers.push_back(std::move(det));
+    }
+
+    // Build ONE post-graph that starts after the last det stage.
+    const DetLayer& last = I.det_layers.back();
+    const std::string& last_tap = last.tap_name;
+    DetLayer& last_mut = I.det_layers.back();
+    last_mut.post_graph = [MPSGraph new];
+    last_mut.post_input = [last_mut.post_graph
+        placeholderWithShape:@[@-1, @(last.H_out), @(last.W_out),
+                                @(last.C_out)]
+                    dataType:MPSDataTypeFloat32
+                        name:@"det_chain_out"];
+    MPSGraphTensor* px = last_mut.post_input;
+    // Append remaining stem stages (with index > last_tap's index).
+    // Order: 0:s1a, 1:s2a, 2:s2b, 3:mp3a, 4:s3b, 5:s4a, 6:mp5a.
+    int last_idx = -1;
+    if (last_tap == "stem_s1a")  last_idx = 0;
+    else if (last_tap == "stem_s2a")  last_idx = 1;
+    else if (last_tap == "stem_s2b")  last_idx = 2;
+    else if (last_tap == "stem_mp3a") last_idx = 3;
+    else if (last_tap == "stem_s3b")  last_idx = 4;
+    else if (last_tap == "stem_s4a")  last_idx = 5;
+    else if (last_tap == "stem_mp5a") last_idx = 6;
+    if (last_idx < 1) px = CBR(last_mut.post_graph, px, *I.weights, 2, 3, 1, 1, false, @"p_s2a");
+    if (last_idx < 2) px = CBR(last_mut.post_graph, px, *I.weights, 4, 5, 1, 1, true,  @"p_s2b");
+    if (last_idx < 3) px = MaxPool3x3s2Valid(last_mut.post_graph, px, @"p_mp3a");
+    if (last_idx < 4) px = CBR(last_mut.post_graph, px, *I.weights, 6, 7, 1, 1, false, @"p_s3b");
+    if (last_idx < 5) px = CBR(last_mut.post_graph, px, *I.weights, 8, 9, 1, 1, false, @"p_s4a");
+    if (last_idx < 6) px = MaxPool3x3s2Valid(last_mut.post_graph, px, @"p_mp5a");
+    px = Mixed_5b(last_mut.post_graph, px, *I.weights);
+    px = Mixed_5c(last_mut.post_graph, px, *I.weights);
+    px = Mixed_5d(last_mut.post_graph, px, *I.weights);
+    px = Mixed_6a(last_mut.post_graph, px, *I.weights);
+    px = Mixed_6b(last_mut.post_graph, px, *I.weights);
+    px = Mixed_6c(last_mut.post_graph, px, *I.weights);
+    px = Mixed_6d(last_mut.post_graph, px, *I.weights);
+    px = Mixed_6e(last_mut.post_graph, px, *I.weights);
+    px = Mixed_7a(last_mut.post_graph, px, *I.weights);
+    px = Mixed_7b(last_mut.post_graph, px, *I.weights);
+    px = Mixed_7c(last_mut.post_graph, px, *I.weights);
+    px = [last_mut.post_graph meanOfTensor:px axes:@[@1, @2] name:@"p_gap"];
+    px = [last_mut.post_graph reshapeTensor:px withShape:@[@-1, @2048]
+                                       name:@"p_squeeze"];
+    last_mut.post_output = px;
+  }
   return self;
 }
 
 bool MetalInception::Predict(const float* input, int batch_size,
                               float* output) {
-  int unused = 0;
-  return PredictAtTap("gap", input, batch_size, output, &unused);
+  auto& I = *impl_;
+
+  // Fast path: no deterministic layers, run the full MPSGraph.
+  if (I.det_layers.empty()) {
+    int unused = 0;
+    return PredictAtTap("gap", input, batch_size, output, &unused);
+  }
+
+  // Det path: dispatch deterministic kernels in chain, then run the
+  // post-graph from the last det layer's output to gap.
+  @autoreleasepool {
+    // 1) Allocate input buffer (user-supplied input, copied to GPU).
+    const DetLayer& det0 = I.det_layers.front();
+    const NSUInteger n_in =
+        (NSUInteger)batch_size * det0.H_in * det0.W_in * det0.C_in;
+    id<MTLBuffer> cur_buf = [I.device
+        newBufferWithBytes:input
+                    length:n_in * sizeof(float)
+                   options:MTLResourceStorageModeShared];
+    if (!cur_buf) {
+      LOG(ERROR) << "MetalInception::Predict(det): input buffer alloc failed";
+      return false;
+    }
+
+    // 2) Chain det stages in sequence on a single command buffer.
+    id<MTLCommandBuffer> cb = [I.queue commandBuffer];
+    for (size_t i = 0; i < I.det_layers.size(); ++i) {
+      const DetLayer& det = I.det_layers[i];
+      const NSUInteger n_dst =
+          (NSUInteger)batch_size * det.H_out * det.W_out * det.C_out;
+      id<MTLBuffer> dst_buf = [I.device
+          newBufferWithLength:n_dst * sizeof(float)
+                       options:MTLResourceStorageModeShared];
+      if (!dst_buf) {
+        LOG(ERROR) << "MetalInception::Predict(det): out buffer alloc failed "
+                   << "for stage " << det.tap_name;
+        return false;
+      }
+      bool ok = false;
+      if (det.kind == DetLayer::kConv) {
+        ConvDesc d = det.conv_desc;
+        d.B = batch_size;
+        d.H_in = det.H_in;
+        d.W_in = det.W_in;
+        d.H_out = det.H_out;
+        d.W_out = det.W_out;
+        ok = I.conv_serial->Encode(cb, cur_buf, det.weights_buf,
+                                    det.bias_buf, dst_buf, d);
+      } else {
+        MaxPoolDesc d = det.pool_desc;
+        d.B = batch_size;
+        d.H_in = det.H_in;
+        d.W_in = det.W_in;
+        d.H_out = det.H_out;
+        d.W_out = det.W_out;
+        d.C = det.C_in;
+        ok = I.max_pool->Encode(cb, cur_buf, dst_buf, d);
+      }
+      if (!ok) {
+        LOG(ERROR) << "MetalInception::Predict(det): kernel encode failed "
+                   << "for stage " << det.tap_name;
+        return false;
+      }
+      cur_buf = dst_buf;  // chain
+    }
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    // 3) Run post-graph (last det layer output → gap) using cur_buf as
+    // the placeholder.
+    const DetLayer& last = I.det_layers.back();
+    NSNumber* bs_key = @(batch_size);
+    MPSGraphExecutable* post_exe = I.post_exec_cache[bs_key];
+    if (!post_exe) {
+      MPSShape* in_shape = @[@(batch_size),
+                              @(last.H_out),
+                              @(last.W_out),
+                              @(last.C_out)];
+      MPSGraphShapedType* in_st =
+          [[MPSGraphShapedType alloc] initWithShape:in_shape
+                                            dataType:MPSDataTypeFloat32];
+      NSDictionary<MPSGraphTensor*, MPSGraphShapedType*>* feeds_shape =
+          @{last.post_input: in_st};
+      post_exe = [last.post_graph
+          compileWithDevice:[MPSGraphDevice deviceWithMTLDevice:I.device]
+                      feeds:feeds_shape
+              targetTensors:@[last.post_output]
+           targetOperations:nil
+      compilationDescriptor:I.compileDesc];
+      if (!post_exe) {
+        LOG(ERROR) << "MetalInception::Predict(det): post-graph compile failed";
+        return false;
+      }
+      I.post_exec_cache[bs_key] = post_exe;
+    }
+
+    MPSGraphTensorData* in_td = [[MPSGraphTensorData alloc]
+        initWithMTLBuffer:cur_buf
+                    shape:@[@(batch_size),
+                             @(last.H_out),
+                             @(last.W_out),
+                             @(last.C_out)]
+                 dataType:MPSDataTypeFloat32];
+
+    MPSGraphExecutableExecutionDescriptor* runDesc =
+        [MPSGraphExecutableExecutionDescriptor new];
+    runDesc.waitUntilCompleted = YES;
+    NSArray<MPSGraphTensorData*>* outs =
+        [post_exe runWithMTLCommandQueue:I.queue
+                            inputsArray:@[in_td]
+                           resultsArray:nil
+                    executionDescriptor:runDesc];
+    if (!outs || outs.count != 1) {
+      LOG(ERROR) << "MetalInception::Predict(det): post-graph run produced "
+                 << (outs ? outs.count : 0) << " results";
+      return false;
+    }
+    [outs[0].mpsndarray readBytes:output strideBytes:nil];
+  }
+  return true;
 }
 
 bool MetalInception::PredictAtTap(const std::string& tap_name,
