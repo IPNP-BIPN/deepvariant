@@ -247,6 +247,18 @@ target_link_libraries(debug_metal PRIVATE
 )
 
 # ---------------------------------------------------------------------------
+# microtest_numpy_rng — Phase 5.5d/3 verification that NumpyMt19937 +
+# BoundedLemireUint32 reproduce NumPy 1.24's
+# np.random.RandomState(seed).randint(...) bit-for-bit.
+# ---------------------------------------------------------------------------
+add_executable(microtest_numpy_rng
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_numpy_rng.cc"
+)
+target_include_directories(microtest_numpy_rng PRIVATE
+  "${CMAKE_SOURCE_DIR}"
+)
+
+# ---------------------------------------------------------------------------
 # microtest_conv_serial — Phase 5.5c hand-verifiable test for the
 # deterministic Conv2D kernel. Compares GPU dispatch output against a
 # scalar (kh,kw,c_in)-order CPU reference using std::fma — bit-exact

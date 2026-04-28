@@ -24,6 +24,7 @@
 
 #include "deepvariant/allelecounter.h"
 #include "deepvariant/make_examples_native.h"
+#include "deepvariant/native/numpy_mt19937.h"
 #include "deepvariant/native/realigner_native.h"
 #include "deepvariant/native/regions.h"
 #include "deepvariant/native/small_model_features.h"
@@ -119,6 +120,12 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   opts.set_num_shards(num_shards);
   opts.set_mode(MakeExamplesOptions::CALLING);
   opts.set_random_seed(609314161);
+  // Match upstream `make_examples_options.py`: cap reads per
+  // partition (default 1500) so high-coverage regions don't blow up
+  // and so our per-region read selection matches Docker's. Reservoir
+  // sampling is applied inside the per-region worker loop with a
+  // NumPy-compatible RNG (numpy_mt19937.h).
+  opts.set_max_reads_per_partition(1500);
 
   // Read requirements.
   nucleus::genomics::v1::ReadRequirements read_reqs;
@@ -473,6 +480,31 @@ int RunMakeExamples(int argc, char** argv) {
       reads.push_back(tmp_read);
     }
     reads_iter->Release().IgnoreError();
+
+    // Match upstream make_examples_core.py:partition_reads_etc, which
+    // applies Algorithm-R reservoir sampling to cap reads per partition
+    // at `max_reads_per_partition` (default 1500). Without this cap,
+    // high-coverage regions (chr20:31185000-31186000 has 5686 reads
+    // post-filter) blow up the pileup-image evidence and produce a
+    // different DP/AD/VAF than Docker → different small_model dispatch
+    // → different deepvariant softmax → FILTER drift. The RNG is a
+    // NumPy-compatible mt19937 (numpy_mt19937.h) seeded with
+    // opts.random_seed (609314161, the upstream default), reset per
+    // region — matches `np.random.RandomState(seed)` in
+    // make_examples_core.py:2134.
+    const int max_rpp = static_cast<int>(opts.max_reads_per_partition());
+    if (max_rpp > 0 && reads.size() > static_cast<size_t>(max_rpp)) {
+      const size_t orig_n = reads.size();
+      ::deepvariant::npr::NumpyMt19937 region_rng(opts.random_seed());
+      auto sampled =
+          ::deepvariant::npr::ReservoirSamplePtrs(reads, max_rpp, region_rng);
+      std::vector<nucleus::genomics::v1::Read> kept;
+      kept.reserve(sampled.size());
+      for (const auto* p : sampled) kept.push_back(*p);
+      reads = std::move(kept);
+      LOG(INFO) << "  reservoir-sampled " << orig_n << " → " << reads.size()
+                 << " reads (max_reads_per_partition=" << max_rpp << ")";
+    }
 
     LOG(INFO) << "  read " << reads.size() << " reads from BAM";
     if (reads.empty()) continue;
