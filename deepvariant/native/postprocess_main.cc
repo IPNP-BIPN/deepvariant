@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "deepvariant/native/haplotypes.h"
 #include "deepvariant/native/tfrecord.h"
 #include "deepvariant/protos/deepvariant.pb.h"
 #include "absl/flags/flag.h"
@@ -411,6 +412,9 @@ int RunPostprocessVariants(int argc, char** argv) {
   int written = 0;
   int refcall = 0;
   int nocall = 0;
+  // Phase 5.5d/4 — buffer variants for haplotype resolution.
+  std::vector<Variant> variants_buffer;
+  variants_buffer.reserve(ordered_keys.size());
 
   for (const auto& key : ordered_keys) {
     const auto& cvos = groups[key];
@@ -645,6 +649,18 @@ int RunPostprocessVariants(int argc, char** argv) {
     for (int& v : pl) v -= min_pl;
     nucleus::SetInfoField("PL", pl, call);
 
+    // Also populate VariantCall.genotype_likelihood as log10(p) per
+    // genotype slot. Required for haplotype resolution
+    // (`MaybeResolveConflictingVariants` reads `call.genotype_likelihood`
+    // to compute the joint likelihood across overlapping variants).
+    // Floor at log10(1.25e-10) = -9.0309 to mirror upstream's
+    // perror_to_bounded_log10_perror.
+    call->clear_genotype_likelihood();
+    for (int i = 0; i < n_gt; ++i) {
+      const double p = std::max(like[i], 1.25e-10);
+      call->add_genotype_likelihood(std::log10(p));
+    }
+
     variant.set_quality(qual);
 
     // QUAL filter: low-confidence variants become RefCall.
@@ -667,20 +683,44 @@ int RunPostprocessVariants(int argc, char** argv) {
       ++nocall;
     }
 
-    auto status = vcf_writer->Write(variant);
+    // Buffer for haplotype resolution (Phase 5.5d/4). The pre-resolution
+    // GT/FILTER values (incl. uncall_homref_gt_if_lowqual above) are
+    // applied first, then `MaybeResolveConflictingVariants` may rewrite
+    // overlapping calls and recompute FILTER — matching upstream's
+    // postprocess_variants.run_postprocess_variants_on_region order
+    // (per-variant add_call_to_variant → maybe_resolve_conflicting_variants).
+    variants_buffer.push_back(std::move(variant));
+  }
+
+  LOG(INFO) << "Applying haplotype resolution to "
+            << variants_buffer.size() << " variants ...";
+  ::deepvariant::MaybeResolveConflictingVariants(&variants_buffer, qual_filter);
+
+  for (const auto& v : variants_buffer) {
+    auto status = vcf_writer->Write(v);
     if (!status.ok()) {
       LOG(WARNING) << "Failed to write variant at "
-                   << variant.reference_name() << ":" << variant.start()
-                   << " — " << status;
+                   << v.reference_name() << ":" << v.start() << " — " << status;
     } else {
       ++written;
     }
   }
 
+  // Recount filter classes after haplotype resolution (the per-variant
+  // counts above may be stale where resolution rewrote GT to 0/0).
+  refcall = 0; nocall = 0;
+  int pass = 0;
+  for (const auto& v : variants_buffer) {
+    if (v.filter_size() == 0) continue;
+    const std::string& f = v.filter(0);
+    if (f == "RefCall") ++refcall;
+    else if (f == "NoCall") ++nocall;
+    else if (f == "PASS") ++pass;
+  }
   LOG(INFO) << "postprocess_variants done: " << written << " VCF lines"
-            << " (" << (refcall - nocall) << " RefCall, "
+            << " (" << refcall << " RefCall, "
             << nocall << " NoCall, "
-            << (written - refcall) << " PASS).";
+            << pass << " PASS).";
   return 0;
 }
 
