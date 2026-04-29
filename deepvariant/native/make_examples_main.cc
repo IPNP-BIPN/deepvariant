@@ -103,6 +103,57 @@ ABSL_FLAG(int, threads, 1,
           "concatenated into the final --examples / --small_model_cvo_outfile "
           "paths after all workers join.");
 
+// ----------------------------------------------------------------------------
+// DeepTrio flags (Step 1 — mirrors deeptrio/make_examples.py exactly).
+// When --reads_parent1 is set, make_examples runs in trio mode: 3 samples
+// (parent1 at index 0, child at index 1, parent2 at index 2; child is the
+// MAIN_SAMPLE_INDEX). Each region is processed by 3 AlleleCounters keyed by
+// sample_name and fed to multi_sample::VariantCaller. ExamplesGenerator
+// emits 3 separate example streams (one per target sample), each rendered
+// with the per-sample `order` permutation so the pileup channel-stack
+// shows the target sample in slot 1.
+// ----------------------------------------------------------------------------
+ABSL_FLAG(std::string, reads_parent1, "",
+          "Trio mode: BAM/CRAM for parent1. When set, make_examples runs "
+          "as DeepTrio (3 samples: parent1, child, parent2; child = main).");
+ABSL_FLAG(std::string, reads_parent2, "",
+          "Trio mode: BAM/CRAM for parent2.");
+ABSL_FLAG(std::string, sample_name_parent1, "",
+          "Trio mode: parent1 sample name (inferred from BAM if empty).");
+ABSL_FLAG(std::string, sample_name_parent2, "",
+          "Trio mode: parent2 sample name (inferred from BAM if empty).");
+ABSL_FLAG(int, pileup_image_height_child, 0,
+          "Trio mode: pileup image height for the child sample. 0 = default "
+          "(100 per upstream dt_constants.PILEUP_DEFAULT_HEIGHT_CHILD).");
+ABSL_FLAG(int, pileup_image_height_parent, 0,
+          "Trio mode: pileup image height for each parent sample. 0 = default "
+          "(100 per upstream dt_constants.PILEUP_DEFAULT_HEIGHT_PARENT).");
+ABSL_FLAG(double, downsample_fraction_child, 0.0,
+          "Trio mode: downsample fraction applied to child reads (0.0 = none).");
+ABSL_FLAG(double, downsample_fraction_parents, 0.0,
+          "Trio mode: downsample fraction applied to both parents' reads.");
+ABSL_FLAG(std::string, small_model_path_child, "",
+          "Trio mode: small_model weights directory for child examples.");
+ABSL_FLAG(std::string, small_model_path_parent, "",
+          "Trio mode: small_model weights directory for parent examples.");
+ABSL_FLAG(bool, skip_parent_calling, false,
+          "Trio mode: if true, generate examples for child only "
+          "(parents' SampleOptions still populated for joint candidate "
+          "generation, but their example output is suppressed).");
+ABSL_FLAG(std::string, examples_child, "",
+          "Trio mode: examples output path for the child sample. If empty, "
+          "the existing --examples flag is used as the child path.");
+ABSL_FLAG(std::string, examples_parent1, "",
+          "Trio mode: examples output path for the parent1 sample.");
+ABSL_FLAG(std::string, examples_parent2, "",
+          "Trio mode: examples output path for the parent2 sample.");
+ABSL_FLAG(std::string, small_model_cvo_outfile_child, "",
+          "Trio mode: small_model CVO output path for child.");
+ABSL_FLAG(std::string, small_model_cvo_outfile_parent1, "",
+          "Trio mode: small_model CVO output path for parent1.");
+ABSL_FLAG(std::string, small_model_cvo_outfile_parent2, "",
+          "Trio mode: small_model CVO output path for parent2.");
+
 namespace deepvariant {
 
 using namespace learning::genomics::deepvariant;  // NOLINT
@@ -200,15 +251,81 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   pic.set_num_channels(7);
   *opts.mutable_pic_options() = pic;
 
-  // Sample options.
-  SampleOptions* sopt = opts.add_sample_options();
-  sopt->set_role("sample");
-  sopt->set_name(sample_name);
-  sopt->add_reads_filenames(absl::GetFlag(FLAGS_reads));
-  sopt->set_pileup_height(100);  // WGS default pileup height per sample.
-  *sopt->mutable_variant_caller_options() = vc_opts;
-  opts.set_main_sample_index(0);
-  opts.set_sample_role_to_train("sample");
+  // Sample options. Trio mode (--reads_parent1 set) populates 3 samples
+  // in upstream order [parent1, child, parent2] (mirrors deeptrio/
+  // make_examples.py:trio_samples_from_flags). Single-sample mode keeps
+  // the legacy single SampleOptions.
+  const std::string parent1_reads = absl::GetFlag(FLAGS_reads_parent1);
+  const std::string parent2_reads = absl::GetFlag(FLAGS_reads_parent2);
+  const bool trio_mode = !parent1_reads.empty();
+
+  if (trio_mode) {
+    // Per upstream dt_constants:
+    //   PILEUP_DEFAULT_HEIGHT_CHILD  = 100
+    //   PILEUP_DEFAULT_HEIGHT_PARENT = 100
+    int child_h  = absl::GetFlag(FLAGS_pileup_image_height_child);
+    int parent_h = absl::GetFlag(FLAGS_pileup_image_height_parent);
+    if (child_h  <= 0) child_h  = 100;
+    if (parent_h <= 0) parent_h = 100;
+    const double ds_child   = absl::GetFlag(FLAGS_downsample_fraction_child);
+    const double ds_parents = absl::GetFlag(FLAGS_downsample_fraction_parents);
+    const std::string p1_name = absl::GetFlag(FLAGS_sample_name_parent1);
+    const std::string p2_name = absl::GetFlag(FLAGS_sample_name_parent2);
+
+    auto add_sample = [&](const std::string& role, const std::string& name,
+                           const std::string& reads, int height, double ds,
+                           std::initializer_list<int> order,
+                           bool skip_output, const std::string& small_path) {
+      SampleOptions* s = opts.add_sample_options();
+      s->set_role(role);
+      s->set_name(name);
+      if (!reads.empty()) s->add_reads_filenames(reads);
+      s->set_pileup_height(height);
+      *s->mutable_variant_caller_options() = vc_opts;
+      // Per-sample VC options keep the same thresholds; sample_name in
+      // the proto is set by upstream via make_vc_options(sample_name=…)
+      // — we bake that here so multi_sample::VariantCaller can identify
+      // the target sample from its own VC opts.
+      s->mutable_variant_caller_options()->set_sample_name(name);
+      for (int o : order) s->add_order(o);
+      s->set_skip_output_generation(skip_output);
+      if (!small_path.empty()) s->set_small_model_path(small_path);
+      if (ds > 0.0) s->set_downsample_fraction(static_cast<float>(ds));
+    };
+
+    const bool skip_parents = absl::GetFlag(FLAGS_skip_parent_calling);
+
+    // Order in `samples_in_order`: [parent1, child, parent2].
+    // Each sample's `order` controls the channel-stack permutation when
+    // building its OWN pileup image (so the target sample sits at slot 1
+    // in its own image; parent2 swaps the two parents).
+    add_sample("parent1", p1_name.empty() ? "parent1" : p1_name,
+               parent1_reads, parent_h, ds_parents,
+               {0, 1, 2}, skip_parents,
+               absl::GetFlag(FLAGS_small_model_path_parent));
+    add_sample("child", sample_name,
+               absl::GetFlag(FLAGS_reads), child_h, ds_child,
+               {0, 1, 2}, /*skip_output=*/false,
+               absl::GetFlag(FLAGS_small_model_path_child));
+    add_sample("parent2", p2_name.empty() ? "parent2" : p2_name,
+               parent2_reads, parent_h, ds_parents,
+               {2, 1, 0}, skip_parents,
+               absl::GetFlag(FLAGS_small_model_path_parent));
+
+    // MAIN_SAMPLE_INDEX = 1 (child) per deeptrio/make_examples.py:48.
+    opts.set_main_sample_index(1);
+    opts.set_sample_role_to_train("child");
+  } else {
+    SampleOptions* sopt = opts.add_sample_options();
+    sopt->set_role("sample");
+    sopt->set_name(sample_name);
+    sopt->add_reads_filenames(absl::GetFlag(FLAGS_reads));
+    sopt->set_pileup_height(100);  // WGS default pileup height per sample.
+    *sopt->mutable_variant_caller_options() = vc_opts;
+    sopt->mutable_variant_caller_options()->set_sample_name(sample_name);
+    opts.set_main_sample_index(0);
+    opts.set_sample_role_to_train("sample");
+  }
 
   opts.set_variant_caller(MakeExamplesOptions::VERY_SENSITIVE_CALLER);
   opts.set_realigner_enabled(false);
@@ -216,6 +333,11 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   opts.set_stream_examples(false);
 
   return opts;
+}
+
+// Returns true when --reads_parent1 was set (trio mode active).
+bool IsTrioMode() {
+  return !absl::GetFlag(FLAGS_reads_parent1).empty();
 }
 
 // Infer sample name from the first RG:SM field in the BAM header.
