@@ -156,15 +156,35 @@ std::pair<int, int> GenotypeFromPLIndex(int pl_index, int n_alts) {
   return {0, 0};  // fallback
 }
 
-// QUAL of an alt allele = -10 * log10(p_ref). Mirror of
-// postprocess_variants.py:compute_quals(predictions, 0) → qual.
+// QUAL of an alt allele. Mirrors upstream
+// postprocess_variants.py:compute_quals(predictions, prediction_index=0)
+// EXACTLY, including the `_QUAL_PRECISION=7` rounding step:
+//
+//   qual = ptrue_to_bounded_phred(min(sum(predictions[1:]), 1.0))
+//        = -10 * log10(1 - sum_alt)
+//   rounded_qual = round(qual, 7)
+//
+// The rounding is load-bearing for the AltsToRemove tie-break at
+// saturated multi-allelic homref sites: there `sum_alt` is sub-ULP-
+// different across alts (FP-drift between our scalar BNNS-CPU softmax
+// and Docker's vectorised TF/Keras Eigen softmax), and without
+// rounding the relative qual ordering can flip vs Docker. Rounding to
+// 7 decimals collapses values < 5e-8 to 0 (so they tie and the first-
+// iterated alt wins, matching Docker), while values ≥ 5e-8 survive at
+// 1e-7 granularity (preserving Docker's pick when one alt is
+// genuinely ahead). Closes the chr20 14/14 site-set diff.
 double AltAlleleQual(const CallVariantsOutput& cvo) {
-  if (cvo.genotype_probabilities_size() < 1) return 0.0;
-  const double p_ref = cvo.genotype_probabilities(0);
-  if (p_ref <= 0.0) return kMaxPhred;
-  if (p_ref >= 1.0) return 0.0;
-  return std::min(-10.0 * std::log10(p_ref),
-                  static_cast<double>(kMaxPhred));
+  if (cvo.genotype_probabilities_size() < 3) return 0.0;
+  double sum_alt = 0.0;
+  for (int i = 1; i < cvo.genotype_probabilities_size(); ++i) {
+    sum_alt += cvo.genotype_probabilities(i);
+  }
+  if (sum_alt <= 0.0) return 0.0;
+  if (sum_alt >= 1.0 - 1.25e-10) return kMaxPhred;
+  double qual = -10.0 * std::log10(1.0 - sum_alt);
+  if (qual > kMaxPhred) qual = kMaxPhred;
+  // Round to 7 decimals (upstream's _QUAL_PRECISION).
+  return std::round(qual * 1e7) / 1e7;
 }
 
 // Returns the set of alt-allele strings to remove from the variant.
