@@ -45,6 +45,12 @@ ABSL_FLAG(int,    batch_size, 128, "Inference batch size.");
 ABSL_FLAG(std::string, compute_units, "all",
           "Core ML compute units: all (default), cpu_gpu, cpu_only. "
           "Only applies when --inference_backend=coreml.");
+ABSL_FLAG(int, input_height, 100,
+          "Pileup-image height for the Metal backend. WGS=100, Trio WGS=140 "
+          "(60 child + 2x40 parent), pangenome=100, etc.");
+ABSL_FLAG(int, input_channels, 7,
+          "Pileup-image channels for the Metal backend. WGS/Trio=7, "
+          "pangenome=9.");
 ABSL_FLAG(std::string, inference_backend, "coreml",
           "Inference backend: coreml (Phase 2 default, Core ML .mlpackage) "
           "or metal (Phase 5.5 bit-parity, MPSGraph + BNNS .dvw).");
@@ -236,10 +242,14 @@ int RunCallVariants(int argc, char** argv) {
       LOG(ERROR) << "Failed to load Metal/BNNS model: " << checkpoint_path;
       return 1;
     }
-    // The Metal backbone uses fixed Inception-v3 input geometry.
-    H = 100;
+    // The Metal backbone runs Inception-v3 with the input geometry
+    // baked into the example data. Default: WGS (100×221×7). Trio
+    // overrides to 140×221×7 (DEEP_TRIO_WGS_PILEUP_HEIGHT_CHILD=60 +
+    // 2×PARENT=40 = 140) via --input_height. Pangenome eventually uses
+    // 100×221×9 with --input_channels.
+    H = absl::GetFlag(FLAGS_input_height);
     W = 221;
-    C = 7;
+    C = absl::GetFlag(FLAGS_input_channels);
     K = 3;
   } else {
     LOG(ERROR) << "Unknown --inference_backend=" << backend

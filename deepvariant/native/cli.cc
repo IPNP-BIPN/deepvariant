@@ -424,12 +424,19 @@ int RunAllTrio(int argc, char** argv) {
   for (auto& p : P) {
     LOG(INFO) << "Trio Stage 2 (" << p.role << "): call_variants";
     {
+      // Trio WGS pileup is 140×221×7 (child 60 + 2×parent 40).
+      // The make_examples worker rendered with these heights; pass
+      // through to call_variants so it builds the right Metal input.
+      // TODO(step-1-bis): add --model_type WGS/PACBIO/ONT dispatch
+      // to pick 140 vs other shapes per upstream's per-mode defaults.
       std::vector<std::string> cv_args = {
           absl::StrCat("--examples=", p.examples_pattern),
           absl::StrCat("--outfile=", p.cvo_path),
           absl::StrCat("--checkpoint=", p.ckpt_path),
           absl::StrCat("--batch_size=", absl::GetFlag(FLAGS_batch_size)),
           absl::StrCat("--inference_backend=", inference_backend),
+          "--input_height=140",
+          "--input_channels=7",
       };
       auto argv_cv = MakeArgv("deepvariant_call_variants", cv_args);
       int n = static_cast<int>(argv_cv.size()) - 1;
