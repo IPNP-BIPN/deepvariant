@@ -102,14 +102,15 @@ target_link_libraries(dv_coreml PUBLIC
 )
 
 # ---------------------------------------------------------------------------
-# dv_small_model — Obj-C++ wrapper around the small_model .mlpackage
+# dv_small_model — deterministic FP32 BNNS-CPU MLP runner for the
+# small_model (70 → 750 → 750 → 3). Reads weights from .npy files
+# (Phase 5.5d/7); replaces the Core ML path which had ~0.005-0.01 drift
+# vs Docker's TF/Keras output and caused cross-MID FILTER flips at
+# threshold-borderline sites.
 # ---------------------------------------------------------------------------
 add_library(dv_small_model STATIC
   small_model_inference.mm
   small_model_features.cc
-)
-set_source_files_properties(small_model_inference.mm PROPERTIES
-  COMPILE_FLAGS "-fobjc-arc"
 )
 target_include_directories(dv_small_model PUBLIC
   "${CMAKE_SOURCE_DIR}"
@@ -119,8 +120,7 @@ target_include_directories(dv_small_model PUBLIC
 target_link_libraries(dv_small_model PUBLIC
   proto_dv
   proto_nucleus
-  "-framework CoreML"
-  "-framework Foundation"
+  absl::log
 )
 
 # ---------------------------------------------------------------------------
