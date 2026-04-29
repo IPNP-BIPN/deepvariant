@@ -258,6 +258,21 @@ bool IsSnpAlt(const nucleus::genomics::v1::Variant& v, int alt_idx) {
          v.alternate_bases(alt_idx).size() == 1;
 }
 
+// Multi-index version: SNP iff REF is 1 base AND every alt in
+// `alt_indices` is 1 base. Mirror of nucleus/util/variant_utils.is_snp(
+// variant, exclude_alleles) where exclude_alleles is the complement of
+// alt_indices.
+bool IsSnpForIndices(const nucleus::genomics::v1::Variant& v,
+                      const std::vector<int>& alt_indices) {
+  if (alt_indices.empty()) return false;
+  if (v.reference_bases().size() != 1) return false;
+  for (int idx : alt_indices) {
+    if (idx < 0 || idx >= v.alternate_bases_size()) return false;
+    if (v.alternate_bases(idx).size() != 1) return false;
+  }
+  return true;
+}
+
 // Phred = -10 * log10(p), truncated toward zero. Capped at 99.
 //
 // Truncation (not std::round) matches upstream's small_model
@@ -275,12 +290,15 @@ int ProbToPhred(double p) {
 // Build a CallVariantsOutput proto for a single (candidate, alt_idx) pair
 // that the small model has resolved. We tag MID="small_model" in the
 // VariantCall.info so postprocess can propagate it to the VCF.
+// `alt_indices` may be a single index (single-alt CVO) or two indices
+// (multi-alt combo CVO, mirrors upstream's get_set_of_allele_indices
+// `multiallelic = combinations(range(N), 2)`).
 CallVariantsOutput MakeSmallModelCvo(
-    const DeepVariantCall& candidate, int alt_idx,
+    const DeepVariantCall& candidate, const std::vector<int>& alt_indices,
     const float* probs) {
   CallVariantsOutput cvo;
   *cvo.mutable_variant() = candidate.variant();
-  cvo.mutable_alt_allele_indices()->add_indices(alt_idx);
+  for (int idx : alt_indices) cvo.mutable_alt_allele_indices()->add_indices(idx);
   // Probabilities written as double — same wire-format as the big model.
   for (int i = 0; i < 3; ++i) cvo.add_genotype_probabilities(probs[i]);
   // Tag MID in VariantCall.info["MID"]. variant_calling.cc already adds an
@@ -622,12 +640,17 @@ int RunMakeExamples(int argc, char** argv) {
 
     total_candidates += candidates.size();
 
-    // Optional small-model first-pass dispatch. We try each candidate against
-    // the small model (one prediction per alt allele); if EVERY alt for a
-    // candidate gets a confident enough genotype call, we emit the per-alt
-    // CVOs directly and skip the big model. Otherwise the candidate falls
-    // through to ExamplesGenerator (which generates the pileup image and the
-    // big model picks up downstream in call_variants).
+    // Small-model first-pass dispatch. Mirror of upstream
+    // `SmallModelVariantCaller.call_variants` + `make_small_model_examples.
+    // get_set_of_allele_indices`:
+    //   - For each candidate, enumerate the FULL set of alt-allele-indices:
+    //       biallelic   = [(0,), (1,), …, (N-1,)]
+    //       multiallelic = list(combinations(range(N), 2))
+    //   - Run small_model on each (candidate, alt_indices) PAIR.
+    //   - PER-PAIR pass/fail: if pass → emit small_model CVO; if fail →
+    //     append to candidate.make_examples_alt_allele_indices so big_model
+    //     generates an example for that specific alt-set only. Multiple
+    //     pairs from the same candidate can split between small/big.
     std::vector<DeepVariantCall> big_candidates;
     if (small_model) {
       // Populate VAF context for every candidate (the small model's 51
@@ -638,40 +661,51 @@ int RunMakeExamples(int argc, char** argv) {
         PopulateVafContext(&c, allele_counts);
       }
 
-      for (const auto& c : candidates) {
+      for (auto& c : candidates) {
         const int n_alts = c.variant().alternate_bases_size();
-        // Decide per-alt; only keep the candidate fully on the small-model
-        // path if every alt clears its threshold.
-        std::vector<CallVariantsOutput> per_alt_cvos;
-        bool all_alts_pass = (n_alts > 0);
-        for (int alt_idx = 0; alt_idx < n_alts; ++alt_idx) {
-          const auto features = EncodeSmallModelFeatures(c, {alt_idx});
-          float probs[3] = {0, 0, 0};
-          if (!small_model->Predict(features.data(), 1, probs)) {
-            all_alts_pass = false;
-            break;
+        // Build the list of alt-index sets to query: single + combinations.
+        std::vector<std::vector<int>> alt_idx_sets;
+        for (int i = 0; i < n_alts; ++i) alt_idx_sets.push_back({i});
+        for (int i = 0; i < n_alts; ++i) {
+          for (int j = i + 1; j < n_alts; ++j) {
+            alt_idx_sets.push_back({i, j});
           }
-          // The small_model GQ is the phred score of NOT being the called
-          // genotype, i.e. -10·log10(1 − max_p).
-          const float max_p = std::max({probs[0], probs[1], probs[2]});
-          const int gq = ProbToPhred(1.0 - max_p);
-          const int threshold =
-              IsSnpAlt(c.variant(), alt_idx) ? snp_gq_threshold
-                                              : indel_gq_threshold;
-          if (gq < threshold) {
-            all_alts_pass = false;
-            break;
-          }
-          per_alt_cvos.push_back(MakeSmallModelCvo(c, alt_idx, probs));
         }
-        if (all_alts_pass) {
-          for (const auto& cvo : per_alt_cvos) {
+
+        // Per alt-index-set: predict + decide.
+        bool any_failed = false;
+        c.clear_make_examples_alt_allele_indices();
+        for (const auto& idx_set : alt_idx_sets) {
+          const auto features = EncodeSmallModelFeatures(c, idx_set);
+          float probs[3] = {0, 0, 0};
+          bool pred_ok = small_model->Predict(features.data(), 1, probs);
+          bool accept = false;
+          if (pred_ok) {
+            const float max_p = std::max({probs[0], probs[1], probs[2]});
+            const int gq = ProbToPhred(1.0 - max_p);
+            const int threshold = IsSnpForIndices(c.variant(), idx_set)
+                                    ? snp_gq_threshold
+                                    : indel_gq_threshold;
+            accept = (gq >= threshold);
+          }
+          if (accept) {
+            // Single-alt CVOs use idx_set[0]; the multi-alt (i, j) set is
+            // emitted with both indices so postprocess merge can route it
+            // correctly.
+            CallVariantsOutput cvo = MakeSmallModelCvo(c, idx_set, probs);
             std::string serialized;
             cvo.SerializeToString(&serialized);
             small_cvo_writer->WriteRecord(serialized);
             ++total_small_hits;
+          } else {
+            // Failed → big model generates an example for this exact
+            // alt-index-set only.
+            auto* aai = c.add_make_examples_alt_allele_indices();
+            for (int idx : idx_set) aai->add_indices(idx);
+            any_failed = true;
           }
-        } else {
+        }
+        if (any_failed) {
           big_candidates.push_back(c);
           ++total_big_dispatched;
         }
