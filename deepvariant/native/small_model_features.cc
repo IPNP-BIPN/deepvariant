@@ -104,6 +104,17 @@ bool IsDeletion(const Variant& v, const std::set<std::string>& exclude) {
 // candidate's reads to `features`. Mirrors upstream's
 // `FeatureEncoder.encode_base_feature` invoked over the BaseFeature
 // enum in declaration order.
+//
+// IMPORTANT — upstream's _get_total_depth (make_small_model_examples.py:
+// 292-296) is ALWAYS unfiltered: it returns
+// `len(candidate.ref_support_ext.read_infos) + sum(len(r.read_infos)
+// for r in candidate.allele_support_ext.values())` regardless of the
+// FeatureEncoder's `sample` arg. Only `ref_read_infos_count` and
+// `alt_read_infos_count` (and derivatives) are sample-filtered. So:
+//   - total_depth: unfiltered
+//   - alt_indices_depth: ref_count_filtered + alt_count_filtered
+//   - variant_allele_frequency: 100 * alt_count_filtered / total_depth_unfiltered
+//   - alt_indices_variant_allele_frequency: 100 * alt_count_filtered / alt_indices_depth
 void AppendBaseFeatures(
     const DeepVariantCall& candidate,
     const std::vector<int>& alt_allele_indices,
@@ -112,17 +123,11 @@ void AppendBaseFeatures(
   auto ref_reads = GetRefReadInfos(candidate, sample_filter);
   auto alt_reads = GetAltReadInfos(candidate, alt_allele_indices, sample_filter);
 
-  // total_depth includes all alleles (ref + every allele's reads), filtered
-  // by sample if a filter is set.
-  int total_depth = static_cast<int>(ref_reads.size());
+  // Upstream invariant: total_depth is ALWAYS unfiltered (across all
+  // samples + all alleles), even when computing per-sample features.
+  int total_depth = candidate.ref_support_ext().read_infos_size();
   for (const auto& [_, support] : candidate.allele_support_ext()) {
-    if (sample_filter.empty()) {
-      total_depth += support.read_infos_size();
-    } else {
-      for (const auto& r : support.read_infos()) {
-        if (r.sample_name() == sample_filter) ++total_depth;
-      }
-    }
+    total_depth += support.read_infos_size();
   }
 
   const int n_ref = static_cast<int>(ref_reads.size());
@@ -131,8 +136,10 @@ void AppendBaseFeatures(
   features->push_back(n_ref);                  // num_reads_supports_ref
   features->push_back(n_alt);                  // num_reads_supports_alt
   features->push_back(alt_indices_depth);      // alt_indices_depth
-  features->push_back(total_depth);            // total_depth
+  features->push_back(total_depth);            // total_depth (unfiltered!)
+  // VAF: numerator sample-filtered, denominator unfiltered total_depth.
   features->push_back(total_depth > 0 ? (100 * n_alt / total_depth) : 0);
+  // alt_indices_VAF: both numerator and denominator sample-filtered.
   features->push_back(alt_indices_depth > 0
                            ? (100 * n_alt / alt_indices_depth)
                            : 0);
