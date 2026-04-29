@@ -651,6 +651,13 @@ int RunPostprocessVariants(int argc, char** argv) {
     double qual = (err_for_qual >= 1.0) ? 0.0
                                         : std::min(-10.0 * std::log10(err_for_qual),
                                                    static_cast<double>(kMaxPhred));
+    // Mirror upstream's compute_quals: rounded_qual = round(qual, 7)
+    // (postprocess_variants.py:645, _QUAL_PRECISION=7). The VCF writer
+    // then rounds to 1 decimal via set_round_qual_values; this 7-decimal
+    // pre-round normalises sub-ULP drift between us and Docker so the
+    // 1-decimal write boundary doesn't flip QUAL by 0.1 on borderline
+    // values.
+    qual = std::round(qual * 1e7) / 1e7;
 
     // Set up the VariantCall.
     if (variant.calls_size() == 0) variant.add_calls();
@@ -700,27 +707,39 @@ int RunPostprocessVariants(int argc, char** argv) {
     }
     nucleus::SetInfoField("GQ", gq, call);
 
-    // PL = phred-scaled likelihoods for each genotype.
-    std::vector<int> pl(n_gt);
-    int min_pl = kMaxPhred;
+    // GL = log10 likelihood per genotype, capped at log10(1.25e-10)
+    // (mirrors upstream's perror_to_bounded_log10_perror in
+    // genomics_math.py:106). Used both as the PL source and by the
+    // haplotype resolver (`MaybeResolveConflictingVariants`).
+    std::vector<double> gls(n_gt);
+    double max_gl = -std::numeric_limits<double>::infinity();
     for (int i = 0; i < n_gt; ++i) {
-      pl[i] = ProbToPhred(like[i]);
-      min_pl = std::min(min_pl, pl[i]);
+      gls[i] = std::log10(std::max(like[i], 1.25e-10));
+      if (gls[i] > max_gl) max_gl = gls[i];
     }
-    for (int& v : pl) v -= min_pl;
-    nucleus::SetInfoField("PL", pl, call);
-
-    // Also populate VariantCall.genotype_likelihood as log10(p) per
-    // genotype slot. Required for haplotype resolution
-    // (`MaybeResolveConflictingVariants` reads `call.genotype_likelihood`
-    // to compute the joint likelihood across overlapping variants).
-    // Floor at log10(1.25e-10) = -9.0309 to mirror upstream's
-    // perror_to_bounded_log10_perror.
     call->clear_genotype_likelihood();
+    for (double gl : gls) call->add_genotype_likelihood(gl);
+
+    // PL = phred-scaled likelihoods. Mirrors upstream's exact flow in
+    // vcf_conversion.cc:1215-1232:
+    //   1. ZeroShiftLikelihoods: subtract max log10 (zero-shift).
+    //   2. std::transform(..., Log10PErrorToPhred) into vector<int> →
+    //      double→int via implicit narrowing = TRUNCATION (NOT
+    //      std::round; the writer uses `Log10PErrorToPhred` which
+    //      returns double, then `std::transform` to vector<int>).
+    // Operating in LOG-space (subtract max log10 before phred) is
+    // structurally different from the older PHRED-space approach
+    // (compute phred[i], subtract min phred): for non-saturated
+    // probabilities like=[0.6, 0.4] log-space gives PL=[0,1] (correct,
+    // matches Docker), phred-space gave [0,1] too here but in general
+    // diverges by 1 unit at rounding boundaries.
+    std::vector<int> pl(n_gt);
     for (int i = 0; i < n_gt; ++i) {
-      const double p = std::max(like[i], 1.25e-10);
-      call->add_genotype_likelihood(std::log10(p));
+      const double phred = -10.0 * (gls[i] - max_gl);
+      int p = static_cast<int>(phred);  // truncation (matches writer).
+      pl[i] = std::min(std::max(p, 0), kMaxPhred);
     }
+    nucleus::SetInfoField("PL", pl, call);
 
     variant.set_quality(qual);
 
