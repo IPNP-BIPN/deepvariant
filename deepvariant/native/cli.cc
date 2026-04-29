@@ -38,6 +38,38 @@ ABSL_DECLARE_FLAG(int, batch_size);
 ABSL_DECLARE_FLAG(std::string, inference_backend);
 ABSL_DECLARE_FLAG(std::string, checkpoint);
 
+// DeepTrio (Step 1.5) — trio mode flags. When --reads_parent1 is set,
+// run mode dispatches 3× call_variants with the appropriate child/parent
+// model and writes 3 separate VCFs.
+ABSL_DECLARE_FLAG(std::string, reads_parent1);
+ABSL_DECLARE_FLAG(std::string, reads_parent2);
+ABSL_DECLARE_FLAG(std::string, sample_name_parent1);
+ABSL_DECLARE_FLAG(std::string, sample_name_parent2);
+ABSL_DECLARE_FLAG(std::string, examples_child);
+ABSL_DECLARE_FLAG(std::string, examples_parent1);
+ABSL_DECLARE_FLAG(std::string, examples_parent2);
+ABSL_DECLARE_FLAG(std::string, small_model_path_child);
+ABSL_DECLARE_FLAG(std::string, small_model_path_parent);
+ABSL_DECLARE_FLAG(std::string, small_model_cvo_outfile_child);
+ABSL_DECLARE_FLAG(std::string, small_model_cvo_outfile_parent1);
+ABSL_DECLARE_FLAG(std::string, small_model_cvo_outfile_parent2);
+ABSL_FLAG(std::string, checkpoint_child, "",
+          "Trio mode: model checkpoint (.dvw or .mlpackage) for child.");
+ABSL_FLAG(std::string, checkpoint_parent, "",
+          "Trio mode: model checkpoint shared by parent1 and parent2.");
+ABSL_FLAG(std::string, output_vcf_child, "",
+          "Trio mode: output VCF for the child sample.");
+ABSL_FLAG(std::string, output_vcf_parent1, "",
+          "Trio mode: output VCF for parent1.");
+ABSL_FLAG(std::string, output_vcf_parent2, "",
+          "Trio mode: output VCF for parent2.");
+ABSL_FLAG(std::string, output_gvcf_child, "",
+          "Trio mode: output gVCF for the child sample.");
+ABSL_FLAG(std::string, output_gvcf_parent1, "",
+          "Trio mode: output gVCF for parent1.");
+ABSL_FLAG(std::string, output_gvcf_parent2, "",
+          "Trio mode: output gVCF for parent2.");
+
 namespace deepvariant {
 
 namespace {
@@ -70,8 +102,16 @@ std::string ModelPath(const std::string& model_type) {
 
 }  // namespace
 
+// Forward decl: trio dispatch implementation (defined below RunAll).
+int RunAllTrio(int argc, char** argv);
+
 int RunAll(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
+
+  // Trio mode: --reads_parent1 set → dispatch the 3-sample pipeline.
+  if (!absl::GetFlag(FLAGS_reads_parent1).empty()) {
+    return RunAllTrio(argc, argv);
+  }
 
   const std::string model_type = absl::GetFlag(FLAGS_model_type);
   const std::string reads_flag = absl::GetFlag(FLAGS_reads);
@@ -240,6 +280,223 @@ int RunAll(int argc, char** argv) {
   }
 
   LOG(INFO) << "Done. VCF: " << output_vcf_flag;
+  return 0;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Trio dispatch: one make_examples (3 sample streams), 3× call_variants
+// (child + parent1 + parent2 with the appropriate child/parent model),
+// 3× postprocess (one VCF per sample). Mirrors the upstream
+// run_deeptrio.py command sequence at deeptrio-quick-start.md.
+// ──────────────────────────────────────────────────────────────────────
+int RunAllTrio(int argc, char** argv) {
+  // ParseCommandLine is already called by RunAll before dispatch here.
+  const std::string ref_flag = absl::GetFlag(FLAGS_ref);
+  const std::string regions_flag = absl::GetFlag(FLAGS_regions);
+  const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
+  const int num_shards = absl::GetFlag(FLAGS_num_shards);
+  const int n_threads = std::max(1, num_shards);
+
+  const std::string reads_child   = absl::GetFlag(FLAGS_reads);
+  const std::string reads_parent1 = absl::GetFlag(FLAGS_reads_parent1);
+  const std::string reads_parent2 = absl::GetFlag(FLAGS_reads_parent2);
+  if (reads_child.empty() || reads_parent1.empty() || reads_parent2.empty()) {
+    LOG(ERROR) << "Trio: requires --reads (child), --reads_parent1, --reads_parent2";
+    return 1;
+  }
+
+  const std::string out_child   = absl::GetFlag(FLAGS_output_vcf_child);
+  const std::string out_parent1 = absl::GetFlag(FLAGS_output_vcf_parent1);
+  const std::string out_parent2 = absl::GetFlag(FLAGS_output_vcf_parent2);
+  if (out_child.empty() || out_parent1.empty() || out_parent2.empty()) {
+    LOG(ERROR) << "Trio: requires --output_vcf_child, --output_vcf_parent1, "
+                  "--output_vcf_parent2";
+    return 1;
+  }
+
+  // Resolve per-role model checkpoints. Allow either explicit
+  // --checkpoint_child / --checkpoint_parent OR fall back to legacy
+  // --checkpoint (used for both — useful for smoke tests with one model).
+  std::string ckpt_child  = absl::GetFlag(FLAGS_checkpoint_child);
+  std::string ckpt_parent = absl::GetFlag(FLAGS_checkpoint_parent);
+  if (ckpt_child.empty())  ckpt_child  = absl::GetFlag(FLAGS_checkpoint);
+  if (ckpt_parent.empty()) ckpt_parent = absl::GetFlag(FLAGS_checkpoint);
+  if (ckpt_child.empty() || ckpt_parent.empty()) {
+    LOG(ERROR) << "Trio: requires --checkpoint_child + --checkpoint_parent "
+                  "(or --checkpoint as a shared fallback)";
+    return 1;
+  }
+  const std::string sm_child  = absl::GetFlag(FLAGS_small_model_path_child);
+  const std::string sm_parent = absl::GetFlag(FLAGS_small_model_path_parent);
+
+  const std::string inference_backend =
+      absl::GetFlag(FLAGS_inference_backend);
+
+  // Per-sample intermediate paths.
+  struct PerSamplePaths {
+    std::string role;
+    std::string examples_pattern;
+    std::string small_cvo_pattern;
+    std::string cvo_path;
+    std::string merged_cvo_path;
+    std::string sm_path;        // small_model weights dir (or empty)
+    std::string ckpt_path;      // big-model checkpoint
+    std::string output_vcf;
+    std::string output_gvcf;
+  };
+  std::array<PerSamplePaths, 3> P;
+  P[0].role = "child";
+  P[1].role = "parent1";
+  P[2].role = "parent2";
+  for (auto& p : P) {
+    p.examples_pattern  = absl::StrCat(tmp_dir, "/examples_", p.role,
+                                        ".tfrecord");
+    if (n_threads > 1) {
+      p.examples_pattern = absl::StrCat(p.examples_pattern, "@", n_threads);
+    }
+    p.small_cvo_pattern = absl::StrCat(tmp_dir, "/small_cvo_", p.role,
+                                        ".tfrecord");
+    if (n_threads > 1) {
+      p.small_cvo_pattern =
+          absl::StrCat(p.small_cvo_pattern, "@", n_threads);
+    }
+    p.cvo_path        = absl::StrCat(tmp_dir, "/cvo_", p.role, ".tfrecord");
+    p.merged_cvo_path =
+        absl::StrCat(tmp_dir, "/merged_cvo_", p.role, ".tfrecord");
+  }
+  P[0].sm_path = sm_child;   P[0].ckpt_path = ckpt_child;
+  P[1].sm_path = sm_parent;  P[1].ckpt_path = ckpt_parent;
+  P[2].sm_path = sm_parent;  P[2].ckpt_path = ckpt_parent;
+  P[0].output_vcf = out_child;   P[0].output_gvcf = absl::GetFlag(FLAGS_output_gvcf_child);
+  P[1].output_vcf = out_parent1; P[1].output_gvcf = absl::GetFlag(FLAGS_output_gvcf_parent1);
+  P[2].output_vcf = out_parent2; P[2].output_gvcf = absl::GetFlag(FLAGS_output_gvcf_parent2);
+
+  // ── Stage 1: ONE make_examples invocation produces 3 example streams.
+  LOG(INFO) << "Trio Stage 1: make_examples (3-sample, --threads=" << n_threads
+            << ")";
+  {
+    std::vector<std::string> me_args = {
+        absl::StrCat("--reads=", reads_child),
+        absl::StrCat("--reads_parent1=", reads_parent1),
+        absl::StrCat("--reads_parent2=", reads_parent2),
+        absl::StrCat("--ref=", ref_flag),
+        absl::StrCat("--examples_child=",   P[0].examples_pattern),
+        absl::StrCat("--examples_parent1=", P[1].examples_pattern),
+        absl::StrCat("--examples_parent2=", P[2].examples_pattern),
+        absl::StrCat("--threads=", n_threads),
+        "--task_id=0",
+        "--num_shards=1",
+        // Realigner not yet wired for trio (Step 1.3-bis); leave off.
+        "--realigner_enabled=false",
+    };
+    if (!regions_flag.empty()) {
+      me_args.push_back(absl::StrCat("--regions=", regions_flag));
+    }
+    if (!absl::GetFlag(FLAGS_sample_name_parent1).empty()) {
+      me_args.push_back(absl::StrCat("--sample_name_parent1=",
+                                      absl::GetFlag(FLAGS_sample_name_parent1)));
+    }
+    if (!absl::GetFlag(FLAGS_sample_name_parent2).empty()) {
+      me_args.push_back(absl::StrCat("--sample_name_parent2=",
+                                      absl::GetFlag(FLAGS_sample_name_parent2)));
+    }
+    if (!sm_child.empty()) {
+      me_args.push_back(absl::StrCat("--small_model_path_child=", sm_child));
+      me_args.push_back(absl::StrCat("--small_model_cvo_outfile_child=",
+                                      P[0].small_cvo_pattern));
+    }
+    if (!sm_parent.empty()) {
+      me_args.push_back(absl::StrCat("--small_model_path_parent=", sm_parent));
+      me_args.push_back(absl::StrCat("--small_model_cvo_outfile_parent1=",
+                                      P[1].small_cvo_pattern));
+      me_args.push_back(absl::StrCat("--small_model_cvo_outfile_parent2=",
+                                      P[2].small_cvo_pattern));
+    }
+    auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
+    int n = static_cast<int>(argv_me.size()) - 1;
+    if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
+      LOG(ERROR) << "Trio: make_examples failed";
+      return rc;
+    }
+  }
+
+  // ── Stage 2-3 per sample: call_variants → merge → postprocess.
+  for (auto& p : P) {
+    LOG(INFO) << "Trio Stage 2 (" << p.role << "): call_variants";
+    {
+      std::vector<std::string> cv_args = {
+          absl::StrCat("--examples=", p.examples_pattern),
+          absl::StrCat("--outfile=", p.cvo_path),
+          absl::StrCat("--checkpoint=", p.ckpt_path),
+          absl::StrCat("--batch_size=", absl::GetFlag(FLAGS_batch_size)),
+          absl::StrCat("--inference_backend=", inference_backend),
+      };
+      auto argv_cv = MakeArgv("deepvariant_call_variants", cv_args);
+      int n = static_cast<int>(argv_cv.size()) - 1;
+      if (int rc = RunCallVariants(n, argv_cv.data()); rc != 0) {
+        LOG(ERROR) << "Trio: call_variants failed for " << p.role;
+        return rc;
+      }
+    }
+
+    // Stage 2.5: merge small_cvo + big cvo (per sample).
+    std::string postprocess_input = p.cvo_path;
+    if (!p.sm_path.empty()) {
+      LOG(INFO) << "Trio Stage 2.5 (" << p.role << "): merge → "
+                << p.merged_cvo_path;
+      std::ofstream out(p.merged_cvo_path,
+                         std::ios::binary | std::ios::trunc);
+      if (!out) {
+        LOG(ERROR) << "Cannot open merged CVO: " << p.merged_cvo_path;
+        return 1;
+      }
+      auto append_path = [&](const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (in) out << in.rdbuf();
+      };
+      auto at = p.small_cvo_pattern.find('@');
+      if (at == std::string::npos) {
+        append_path(p.small_cvo_pattern);
+      } else {
+        const std::string prefix = p.small_cvo_pattern.substr(0, at);
+        int nshard = 0;
+        if (!absl::SimpleAtoi(p.small_cvo_pattern.substr(at + 1), &nshard) ||
+            nshard <= 0) {
+          LOG(ERROR) << "Bad small_cvo shard spec: " << p.small_cvo_pattern;
+          return 1;
+        }
+        for (int i = 0; i < nshard; ++i) {
+          append_path(absl::StrCat(prefix, "-",
+                                    absl::Dec(i, absl::kZeroPad5),
+                                    "-of-",
+                                    absl::Dec(nshard, absl::kZeroPad5)));
+        }
+      }
+      append_path(p.cvo_path);
+      out.close();
+      postprocess_input = p.merged_cvo_path;
+    }
+
+    LOG(INFO) << "Trio Stage 3 (" << p.role << "): postprocess_variants";
+    std::vector<std::string> pp_args = {
+        absl::StrCat("--infile=", postprocess_input),
+        absl::StrCat("--ref=", ref_flag),
+        absl::StrCat("--output_vcf_outfile=", p.output_vcf),
+    };
+    if (!p.output_gvcf.empty()) {
+      pp_args.push_back(absl::StrCat("--gvcf_outfile=", p.output_gvcf));
+    }
+    auto argv_pp = MakeArgv("deepvariant_postprocess", pp_args);
+    int n = static_cast<int>(argv_pp.size()) - 1;
+    if (int rc = RunPostprocessVariants(n, argv_pp.data()); rc != 0) {
+      LOG(ERROR) << "Trio: postprocess failed for " << p.role;
+      return rc;
+    }
+    LOG(INFO) << "Trio: " << p.role << " VCF: " << p.output_vcf;
+  }
+
+  LOG(INFO) << "Trio: done. 3 VCFs at " << out_child << ", " << out_parent1
+            << ", " << out_parent2;
   return 0;
 }
 
