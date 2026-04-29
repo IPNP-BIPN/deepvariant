@@ -297,6 +297,14 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
       // — we bake that here so multi_sample::VariantCaller can identify
       // the target sample from its own VC opts.
       s->mutable_variant_caller_options()->set_sample_name(name);
+      // Trio default override (mirrors deeptrio/make_examples.py:208):
+      //   FLAGS.set_default('vsc_min_fraction_multiplier', 0.67)
+      // Used by multi_sample::VariantCaller::IsGoodAltAlleleWithReason
+      // when re-evaluating combined-sample evidence (apply_trio_coefficient=
+      // true). Lowers the joint-promotion threshold from 0.12 to 0.0804
+      // so candidates supported by < 12 % in the target sample but
+      // ≥ 8 % combined evidence get promoted (matches Docker's default).
+      s->mutable_variant_caller_options()->set_min_fraction_multiplier(0.67f);
       for (int o : order) s->add_order(o);
       s->set_skip_output_generation(skip_output);
       if (!small_path.empty()) s->set_small_model_path(small_path);
