@@ -313,10 +313,12 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
 
     const bool skip_parents = absl::GetFlag(FLAGS_skip_parent_calling);
 
-    // Order in `samples_in_order`: [parent1, child, parent2].
+    // Order in `samples_in_order`: [parent1(0), child(1), parent2(2)].
     // Each sample's `order` controls the channel-stack permutation when
-    // building its OWN pileup image (so the target sample sits at slot 1
-    // in its own image; parent2 swaps the two parents).
+    // building its OWN pileup image: the target sample is placed FIRST
+    // (slot 0) in its own image so the model always finds its target
+    // sample at a fixed position. parent2 additionally swaps parent1↔2
+    // vs child so the "other parent" is consistent at slot 2.
     add_sample("parent1", p1_name.empty() ? "parent1" : p1_name,
                parent1_reads, parent_h, ds_parents,
                {0, 1, 2}, skip_parents,
@@ -900,8 +902,15 @@ int RunMakeExamples(int argc, char** argv) {
                   C.small_model->Predict(features.data(), 1, probs);
               bool accept = false;
               if (pred_ok) {
-                const float max_p =
-                    std::max({probs[0], probs[1], probs[2]});
+                // Mirror upstream's _MAX_CONFIDENCE = 1 - 1e-7 clamp
+                // (inference.py:46). When our BNNS-CPU saturates to exactly
+                // 1.0 in FP32, ProbToPhred(1.0 - 1.0) = ProbToPhred(0) = 0
+                // → GQ=0 → reject, while Docker's Eigen gives p < 1.0 →
+                // GQ ≥ threshold → accept. Clamp to 1-1e-7 so saturated
+                // p=1.0 maps to GQ=70 (same decision as Docker).
+                const float max_p = std::min(
+                    std::max({probs[0], probs[1], probs[2]}),
+                    1.0f - 1e-7f);
                 const int gq = ProbToPhred(1.0 - max_p);
                 const int threshold = IsSnpForIndices(c.variant(), idx_set)
                                         ? snp_gq_threshold
@@ -1238,7 +1247,10 @@ int RunMakeExamples(int argc, char** argv) {
           bool pred_ok = small_model->Predict(features.data(), 1, probs);
           bool accept = false;
           if (pred_ok) {
-            const float max_p = std::max({probs[0], probs[1], probs[2]});
+            // Mirror upstream _MAX_CONFIDENCE clamp (see trio path comment).
+            const float max_p = std::min(
+                std::max({probs[0], probs[1], probs[2]}),
+                1.0f - 1e-7f);
             const int gq = ProbToPhred(1.0 - max_p);
             const int threshold = IsSnpForIndices(c.variant(), idx_set)
                                     ? snp_gq_threshold
