@@ -102,6 +102,35 @@ Sub-phases (per the master plan):
 - **5.5d status (chr20, FINAL — 2026-04-29).** End-to-end with all ten fixes: **210390/210390 site-set parity (100 %), 0 FILTER mismatches, 107113/107113 PASS variants identical**. Wall-time 3:13 m:s on M4 Max with 14 threads. **204419/210390 = 97.16 % records byte-identical to Docker** (up from 88.3 % at 5.5d/9). Remaining 5971 record-level diffs: 4877 QUAL ±0.1 only (FP drift in `1-sum_alt` straddles the 0.05 boundary at the 1-decimal write); 756 MID `small_model` vs `deepvariant` only (small_model dispatch GQ ≈ 20 boundary, FP-drift in max_p flips threshold side); 80 PL only (residual FP drift in like[] vector); 161 QUAL+GQ; 65 GQ only; 29 VAF only (htslib float-to-text rounding at 6th decimal); ~30 mixed. All residuals are FP-drift in big_model softmax (Inception-v3 GPU MPSGraph FP32 vs Docker TF/Keras Eigen-x86 FP32) — explicit non-goal per plan, "fundamentally unachievable on Apple GPU due to FP32 non-associativity in any parallel reduction". **Zero records differ in CHROM/POS/REF/ALT, FILTER, or GT** — every user-facing genomic conclusion matches Docker on chr20.
 - **5.5e — extension to all variants.** Pending.
 
+## Phase 6 — DeepTrio + DeepSomatic + Pangenome-aware DV (in progress)
+
+**Hard release gate (set 2026-04-29, applies to all three tools):** reproduce Docker's per-tool VCF output bit-for-bit on a chr20 fixture. Same gate as WGS chr20 already passes:
+
+- 100 % site-set parity (`bcftools isec` shows `only_ours = only_docker = 0`)
+- 0 FILTER-class mismatches on shared sites
+- Identical PASS variant set (same count, same positions)
+- Identical GT on every shared site
+
+PL/QUAL/MID byte-level drift from FP32 non-associativity remains the explicit non-goal (carry-over from Phase 5.5d). FILTER classification, GT, and the variant set itself MUST be byte-identical to Docker, replicating the WGS guarantee for every tool.
+
+### Step 1 — DeepTrio (in progress)
+
+- **1.1+1.2** ✅ trio flags + 3-sample SampleOptions builder mirroring `deeptrio/make_examples.py:trio_samples_from_flags`. Per-sample `order` permutations: child/parent1=`[0,1,2]`, parent2=`[2,1,0]`. Default heights 60/40/40 (`DEEP_TRIO_WGS_PILEUP_HEIGHT_*`).
+- **1.3** ✅ `multi_sample::VariantCaller::CallsFromAlleleCounts(map, target, role)` integration in run_trio_worker.
+- **1.5** ✅ `cli.cc` trio dispatch — 3× call_variants chaining + 3 per-sample VCFs + per-role checkpoint paths (`--checkpoint_child / _parent`).
+- **1.6** ✅ DeepTrio WGS .dvw bundles extracted (`validation/work/deeptrio.wgs_{child,parent}.dvw`, 87.27 MB each).
+- **1.3-bis** ✅ per-sample realigner wired (mirrors upstream's `realign_reads_per_sample_multisample`). Closes only_docker gap (~31 → ~12 per sample on chr20:10M-10.1M).
+- **M1** Docker reference captured at `tools/reference/output/deeptrio/{HG002,HG003,HG004}.output.vcf.gz` for the chr20:10M-10.1M quick-start fixture.
+- **1.7** ⏳ FILTER-parity gate: end-to-end runs in ~14 s on M4 Max producing 3 VCFs. Current status (with realigner): shared 360/357/329 (HG002/HG003/HG004), only_ours 1634/1788/1599, only_docker 12/11/10, PASS 198/181/170 (vs Docker 262/265/222). Remaining gap = ~1500 only_ours per sample (mostly low-GQ RefCalls from realigner-induced phantom alleles). Iterative root-cause loop (5.5d-style) ongoing.
+
+### Step 2 — DeepSomatic (pending)
+
+Same multi-sample plumbing as trio (2 samples instead of 3); 12 .mlpackage already extracted; same hard gate per operating mode (tumor+normal / tumor-only / FFPE).
+
+### Step 3 — Pangenome-aware DV (pending)
+
+Adds GBZ reader (mmap) on top of multi-sample plumbing; same hard gate vs Docker pangenome run.
+
 ## Pitfalls already known (mine before re-discovering)
 
 - **`tensorflow-metal` is dead** — unmaintained since mid-2024, frozen at TF 2.16, M-series ReLU bugs. Dropped from the v2 bench.
