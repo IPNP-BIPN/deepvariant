@@ -19,10 +19,13 @@ using nucleus::genomics::v1::Variant;
 namespace {
 
 // Pull the reads supporting the chosen alt allele indices into a single
-// flat vector of ReadSupport pointers.
+// flat vector of ReadSupport pointers. If `sample_filter` is non-empty,
+// only reads with matching `sample_name` are retained (mirrors upstream's
+// `_filter_by_sample(read_infos, sample_name)`).
 std::vector<const DeepVariantCall_ReadSupport*> GetAltReadInfos(
     const DeepVariantCall& candidate,
-    const std::vector<int>& alt_allele_indices) {
+    const std::vector<int>& alt_allele_indices,
+    const std::string& sample_filter = "") {
   std::vector<const DeepVariantCall_ReadSupport*> out;
   for (int idx : alt_allele_indices) {
     if (idx < 0 || idx >= candidate.variant().alternate_bases_size()) continue;
@@ -30,8 +33,20 @@ std::vector<const DeepVariantCall_ReadSupport*> GetAltReadInfos(
     auto it = candidate.allele_support_ext().find(alt_bases);
     if (it == candidate.allele_support_ext().end()) continue;
     for (const auto& r : it->second.read_infos()) {
+      if (!sample_filter.empty() && r.sample_name() != sample_filter) continue;
       out.push_back(&r);
     }
+  }
+  return out;
+}
+
+std::vector<const DeepVariantCall_ReadSupport*> GetRefReadInfos(
+    const DeepVariantCall& candidate,
+    const std::string& sample_filter = "") {
+  std::vector<const DeepVariantCall_ReadSupport*> out;
+  for (const auto& r : candidate.ref_support_ext().read_infos()) {
+    if (!sample_filter.empty() && r.sample_name() != sample_filter) continue;
+    out.push_back(&r);
   }
   return out;
 }
@@ -85,6 +100,50 @@ bool IsDeletion(const Variant& v, const std::set<std::string>& exclude) {
   return any;
 }
 
+// Append 12 BaseFeatures for a particular sample-filter slice of the
+// candidate's reads to `features`. Mirrors upstream's
+// `FeatureEncoder.encode_base_feature` invoked over the BaseFeature
+// enum in declaration order.
+void AppendBaseFeatures(
+    const DeepVariantCall& candidate,
+    const std::vector<int>& alt_allele_indices,
+    const std::string& sample_filter,
+    std::vector<float>* features) {
+  auto ref_reads = GetRefReadInfos(candidate, sample_filter);
+  auto alt_reads = GetAltReadInfos(candidate, alt_allele_indices, sample_filter);
+
+  // total_depth includes all alleles (ref + every allele's reads), filtered
+  // by sample if a filter is set.
+  int total_depth = static_cast<int>(ref_reads.size());
+  for (const auto& [_, support] : candidate.allele_support_ext()) {
+    if (sample_filter.empty()) {
+      total_depth += support.read_infos_size();
+    } else {
+      for (const auto& r : support.read_infos()) {
+        if (r.sample_name() == sample_filter) ++total_depth;
+      }
+    }
+  }
+
+  const int n_ref = static_cast<int>(ref_reads.size());
+  const int n_alt = static_cast<int>(alt_reads.size());
+  const int alt_indices_depth = n_ref + n_alt;
+  features->push_back(n_ref);                  // num_reads_supports_ref
+  features->push_back(n_alt);                  // num_reads_supports_alt
+  features->push_back(alt_indices_depth);      // alt_indices_depth
+  features->push_back(total_depth);            // total_depth
+  features->push_back(total_depth > 0 ? (100 * n_alt / total_depth) : 0);
+  features->push_back(alt_indices_depth > 0
+                           ? (100 * n_alt / alt_indices_depth)
+                           : 0);
+  features->push_back(MeanInt(ref_reads, GetMQ));
+  features->push_back(MeanInt(alt_reads, GetMQ));
+  features->push_back(MeanInt(ref_reads, GetBQ));
+  features->push_back(MeanInt(alt_reads, GetBQ));
+  features->push_back(MeanInt(ref_reads, GetReverseStrand100));
+  features->push_back(MeanInt(alt_reads, GetReverseStrand100));
+}
+
 }  // namespace
 
 std::vector<float> EncodeSmallModelFeatures(
@@ -103,39 +162,9 @@ std::vector<float> EncodeSmallModelFeatures(
     }
   }
 
-  // Read sets.
-  std::vector<const DeepVariantCall_ReadSupport*> ref_reads;
-  for (const auto& r : candidate.ref_support_ext().read_infos()) {
-    ref_reads.push_back(&r);
-  }
-  auto alt_reads = GetAltReadInfos(candidate, alt_allele_indices);
-
-  // Compute total depth across all alleles (ref + every allele's alt reads).
-  int total_depth = static_cast<int>(ref_reads.size());
-  for (const auto& [_, support] : candidate.allele_support_ext()) {
-    total_depth += support.read_infos_size();
-  }
-
-  // ── BaseFeatures (12) ─────────────────────────────────────────────────────
-  const int n_ref = static_cast<int>(ref_reads.size());
-  const int n_alt = static_cast<int>(alt_reads.size());
-  const int alt_indices_depth = n_ref + n_alt;
-  features.push_back(n_ref);                   // num_reads_supports_ref
-  features.push_back(n_alt);                   // num_reads_supports_alt
-  features.push_back(alt_indices_depth);       // alt_indices_depth
-  features.push_back(total_depth);             // total_depth
-  // variant_allele_frequency = 100 * n_alt / total_depth
-  features.push_back(total_depth > 0 ? (100 * n_alt / total_depth) : 0);
-  // alt_indices_variant_allele_frequency = 100 * n_alt / alt_indices_depth
-  features.push_back(alt_indices_depth > 0
-                          ? (100 * n_alt / alt_indices_depth)
-                          : 0);
-  features.push_back(MeanInt(ref_reads, GetMQ));   // ref_mapping_quality
-  features.push_back(MeanInt(alt_reads, GetMQ));   // alt_mapping_quality
-  features.push_back(MeanInt(ref_reads, GetBQ));   // ref_base_quality
-  features.push_back(MeanInt(alt_reads, GetBQ));   // alt_base_quality
-  features.push_back(MeanInt(ref_reads, GetReverseStrand100));  // ref_rev_strand
-  features.push_back(MeanInt(alt_reads, GetReverseStrand100));  // alt_rev_strand
+  // ── BaseFeatures (12) — single sample, no filter ──────────────────────────
+  AppendBaseFeatures(candidate, alt_allele_indices, /*sample_filter=*/"",
+                      &features);
 
   // ── VariantFeatures (7) ───────────────────────────────────────────────────
   const auto& v = candidate.variant();
@@ -164,6 +193,80 @@ std::vector<float> EncodeSmallModelFeatures(
   features.push_back(alt_allele_indices.size() > 1 ? 1 : 0);     // is_multiple_alt_alleles
 
   // ── VAF context (51 features, offsets -25..+25 inclusive) ─────────────────
+  const auto& vaf_at_pos = candidate.allele_frequency_at_position();
+  const int half = kSmallModelVafContextWindow / 2;  // 25
+  for (int o = -half; o <= half; ++o) {
+    const int64_t pos = v.start() + o;
+    auto it = vaf_at_pos.find(static_cast<int>(pos));
+    features.push_back(it != vaf_at_pos.end() ? it->second : 0);
+  }
+
+  return features;
+}
+
+// Multi-sample (trio / somatic) feature encoder. Mirrors upstream's
+// `FeatureEncoder._encode_candidate_feature_dict` insertion order:
+//   1. 12 BaseFeatures (combined / target-only — sample_filter="")
+//   2. 12 BaseFeatures × N samples, in `sample_order` over `sample_names`
+//   3. 7 VariantFeatures
+//   4. 51 VAF context features
+std::vector<float> EncodeSmallModelFeaturesMultiSample(
+    const DeepVariantCall& candidate,
+    const std::vector<int>& alt_allele_indices,
+    const std::vector<std::string>& sample_names,
+    const std::vector<int>& sample_order) {
+  const int n_samples = static_cast<int>(sample_names.size());
+  const int total_features = kSmallModelNumFeatures +
+      kSmallModelBaseFeaturesPerSample * n_samples;
+  std::vector<float> features;
+  features.reserve(total_features);
+
+  // Excluded alternates: those NOT in alt_allele_indices.
+  std::set<std::string> exclude;
+  std::set<int> indices_set(alt_allele_indices.begin(),
+                             alt_allele_indices.end());
+  for (int i = 0; i < candidate.variant().alternate_bases_size(); ++i) {
+    if (!indices_set.count(i)) {
+      exclude.insert(candidate.variant().alternate_bases(i));
+    }
+  }
+
+  // ── BaseFeatures (12) — combined / no sample filter ──────────────────────
+  AppendBaseFeatures(candidate, alt_allele_indices, /*sample_filter=*/"",
+                      &features);
+
+  // ── Per-sample BaseFeatures (12 × N), in sample_order order ──────────────
+  for (int idx : sample_order) {
+    if (idx < 0 || idx >= n_samples) continue;
+    AppendBaseFeatures(candidate, alt_allele_indices,
+                        sample_names[idx], &features);
+  }
+
+  // ── VariantFeatures (7) ──────────────────────────────────────────────────
+  const auto& v = candidate.variant();
+  features.push_back(IsSnp(v, exclude) ? 1 : 0);
+  features.push_back(IsInsertion(v, exclude) ? 1 : 0);
+  features.push_back(IsDeletion(v, exclude) ? 1 : 0);
+  int ins_len = 0;
+  for (int idx : alt_allele_indices) {
+    if (idx < 0 || idx >= v.alternate_bases_size()) continue;
+    int d = static_cast<int>(v.alternate_bases(idx).size()) -
+            static_cast<int>(v.reference_bases().size());
+    ins_len = std::max(ins_len, d);
+  }
+  features.push_back(std::max(0, ins_len));
+  int del_len = 0;
+  for (int idx : alt_allele_indices) {
+    if (idx < 0 || idx >= v.alternate_bases_size()) continue;
+    int d = static_cast<int>(v.reference_bases().size()) -
+            static_cast<int>(v.alternate_bases(idx).size());
+    del_len = std::max(del_len, d);
+  }
+  features.push_back(std::max(0, del_len));
+  features.push_back(v.alternate_bases_size() > 1 ? 1 : 0);
+  features.push_back(alt_allele_indices.size() > 1 ? 1 : 0);
+
+  // ── VAF context (51) ─────────────────────────────────────────────────────
   const auto& vaf_at_pos = candidate.allele_frequency_at_position();
   const int half = kSmallModelVafContextWindow / 2;  // 25
   for (int o = -half; o <= half; ++o) {
