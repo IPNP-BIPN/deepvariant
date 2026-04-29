@@ -10,6 +10,7 @@
 #include "deepvariant/native/make_examples_main.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -450,8 +451,21 @@ int RunMakeExamples(int argc, char** argv) {
   const std::string ref_path = absl::GetFlag(FLAGS_ref);
   const std::string examples_path = absl::GetFlag(FLAGS_examples);
 
-  if (reads_path.empty() || ref_path.empty() || examples_path.empty()) {
-    LOG(ERROR) << "Required: --reads, --ref, --examples";
+  if (reads_path.empty() || ref_path.empty()) {
+    LOG(ERROR) << "Required: --reads, --ref";
+    return 1;
+  }
+  // Trio mode: at least one of --examples / --examples_child must be set.
+  // Parents are optional (skip_parent_calling), but child is mandatory.
+  if (IsTrioMode()) {
+    const std::string ex_child = absl::GetFlag(FLAGS_examples_child);
+    if (examples_path.empty() && ex_child.empty()) {
+      LOG(ERROR)
+          << "Trio mode requires --examples_child (or --examples as alias).";
+      return 1;
+    }
+  } else if (examples_path.empty()) {
+    LOG(ERROR) << "Required: --examples";
     return 1;
   }
 
@@ -558,11 +572,368 @@ int RunMakeExamples(int argc, char** argv) {
     return n_threads == 1 ? small_cvo_path : ShardName(small_cvo_spec, t);
   };
 
+  // ──────────────────────────────────────────────────────────────────
+  // Trio worker — mirrors deeptrio/make_examples.py's per-region loop.
+  // Opens 3 SamReaders, builds 3 AlleleCounters per region, runs
+  // multi_sample::VariantCaller once per target sample, generates
+  // examples with the target's `order` permutation, and writes per-
+  // sample small_cvo + examples streams. The single-sample path
+  // below is unchanged (preserves the WGS chr20 100% FILTER parity
+  // gate already achieved at 5.5d/10).
+  // ──────────────────────────────────────────────────────────────────
+  auto run_trio_worker = [&](int tid, WorkerStats* out_stats) {
+    auto t_ref_or = nucleus::IndexedFastaReader::FromFile(
+        ref_path, absl::StrCat(ref_path, ".fai"));
+    CHECK(t_ref_or.ok()) << "thread " << tid << ": ref reopen failed";
+    auto ref_reader = std::move(t_ref_or.ValueOrDie());
+
+    // Per-role context. Index 0=parent1, 1=child, 2=parent2 (mirrors
+    // upstream samples_in_order at deeptrio/make_examples.py:318).
+    struct SampleCtx {
+      std::string role;
+      std::string name;
+      std::vector<int> order;          // pileup channel-stack permutation
+      int pileup_height = 100;
+      bool skip_output = false;
+      std::unique_ptr<nucleus::SamReader> sam_reader;
+      std::unique_ptr<SmallModel> small_model;
+      std::unique_ptr<TFRecordWriter> small_cvo_writer;
+      std::string examples_path;
+      // Per-target call_variants_outputs counters reported back as stats.
+      int64_t total_candidates = 0;
+      int64_t total_examples = 0;
+      int64_t total_small_hits = 0;
+      int64_t total_big_dispatched = 0;
+    };
+    std::array<SampleCtx, 3> ctx;
+    for (int s = 0; s < 3; ++s) {
+      const auto& so = opts.sample_options(s);
+      ctx[s].role = so.role();
+      ctx[s].name = so.name();
+      ctx[s].pileup_height = so.pileup_height();
+      ctx[s].skip_output = so.skip_output_generation();
+      for (int o : so.order()) ctx[s].order.push_back(o);
+      // Open BAM (only if reads_filenames is set; pangenome's pangenome-
+      // sample has no BAM, but trio always has all 3).
+      if (so.reads_filenames_size() > 0) {
+        auto sr_or = nucleus::SamReader::FromFile(so.reads_filenames(0),
+                                                    sam_opts);
+        CHECK(sr_or.ok()) << "thread " << tid << " " << ctx[s].role
+                           << ": BAM reopen failed: " << so.reads_filenames(0);
+        ctx[s].sam_reader = std::move(sr_or.ValueOrDie());
+      }
+    }
+
+    // Per-target small_model + small_cvo writer + examples path.
+    // Trio convention: child uses --small_model_path_child; parent1/2
+    // share --small_model_path_parent. Per-sample examples paths come
+    // from --examples_{child,parent1,parent2} (or fall back to
+    // --examples for child for backward compat).
+    auto trio_examples_path = [&](const std::string& role) -> std::string {
+      std::string base;
+      if (role == "child")
+        base = absl::GetFlag(FLAGS_examples_child).empty()
+                   ? examples_path
+                   : absl::GetFlag(FLAGS_examples_child);
+      else if (role == "parent1")
+        base = absl::GetFlag(FLAGS_examples_parent1);
+      else  // parent2
+        base = absl::GetFlag(FLAGS_examples_parent2);
+      if (base.empty()) return "";
+      return n_threads == 1 ? base : ShardName(base, tid);
+    };
+    auto trio_small_cvo_path = [&](const std::string& role) -> std::string {
+      std::string base;
+      if (role == "child")
+        base = absl::GetFlag(FLAGS_small_model_cvo_outfile_child);
+      else if (role == "parent1")
+        base = absl::GetFlag(FLAGS_small_model_cvo_outfile_parent1);
+      else
+        base = absl::GetFlag(FLAGS_small_model_cvo_outfile_parent2);
+      if (base.empty()) return "";
+      return n_threads == 1 ? base : ShardName(base, tid);
+    };
+
+    const std::string sm_child  = absl::GetFlag(FLAGS_small_model_path_child);
+    const std::string sm_parent = absl::GetFlag(FLAGS_small_model_path_parent);
+
+    std::unordered_map<std::string, std::string> example_filenames;
+    for (auto& c : ctx) {
+      c.examples_path = trio_examples_path(c.role);
+      if (!c.skip_output && !c.examples_path.empty()) {
+        example_filenames[c.role] = c.examples_path;
+      }
+      // Small-model load — child or parent share-of-two depending on role.
+      const std::string& sm_path = (c.role == "child") ? sm_child : sm_parent;
+      if (!sm_path.empty() && !c.skip_output) {
+        c.small_model = SmallModel::Load(sm_path);
+        CHECK(c.small_model) << "thread " << tid << " " << c.role
+                              << ": small_model load failed: " << sm_path;
+        const std::string scp = trio_small_cvo_path(c.role);
+        if (!scp.empty()) {
+          c.small_cvo_writer = TFRecordWriter::New(scp);
+          CHECK(c.small_cvo_writer)
+              << "thread " << tid << " " << c.role
+              << ": small CVO writer open failed: " << scp;
+        }
+      }
+    }
+
+    multi_sample::VariantCaller caller(
+        opts.sample_options(opts.main_sample_index()).variant_caller_options());
+
+    ExamplesGenerator generator(opts, example_filenames);
+
+    while (true) {
+      const size_t i = next_region.fetch_add(1, std::memory_order_relaxed);
+      if (i >= shard_regions.size()) break;
+      const auto& region = shard_regions[i];
+      LOG(INFO) << "Trio region: " << region.reference_name() << ":"
+                << region.start() << "-" << region.end();
+
+      // Per-sample: query reads, reservoir-sample, store working_reads
+      // alongside each ctx. (Realigner is intentionally NOT yet wired
+      // for trio — upstream's joint_realignment / per_sample_realignment
+      // is a Step-1.3-bis follow-up. For chr20 quick-start fixtures most
+      // candidates come from straightforward pileups so realigner-off
+      // gives us the first stage-by-stage diff baseline. WGS path keeps
+      // realigner enabled.)
+      std::array<std::vector<nucleus::genomics::v1::Read>, 3> reads_per_sample_v;
+      const int max_rpp = static_cast<int>(opts.max_reads_per_partition());
+      for (int s = 0; s < 3; ++s) {
+        if (!ctx[s].sam_reader) continue;
+        auto reads_or = ctx[s].sam_reader->Query(region);
+        if (!reads_or.ok()) {
+          LOG(WARNING) << "Query failed for " << ctx[s].role << " "
+                       << region.reference_name() << ":" << region.start()
+                       << "-" << region.end() << " — " << reads_or.status();
+          continue;
+        }
+        auto& reads_iter = reads_or.ValueOrDie();
+        std::vector<nucleus::genomics::v1::Read>& reads =
+            reads_per_sample_v[s];
+        nucleus::genomics::v1::Read tmp_read;
+        while (true) {
+          auto next = reads_iter->Next(&tmp_read);
+          if (!next.ok() || !next.ValueOrDie()) break;
+          reads.push_back(tmp_read);
+        }
+        reads_iter->Release().IgnoreError();
+        if (max_rpp > 0 && reads.size() > static_cast<size_t>(max_rpp)) {
+          ::deepvariant::npr::NumpyMt19937 region_rng(opts.random_seed());
+          auto sampled = ::deepvariant::npr::ReservoirSamplePtrs(
+              reads, max_rpp, region_rng);
+          std::vector<nucleus::genomics::v1::Read> kept;
+          kept.reserve(sampled.size());
+          for (const auto* p : sampled) kept.push_back(*p);
+          reads = std::move(kept);
+        }
+      }
+
+      // Build 3 AlleleCounters keyed by sample_name. Two-pass: probe
+      // (no candidate positions) → collect candidate positions → re-
+      // build with candidate_positions for ref-read tracking. Same
+      // as single-sample path; here we two-pass per sample.
+      std::array<std::unique_ptr<AlleleCounter>, 3> counters;
+      // First pass: probe per sample.
+      std::vector<int> all_candidate_positions;
+      for (int s = 0; s < 3; ++s) {
+        if (!ctx[s].sam_reader) continue;
+        AlleleCounter probe(ref_reader.get(), region, /*positions=*/{},
+                            opts.allele_counter_options());
+        for (const auto& r : reads_per_sample_v[s]) {
+          probe.Add(r, ctx[s].name);
+        }
+        // Collect probe candidate positions across all samples — the
+        // multi_sample::VariantCaller will join across samples; we
+        // give every counter the union of candidate positions so
+        // ref-read tracking works for joint candidates from another
+        // sample's evidence.
+        // (Mirror of upstream make_examples_core.py:_make_allele_counter_for_region
+        // which uses the joint candidate set for all samples.)
+        // Rough approximation: get probe candidates positions; we'll
+        // union after the loop.
+        // Simpler: rebuild every counter with same merged positions.
+      }
+      // Simpler approach (chr20 quick-start fixture): probe → union of
+      // candidate positions → rebuild each AlleleCounter with the
+      // unioned positions. Matches upstream's "positions known up-front"
+      // pattern.
+      for (int s = 0; s < 3; ++s) {
+        if (!ctx[s].sam_reader) continue;
+        AlleleCounter probe(ref_reader.get(), region, /*positions=*/{},
+                            opts.allele_counter_options());
+        for (const auto& r : reads_per_sample_v[s]) {
+          probe.Add(r, ctx[s].name);
+        }
+        // No public position-extractor on AlleleCounter; iterate Counts().
+        for (const auto& ac : probe.Counts()) {
+          if (!ac.read_alleles().empty()) {
+            all_candidate_positions.push_back(
+                static_cast<int>(ac.position().position()));
+          }
+        }
+      }
+      std::sort(all_candidate_positions.begin(),
+                all_candidate_positions.end());
+      all_candidate_positions.erase(
+          std::unique(all_candidate_positions.begin(),
+                      all_candidate_positions.end()),
+          all_candidate_positions.end());
+
+      for (int s = 0; s < 3; ++s) {
+        if (!ctx[s].sam_reader) continue;
+        counters[s] = std::make_unique<AlleleCounter>(
+            ref_reader.get(), region, all_candidate_positions,
+            opts.allele_counter_options());
+        for (const auto& r : reads_per_sample_v[s]) {
+          counters[s]->Add(r, ctx[s].name);
+        }
+      }
+
+      // Build the unordered_map<sample_name, AlleleCounter*> map for
+      // multi_sample::VariantCaller.
+      std::unordered_map<std::string, AlleleCounter*> ac_map;
+      for (int s = 0; s < 3; ++s) {
+        if (counters[s]) ac_map[ctx[s].name] = counters[s].get();
+      }
+
+      // For each target sample (child, parent1, parent2): generate
+      // candidates with the multi-sample API, run small_model dispatch,
+      // emit examples + CVOs. Skip parents when --skip_parent_calling.
+      for (int s = 0; s < 3; ++s) {
+        SampleCtx& C = ctx[s];
+        if (C.skip_output) continue;
+
+        std::vector<DeepVariantCall> candidates =
+            caller.CallsFromAlleleCounts(ac_map, C.name, C.role);
+        if (candidates.empty()) continue;
+        C.total_candidates += candidates.size();
+
+        // VAF context — uses the target sample's AlleleCounts.
+        if (C.small_model && counters[s]) {
+          const auto& allele_counts = counters[s]->Counts();
+          for (auto& c : candidates) PopulateVafContext(&c, allele_counts);
+        }
+
+        // Small-model dispatch (per alt-set), same as single-sample path.
+        std::vector<DeepVariantCall> big_candidates;
+        if (C.small_model) {
+          for (auto& c : candidates) {
+            const int n_alts = c.variant().alternate_bases_size();
+            std::vector<std::vector<int>> alt_idx_sets;
+            for (int i = 0; i < n_alts; ++i) alt_idx_sets.push_back({i});
+            for (int i = 0; i < n_alts; ++i)
+              for (int j = i + 1; j < n_alts; ++j)
+                alt_idx_sets.push_back({i, j});
+
+            bool any_failed = false;
+            c.clear_make_examples_alt_allele_indices();
+            for (const auto& idx_set : alt_idx_sets) {
+              const auto features = EncodeSmallModelFeatures(c, idx_set);
+              float probs[3] = {0, 0, 0};
+              bool pred_ok =
+                  C.small_model->Predict(features.data(), 1, probs);
+              bool accept = false;
+              if (pred_ok) {
+                const float max_p =
+                    std::max({probs[0], probs[1], probs[2]});
+                const int gq = ProbToPhred(1.0 - max_p);
+                const int threshold = IsSnpForIndices(c.variant(), idx_set)
+                                        ? snp_gq_threshold
+                                        : indel_gq_threshold;
+                accept = (gq >= threshold);
+              }
+              if (accept) {
+                CallVariantsOutput cvo =
+                    MakeSmallModelCvo(c, idx_set, probs);
+                std::string serialized;
+                cvo.SerializeToString(&serialized);
+                if (C.small_cvo_writer) {
+                  C.small_cvo_writer->WriteRecord(serialized);
+                }
+                ++C.total_small_hits;
+              } else {
+                auto* aai = c.add_make_examples_alt_allele_indices();
+                for (int idx : idx_set) aai->add_indices(idx);
+                any_failed = true;
+              }
+            }
+            if (any_failed) {
+              big_candidates.push_back(c);
+              ++C.total_big_dispatched;
+            }
+          }
+        } else {
+          big_candidates = candidates;
+          C.total_big_dispatched += candidates.size();
+        }
+
+        if (big_candidates.empty()) continue;
+
+        // ExamplesGenerator: 3 sample read vectors in upstream order
+        // [parent1, child, parent2], rendered with this target's order
+        // permutation. C.order tells the generator which slot of the
+        // 3-sample array to put in slot 1 (target), 0, 2.
+        std::vector<nucleus::ConstProtoPtr<DeepVariantCall>> cand_ptrs;
+        cand_ptrs.reserve(big_candidates.size());
+        for (auto& c : big_candidates) {
+          cand_ptrs.push_back(
+              nucleus::ConstProtoPtr<DeepVariantCall>(&c));
+        }
+        std::array<std::vector<nucleus::ConstProtoPtr<
+            nucleus::genomics::v1::Read>>, 3> per_sample_ptrs;
+        for (int q = 0; q < 3; ++q) {
+          per_sample_ptrs[q].reserve(reads_per_sample_v[q].size());
+          for (auto& r : reads_per_sample_v[q]) {
+            per_sample_ptrs[q].push_back(
+                nucleus::ConstProtoPtr<nucleus::genomics::v1::Read>(&r));
+          }
+        }
+        std::vector<std::vector<nucleus::ConstProtoPtr<
+            nucleus::genomics::v1::Read>>> reads_per_sample = {
+                per_sample_ptrs[0], per_sample_ptrs[1], per_sample_ptrs[2]};
+        std::vector<float> mean_coverage = {0.0f, 0.0f, 0.0f};
+        std::vector<int> image_shape;
+
+        auto stats = generator.WriteExamplesInRegion(
+            absl::MakeSpan(cand_ptrs), absl::MakeSpan(reads_per_sample),
+            absl::MakeSpan(C.order), C.role,
+            absl::MakeSpan(mean_coverage), &image_shape);
+        auto n_it = stats.find("n_examples");
+        if (n_it != stats.end()) C.total_examples += n_it->second;
+      }
+    }  // end while next_region
+
+    generator.SignalShardFinished();
+    for (auto& c : ctx) {
+      if (c.small_cvo_writer) c.small_cvo_writer->Close();
+    }
+
+    // Aggregate per-sample stats into the worker totals (sum across
+    // the 3 samples — the postprocess stage will re-bucket them later).
+    int64_t tot_cand = 0, tot_ex = 0, tot_small = 0, tot_big = 0;
+    for (auto& c : ctx) {
+      tot_cand  += c.total_candidates;
+      tot_ex    += c.total_examples;
+      tot_small += c.total_small_hits;
+      tot_big   += c.total_big_dispatched;
+    }
+    out_stats->total_candidates    = tot_cand;
+    out_stats->total_examples      = tot_ex;
+    out_stats->total_small_hits    = tot_small;
+    out_stats->total_big_dispatched = tot_big;
+  };
+
   // Worker function: opens its own SamReader/IndexedFastaReader/
   // ExamplesGenerator/SmallModel, then loops fetching regions from
   // `next_region` until the queue is exhausted. Writes only to its own
   // per-thread files; no inter-thread mutation.
   auto run_worker = [&](int tid, WorkerStats* out_stats) {
+    if (IsTrioMode()) {
+      run_trio_worker(tid, out_stats);
+      return;
+    }
     auto t_ref_or = nucleus::IndexedFastaReader::FromFile(
         ref_path, absl::StrCat(ref_path, ".fai"));
     CHECK(t_ref_or.ok()) << "thread " << tid << ": ref reopen failed";
