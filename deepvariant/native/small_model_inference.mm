@@ -31,7 +31,14 @@ std::unique_ptr<SmallModel> SmallModel::Load(const std::string& path) {
       return nullptr;
     }
     MLModelConfiguration* cfg = [[MLModelConfiguration alloc] init];
-    cfg.computeUnits = MLComputeUnitsAll;
+    // CPU-only FP32 to match Docker's TF/Keras output. With
+    // MLComputeUnitsAll the small_model (70 → 750 → 750 → 3 MLP) tends to
+    // dispatch to ANE which is FP16, producing GQ drift of ~2-3 phred at
+    // borderline sites — enough to flip a small_model RefCall (GQ≥20) into
+    // a deepvariant fall-through (GQ<20 → NoCall after
+    // uncall_homref_gt_if_lowqual). CPUOnly forces deterministic FP32 and
+    // matches the reference path exactly on the chr20 cross-MID flips.
+    cfg.computeUnits = MLComputeUnitsCPUOnly;
     MLModel* model = [MLModel modelWithContentsOfURL:compiled
                                         configuration:cfg
                                                 error:&error];
