@@ -40,6 +40,12 @@ int main(int argc, char** argv) {
               << v.reference_bases();
     for (const auto& a : v.alternate_bases()) std::cout << '\t' << a;
     std::cout << '\t' << argmax;
+    // alt_allele_indices: which alt-subset this CVO scored.
+    std::cout << "\tAAI=";
+    for (int i = 0; i < cvo.alt_allele_indices().indices_size(); ++i) {
+      if (i) std::cout << ',';
+      std::cout << cvo.alt_allele_indices().indices(i);
+    }
     // AD and DP from the first call's info, so we can diff variant_caller
     // output between us and upstream at the candidate-emission layer.
     if (v.calls_size() > 0) {
