@@ -700,15 +700,14 @@ int RunMakeExamples(int argc, char** argv) {
       LOG(INFO) << "Trio region: " << region.reference_name() << ":"
                 << region.start() << "-" << region.end();
 
-      // Per-sample: query reads, reservoir-sample, store working_reads
-      // alongside each ctx. (Realigner is intentionally NOT yet wired
-      // for trio — upstream's joint_realignment / per_sample_realignment
-      // is a Step-1.3-bis follow-up. For chr20 quick-start fixtures most
-      // candidates come from straightforward pileups so realigner-off
-      // gives us the first stage-by-stage diff baseline. WGS path keeps
-      // realigner enabled.)
+      // Per-sample: query reads, reservoir-sample, run realigner per
+      // sample (mirrors upstream's realign_reads_per_sample_multisample
+      // — each sample's reads are re-aligned independently against
+      // assembled haplotypes; trio joint_realignment is a future
+      // optimization but per-sample matches Docker's default).
       std::array<std::vector<nucleus::genomics::v1::Read>, 3> reads_per_sample_v;
       const int max_rpp = static_cast<int>(opts.max_reads_per_partition());
+      const bool realigner_enabled = absl::GetFlag(FLAGS_realigner_enabled);
       for (int s = 0; s < 3; ++s) {
         if (!ctx[s].sam_reader) continue;
         auto reads_or = ctx[s].sam_reader->Query(region);
@@ -719,23 +718,60 @@ int RunMakeExamples(int argc, char** argv) {
           continue;
         }
         auto& reads_iter = reads_or.ValueOrDie();
-        std::vector<nucleus::genomics::v1::Read>& reads =
-            reads_per_sample_v[s];
+        std::vector<nucleus::genomics::v1::Read> raw_reads;
         nucleus::genomics::v1::Read tmp_read;
         while (true) {
           auto next = reads_iter->Next(&tmp_read);
           if (!next.ok() || !next.ValueOrDie()) break;
-          reads.push_back(tmp_read);
+          raw_reads.push_back(tmp_read);
         }
         reads_iter->Release().IgnoreError();
-        if (max_rpp > 0 && reads.size() > static_cast<size_t>(max_rpp)) {
+        if (max_rpp > 0 && raw_reads.size() > static_cast<size_t>(max_rpp)) {
           ::deepvariant::npr::NumpyMt19937 region_rng(opts.random_seed());
           auto sampled = ::deepvariant::npr::ReservoirSamplePtrs(
-              reads, max_rpp, region_rng);
+              raw_reads, max_rpp, region_rng);
           std::vector<nucleus::genomics::v1::Read> kept;
           kept.reserve(sampled.size());
           for (const auto* p : sampled) kept.push_back(*p);
-          reads = std::move(kept);
+          raw_reads = std::move(kept);
+        }
+
+        // Realign per-sample (Step 1.3-bis). Matches upstream's
+        // make_examples_core.py:realign_reads_per_sample_multisample:
+        // each sample's reads are reassembled against per-sample
+        // de Bruijn graph haplotypes, eliminating misalignment-induced
+        // phantom alleles that inflate the AlleleCounter Counts.
+        if (realigner_enabled) {
+          const auto realigner_opts = DefaultRealignerOptions();
+          const int expand_bp =
+              realigner_opts.ws_config().region_expansion_in_bp();
+          auto contig_or = ref_reader->Contig(region.reference_name());
+          const int64_t contig_n =
+              contig_or.ok() ? contig_or.ValueOrDie()->n_bases()
+                             : static_cast<int64_t>(region.end()) + expand_bp;
+          nucleus::genomics::v1::Range ws_region;
+          ws_region.set_reference_name(region.reference_name());
+          ws_region.set_start(std::max<int64_t>(
+              0, static_cast<int64_t>(region.start()) - expand_bp));
+          ws_region.set_end(std::min<int64_t>(
+              contig_n, static_cast<int64_t>(region.end()) + expand_bp));
+
+          AlleleCounterOptions ws_ac_opts;
+          ws_ac_opts.set_partition_size(
+              opts.allele_counter_options().partition_size());
+          ws_ac_opts.mutable_read_requirements()->set_min_mapping_quality(
+              realigner_opts.ws_config().min_mapq());
+          ws_ac_opts.mutable_read_requirements()->set_min_base_quality(
+              realigner_opts.ws_config().min_base_quality());
+          ws_ac_opts.mutable_read_requirements()->set_min_base_quality_mode(
+              nucleus::genomics::v1::ReadRequirements::ENFORCED_BY_CLIENT);
+          AlleleCounter pre(ref_reader.get(), ws_region, /*positions=*/{},
+                             ws_ac_opts);
+          for (const auto& r : raw_reads) pre.Add(r, ctx[s].name);
+          reads_per_sample_v[s] = RealignReadsForRegion(
+              raw_reads, ws_region, pre, *ref_reader, realigner_opts);
+        } else {
+          reads_per_sample_v[s] = std::move(raw_reads);
         }
       }
 

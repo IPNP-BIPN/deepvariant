@@ -386,8 +386,12 @@ int RunAllTrio(int argc, char** argv) {
         absl::StrCat("--threads=", n_threads),
         "--task_id=0",
         "--num_shards=1",
-        // Realigner not yet wired for trio (Step 1.3-bis); leave off.
-        "--realigner_enabled=false",
+        // Step 1.3-bis: realigner runs per-sample in the trio worker
+        // (mirrors upstream's realign_reads_per_sample_multisample).
+        // Closes the candidate-count gap with Docker on indel-rich
+        // regions where misalignment otherwise inflates AlleleCounter
+        // counts with phantom alleles.
+        "--realigner_enabled=true",
     };
     if (!regions_flag.empty()) {
       me_args.push_back(absl::StrCat("--regions=", regions_flag));
