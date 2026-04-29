@@ -85,6 +85,47 @@ std::vector<std::string> ExpandShards(const std::string& spec) {
   return paths;
 }
 
+// Mirror of nucleus/util/variant_utils.py:simplify_alleles — strips
+// the longest common POSTFIX shared by all (ref, alts), leaving at
+// least 1 base on every allele. Then updates variant.reference_bases,
+// alternate_bases, and end. Required to match upstream's
+// `merge_predictions:simplify_variant_alleles(canonical_variant)` call —
+// without it we get site-extending substitutions where upstream emits
+// clean SNPs (e.g. chr20:63221577 T>C encoded as a 36-bp tandem-repeat
+// substitution → false overlap with neighbouring variants → spurious
+// haplotype-resolution flips).
+void SimplifyVariantAlleles(Variant* variant) {
+  if (!variant || variant->reference_bases().empty() ||
+      variant->alternate_bases_size() == 0) return;
+
+  size_t shortest = variant->reference_bases().size();
+  for (const auto& a : variant->alternate_bases()) {
+    shortest = std::min(shortest, a.size());
+  }
+  // Find longest common postfix length, capped at shortest-1 (each allele
+  // must keep at least 1 base).
+  size_t common_postfix = 0;
+  for (size_t i = 1; i < shortest; ++i) {
+    char ref_c = variant->reference_bases()[
+        variant->reference_bases().size() - i];
+    bool all_same = true;
+    for (const auto& a : variant->alternate_bases()) {
+      if (a[a.size() - i] != ref_c) { all_same = false; break; }
+    }
+    if (!all_same) break;
+    common_postfix = i;
+  }
+  if (common_postfix == 0) return;
+
+  std::string new_ref = variant->reference_bases().substr(
+      0, variant->reference_bases().size() - common_postfix);
+  variant->set_reference_bases(new_ref);
+  for (auto& a : *variant->mutable_alternate_bases()) {
+    a = a.substr(0, a.size() - common_postfix);
+  }
+  variant->set_end(variant->start() + new_ref.size());
+}
+
 // Convert probability p (in [0,1]) to a phred score, capped at 99.
 // Truncates toward zero (matching upstream's vcf_conversion.cc, which
 // converts the double-valued Log10PErrorToPhred() into a std::vector<int>
@@ -689,6 +730,12 @@ int RunPostprocessVariants(int argc, char** argv) {
     // overlapping calls and recompute FILTER — matching upstream's
     // postprocess_variants.run_postprocess_variants_on_region order
     // (per-variant add_call_to_variant → maybe_resolve_conflicting_variants).
+    // Simplify alleles (strip common postfix) — upstream
+    // merge_predictions:simplify_variant_alleles. Without this our
+    // tandem-repeat substitutions retain a long shared suffix which
+    // makes them spuriously overlap with neighbouring variants in
+    // haplotype resolution.
+    SimplifyVariantAlleles(&variant);
     variants_buffer.push_back(std::move(variant));
   }
 
