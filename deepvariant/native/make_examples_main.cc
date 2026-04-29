@@ -880,10 +880,21 @@ int RunMakeExamples(int argc, char** argv) {
               for (int j = i + 1; j < n_alts; ++j)
                 alt_idx_sets.push_back({i, j});
 
+            // Trio small_model is multi-sample (106 features = 70
+            // single-sample + 12 × 3 per-sample). Encode with the
+            // target's `order` so per-sample feature blocks come in
+            // the same insertion order upstream's Python uses.
+            std::vector<std::string> sample_names_in_order;
+            sample_names_in_order.reserve(3);
+            for (int s2 = 0; s2 < 3; ++s2) {
+              sample_names_in_order.push_back(ctx[s2].name);
+            }
+
             bool any_failed = false;
             c.clear_make_examples_alt_allele_indices();
             for (const auto& idx_set : alt_idx_sets) {
-              const auto features = EncodeSmallModelFeatures(c, idx_set);
+              const auto features = EncodeSmallModelFeaturesMultiSample(
+                  c, idx_set, sample_names_in_order, C.order);
               float probs[3] = {0, 0, 0};
               bool pred_ok =
                   C.small_model->Predict(features.data(), 1, probs);

@@ -125,8 +125,9 @@ void Softmax3(float* v) {
 }  // namespace
 
 struct SmallModel::Impl {
-  // Layer 1: 70 → 750
-  std::vector<float> W1;     // shape (70, 750), row-major
+  int input_dim = 0;         // 70 (WGS), 106 (DeepTrio), 94 (DeepSomatic)
+  // Layer 1: input_dim → 750
+  std::vector<float> W1;     // shape (input_dim, 750), row-major
   std::vector<float> b1;     // (750,)
   // Layer 2: 750 → 750
   std::vector<float> W2;     // shape (750, 750)
@@ -138,6 +139,8 @@ struct SmallModel::Impl {
 
 SmallModel::SmallModel() : impl_(std::make_unique<Impl>()) {}
 SmallModel::~SmallModel() = default;
+
+int SmallModel::input_dim() const { return impl_->input_dim; }
 
 // static
 std::unique_ptr<SmallModel> SmallModel::Load(const std::string& path) {
@@ -157,36 +160,48 @@ std::unique_ptr<SmallModel> SmallModel::Load(const std::string& path) {
                << " (expected layer_{0,1,2}_{kernel,bias}.npy)";
     return nullptr;
   }
-  if (W1.shape != std::vector<size_t>{70, 750} ||
+  // Input dimension is detected from layer_0_kernel's first axis. We
+  // accept any sane value (70/94/106 in current model variants); the
+  // layer_1 / layer_2 / bias shapes must be consistent.
+  if (W1.shape.size() != 2 || W1.shape[1] != 750 ||
       b1.shape != std::vector<size_t>{750} ||
       W2.shape != std::vector<size_t>{750, 750} ||
       b2.shape != std::vector<size_t>{750} ||
       W3.shape != std::vector<size_t>{750, 3} ||
       b3.shape != std::vector<size_t>{3}) {
     LOG(ERROR) << "SmallModel: weight shapes don't match "
-                  "(70,750)+(750)+(750,750)+(750)+(750,3)+(3)";
+                  "(?,750)+(750)+(750,750)+(750)+(750,3)+(3) "
+                  "— got W1=("
+               << (W1.shape.size() >= 1 ? std::to_string(W1.shape[0]) : "?")
+               << ","
+               << (W1.shape.size() >= 2 ? std::to_string(W1.shape[1]) : "?")
+               << ")";
     return nullptr;
   }
 
   auto out = std::unique_ptr<SmallModel>(new SmallModel());
+  out->impl_->input_dim = static_cast<int>(W1.shape[0]);
   out->impl_->W1 = std::move(W1.data);
   out->impl_->b1 = std::move(b1.data);
   out->impl_->W2 = std::move(W2.data);
   out->impl_->b2 = std::move(b2.data);
   out->impl_->W3 = std::move(W3.data);
   out->impl_->b3 = std::move(b3.data);
-  LOG(INFO) << "SmallModel: loaded BNNS-CPU FP32 MLP from " << root;
+  LOG(INFO) << "SmallModel: loaded BNNS-CPU FP32 MLP from " << root
+            << " (input_dim=" << out->impl_->input_dim << ")";
   return out;
 }
 
 bool SmallModel::Predict(const float* features, int N, float* probs) {
+  const int in_dim = impl_->input_dim;
+  if (in_dim <= 0) return false;
   // Per-batch scratch — small enough to allocate per call (avoids
   // thread-safety issues if called concurrently).
   std::vector<float> y1(750), y2(750), y3(3);
   for (int n = 0; n < N; ++n) {
-    const float* x = features + (size_t)n * 70;
-    // Layer 1: 70 → 750 + ReLU
-    DenseFp32(x, 70, impl_->W1.data(), impl_->b1.data(), 750, y1.data());
+    const float* x = features + (size_t)n * in_dim;
+    // Layer 1: in_dim → 750 + ReLU
+    DenseFp32(x, in_dim, impl_->W1.data(), impl_->b1.data(), 750, y1.data());
     Relu(y1.data(), 750);
     // Layer 2: 750 → 750 + ReLU
     DenseFp32(y1.data(), 750, impl_->W2.data(), impl_->b2.data(), 750,
