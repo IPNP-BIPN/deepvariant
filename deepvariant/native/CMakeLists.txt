@@ -219,6 +219,7 @@ target_link_libraries(dv_make_examples_lib PUBLIC
 # ---------------------------------------------------------------------------
 add_library(dv_postprocess_lib STATIC
   "${CMAKE_CURRENT_SOURCE_DIR}/postprocess_main.cc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/haplotypes.cc"
 )
 target_include_directories(dv_postprocess_lib PUBLIC ${ME_INCLUDE_DIRS})
 target_compile_options(dv_postprocess_lib PRIVATE ${ME_COMPILE_OPTS})
