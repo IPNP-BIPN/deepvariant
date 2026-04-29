@@ -261,13 +261,22 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   const bool trio_mode = !parent1_reads.empty();
 
   if (trio_mode) {
-    // Per upstream dt_constants:
-    //   PILEUP_DEFAULT_HEIGHT_CHILD  = 100
-    //   PILEUP_DEFAULT_HEIGHT_PARENT = 100
+    // Per-model trio defaults (mirror scripts/run_deeptrio.py:392-399):
+    //   WGS:    child=60,  parent=40   → total 140 (matches Docker
+    //           example_shape=[140, 221, 7])
+    //   WES:    child=100, parent=100  → total 300
+    //   PACBIO: child=60,  parent=40   → total 140
+    //   ONT:    child=100, parent=100  → total 300
+    // Users can override via --pileup_image_height_child / _parent.
+    // The model_type flag is owned by cli.cc (run mode); here in
+    // make_examples_main we infer it via opts.pic_options or default
+    // to WGS heights. The cli.cc trio path already passes through the
+    // user's --pileup_image_height_* flags so this default only
+    // matters for direct `make_examples --reads_parent1=...` usage.
     int child_h  = absl::GetFlag(FLAGS_pileup_image_height_child);
     int parent_h = absl::GetFlag(FLAGS_pileup_image_height_parent);
-    if (child_h  <= 0) child_h  = 100;
-    if (parent_h <= 0) parent_h = 100;
+    if (child_h  <= 0) child_h  = 60;  // DEEP_TRIO_WGS_PILEUP_HEIGHT_CHILD
+    if (parent_h <= 0) parent_h = 40;  // DEEP_TRIO_WGS_PILEUP_HEIGHT_PARENT
     const double ds_child   = absl::GetFlag(FLAGS_downsample_fraction_child);
     const double ds_parents = absl::GetFlag(FLAGS_downsample_fraction_parents);
     const std::string p1_name = absl::GetFlag(FLAGS_sample_name_parent1);
