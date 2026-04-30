@@ -550,6 +550,16 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
     opts.set_trim_reads_for_pileup(true);
     // normalize_reads is on AlleleCounterOptions, not MakeExamplesOptions.
     opts.mutable_allele_counter_options()->set_normalize_reads(true);
+    // keep_legacy_allele_counter_behavior=true → AlleleCounterOptions.
+    // keep_legacy_behavior=true. When true, indel bases below min_base_quality
+    // cause the indel to be skipped (stricter than the new sum-of-quality
+    // gate); see allelecounter.cc:215.
+    opts.mutable_allele_counter_options()->set_keep_legacy_behavior(true);
+    // keep_supplementary_alignments=true → ReadRequirements field. Pangenome
+    // expects supplementary alignments (HPRC haplotypes can have them) to
+    // be retained.
+    opts.mutable_allele_counter_options()->mutable_read_requirements()
+        ->set_keep_supplementary_alignments(true);
 
     const std::string pangenome_reads = absl::GetFlag(FLAGS_reads_pangenome);
     const std::string main_reads      = absl::GetFlag(FLAGS_reads);
