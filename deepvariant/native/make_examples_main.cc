@@ -1158,7 +1158,13 @@ int RunMakeExamples(int argc, char** argv) {
         // each sample's reads are reassembled against per-sample
         // de Bruijn graph haplotypes, eliminating misalignment-induced
         // phantom alleles that inflate the AlleleCounter Counts.
-        if (realigner_enabled) {
+        //
+        // Pangenome exception: upstream's `can_realign` (make_examples_
+        // core.py:2208) returns False for `role == 'pangenome'` — synthetic
+        // haplotypes are pre-aligned to the GBZ graph, so re-running our
+        // realigner on them produces phantom alt alleles that diverge
+        // from Docker's pangenome AlleleCount.
+        if (realigner_enabled && ctx[s].role != "pangenome") {
           const auto realigner_opts = RealignerOptionsFromFlags();
           const int expand_bp =
               realigner_opts.ws_config().region_expansion_in_bp();
