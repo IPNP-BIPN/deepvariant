@@ -705,6 +705,16 @@ std::unique_ptr<MetalInception> MetalInception::Create(
   I.compileDesc = [MPSGraphCompilationDescriptor new];
   I.compileDesc.optimizationLevel = MPSGraphOptimizationLevel0;
   I.compileDesc.waitForCompilationCompletion = YES;
+  // macOS 26+: explicitly disable any reduced-precision fast-math paths
+  // (FP16 Winograd intermediates, FP19/TF32 operand conversion). Default
+  // is `None` already — setting explicitly to make this behaviour
+  // contractually visible and to log it on supported macOS versions.
+  if (@available(macOS 26.0, iOS 26.0, *)) {
+    I.compileDesc.reducedPrecisionFastMath =
+        MPSGraphReducedPrecisionFastMathNone;
+    LOG(INFO) << "MPSGraph: reducedPrecisionFastMath=None (full FP32, "
+              << "no Winograd-FP16, no FP19/TF32 operand conversion)";
+  }
   I.execCache = [NSMutableDictionary dictionary];
   I.taps = [NSMutableDictionary dictionary];
   // Variable batch dimension. -1 means "any" in MPSGraph shape spec.
