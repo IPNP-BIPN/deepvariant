@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "absl/flags/flag.h"
@@ -113,6 +114,24 @@ std::vector<char*> MakeArgv(const std::string& prog,
   return argv;
 }
 
+// Auto-detect a sensible default for num_shards/threads. Uses
+// std::thread::hardware_concurrency() (returns logical cores) and
+// reserves 2 for the system (so an M4 Max with 16 cores returns 14).
+// If --num_shards was set explicitly to a value > 1, that wins.
+int AutoNumShards() {
+  int hw = static_cast<int>(std::thread::hardware_concurrency());
+  if (hw <= 0) return 1;
+  if (hw <= 4) return hw;        // tiny machines: use all cores
+  return std::max(1, hw - 2);    // leave headroom on bigger machines
+}
+
+int EffectiveNumShards() {
+  const int explicit_n = absl::GetFlag(FLAGS_num_shards);
+  // 0 (default) and 1 (=no sharding) both fall back to auto-detect.
+  if (explicit_n > 1) return explicit_n;
+  return AutoNumShards();
+}
+
 std::string ModelPath(const std::string& model_type) {
   if (!absl::GetFlag(FLAGS_model).empty()) {
     return absl::GetFlag(FLAGS_model);
@@ -159,7 +178,7 @@ int RunAll(int argc, char** argv) {
   const std::string output_vcf_flag = absl::GetFlag(FLAGS_output_vcf);
   const std::string regions_flag = absl::GetFlag(FLAGS_regions);
   const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
-  const int num_shards = absl::GetFlag(FLAGS_num_shards);
+  const int num_shards = EffectiveNumShards();
 
   if (reads_flag.empty() || ref_flag.empty() || output_vcf_flag.empty()) {
     LOG(ERROR) << "Usage: deepvariant run --reads=<BAM> --ref=<FASTA> "
@@ -334,7 +353,7 @@ int RunAllTrio(int argc, char** argv) {
   const std::string ref_flag = absl::GetFlag(FLAGS_ref);
   const std::string regions_flag = absl::GetFlag(FLAGS_regions);
   const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
-  const int num_shards = absl::GetFlag(FLAGS_num_shards);
+  const int num_shards = EffectiveNumShards();
   const int n_threads = std::max(1, num_shards);
 
   const std::string reads_child   = absl::GetFlag(FLAGS_reads);
@@ -566,7 +585,7 @@ int RunAllSomatic(int argc, char** argv) {
   const std::string ref_flag = absl::GetFlag(FLAGS_ref);
   const std::string regions_flag = absl::GetFlag(FLAGS_regions);
   const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
-  const int num_shards = absl::GetFlag(FLAGS_num_shards);
+  const int num_shards = EffectiveNumShards();
   const int n_threads = std::max(1, num_shards);
 
   const std::string reads_tumor  = absl::GetFlag(FLAGS_reads_tumor);
@@ -736,7 +755,7 @@ int RunAllPangenome(int argc, char** argv) {
   const std::string ref_flag = absl::GetFlag(FLAGS_ref);
   const std::string regions_flag = absl::GetFlag(FLAGS_regions);
   const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
-  const int num_shards = absl::GetFlag(FLAGS_num_shards);
+  const int num_shards = EffectiveNumShards();
   const int n_threads = std::max(1, num_shards);
 
   const std::string reads_main      = absl::GetFlag(FLAGS_reads);
