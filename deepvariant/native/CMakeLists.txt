@@ -65,6 +65,32 @@ target_link_libraries(dv_metal_conv_serial PUBLIC
 )
 
 # ---------------------------------------------------------------------------
+# dv_metal_det_kernels — Phase 5.5e deterministic AvgPool / Concat /
+# GlobalAvgPool kernels needed to extend Phase 5.5c to the full
+# Inception-v3 stack (blocks 5b–7c + global-avg-pool). All embed
+# kernel source as strings + compile at runtime; same per-thread
+# strict-serial accumulation contract as conv_serial_fp32.
+# ---------------------------------------------------------------------------
+add_library(dv_metal_det_kernels STATIC
+  metal_avg_pool.mm
+  metal_concat.mm
+  metal_global_avg_pool.mm
+)
+set_source_files_properties(
+  metal_avg_pool.mm metal_concat.mm metal_global_avg_pool.mm
+  PROPERTIES COMPILE_FLAGS "-fobjc-arc"
+)
+target_include_directories(dv_metal_det_kernels PUBLIC
+  "${CMAKE_SOURCE_DIR}"
+  "${ABSL_PREFIX}/include"
+)
+target_link_libraries(dv_metal_det_kernels PUBLIC
+  absl::log
+  "-framework Metal"
+  "-framework Foundation"
+)
+
+# ---------------------------------------------------------------------------
 # dv_metal_inference — Phase 5.5 MPSGraph + BNNS Inception-v3 backend
 # (Obj-C++ + Metal Performance Shaders Graph; consumes .dvw weights)
 # ---------------------------------------------------------------------------
@@ -79,6 +105,7 @@ target_include_directories(dv_metal_inference PUBLIC
 target_link_libraries(dv_metal_inference PUBLIC
   dv_weights
   dv_metal_conv_serial
+  dv_metal_det_kernels
   absl::log
   "-framework Metal"
   "-framework MetalPerformanceShadersGraph"
