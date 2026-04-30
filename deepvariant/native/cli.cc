@@ -844,6 +844,12 @@ int RunAllPangenome(int argc, char** argv) {
     me_args.push_back("--aln_gap_open=10");
     me_args.push_back("--aln_gap_extend=1");
     me_args.push_back("--dbg_disable_graph_pruning=true");
+    // Pangenome's run_pangenome_aware_deepvariant.py invokes
+    // make_examples with --partition_size=25000 (vs our default 1000).
+    // Larger partitions match Docker's per-partition AlleleCounter
+    // semantics (some reads spanning partition boundaries get
+    // processed differently). Empirically tested on chr20:10M-10.1M.
+    me_args.push_back("--partition_size=25000");
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
