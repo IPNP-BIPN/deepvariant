@@ -65,6 +65,29 @@ target_link_libraries(dv_metal_conv_serial PUBLIC
 )
 
 # ---------------------------------------------------------------------------
+# dv_metal_conv_kahan — Phase 5.5e/Path B Kahan-compensated Conv2D
+# kernel. Same dispatch shape as conv_serial; per-thread accumulator
+# uses TwoSum compensation to bound per-step error at O(ε² · |sum|)
+# instead of O(ε · |sum|). Provably bit-deterministic across reduction
+# orders within ~1 ULP — sufficient to match Docker FILTER classes
+# regardless of their AVX-512 vs scalar reduction strategy.
+# ---------------------------------------------------------------------------
+add_library(dv_metal_conv_kahan STATIC metal_conv_kahan.mm)
+set_source_files_properties(metal_conv_kahan.mm PROPERTIES
+  COMPILE_FLAGS "-fobjc-arc"
+)
+target_include_directories(dv_metal_conv_kahan PUBLIC
+  "${CMAKE_SOURCE_DIR}"
+  "${ABSL_PREFIX}/include"
+)
+target_link_libraries(dv_metal_conv_kahan PUBLIC
+  dv_metal_conv_serial   # reuse ConvDesc
+  absl::log
+  "-framework Metal"
+  "-framework Foundation"
+)
+
+# ---------------------------------------------------------------------------
 # dv_metal_det_kernels — Phase 5.5e deterministic AvgPool / Concat /
 # GlobalAvgPool kernels needed to extend Phase 5.5c to the full
 # Inception-v3 stack (blocks 5b–7c + global-avg-pool). All embed
@@ -308,6 +331,31 @@ target_include_directories(microtest_conv_serial PRIVATE
 )
 target_link_libraries(microtest_conv_serial PRIVATE
   dv_metal_conv_serial
+  absl::log
+  "-framework Metal"
+  "-framework Foundation"
+)
+
+# ---------------------------------------------------------------------------
+# microtest_conv_kahan — Phase 5.5e/Path B hand-verifiable test for the
+# Kahan-compensated Conv2D kernel. Compares GPU dispatch output against
+# a scalar Kahan reference and reports the precision improvement vs
+# basic-FMA scalar reference.
+# ---------------------------------------------------------------------------
+add_executable(microtest_conv_kahan
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_conv_kahan.mm"
+)
+set_source_files_properties(
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_conv_kahan.mm" PROPERTIES
+  COMPILE_FLAGS "-fobjc-arc"
+)
+target_include_directories(microtest_conv_kahan PRIVATE
+  ${ME_INCLUDE_DIRS}
+  "${CMAKE_SOURCE_DIR}"
+  "${ABSL_PREFIX}/include"
+)
+target_link_libraries(microtest_conv_kahan PRIVATE
+  dv_metal_conv_kahan
   absl::log
   "-framework Metal"
   "-framework Foundation"

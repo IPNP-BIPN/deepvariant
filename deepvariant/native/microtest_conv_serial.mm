@@ -175,7 +175,91 @@ int RunAll() {
     n_fail += RunCase(*mcs, "stem_s1a-shape 3×3 s=2 VALID", d);
   }
 
-  std::printf("\n%d/4 cases FAILED\n", n_fail);
+  // ===== Tier 6.0 shape coverage: Inception blocks 5b–7c =====
+  // Validate MetalConvSerial supports every conv shape used by the
+  // 11 Mixed_X blocks. If any case FAILs, the conv_serial-full-network
+  // refactor cannot proceed without a kernel-side fix.
+
+  // Case 5: 5×5 stride-1 SAME (Mixed_5b/5c/5d branch5x5).
+  // E.g. Mixed_5b: 48 → 64 channels, padded to maintain spatial size.
+  {
+    ConvDesc d{};
+    d.B = 1; d.H_in = 23; d.W_in = 53; d.C_in = 48;
+    d.H_out = 23; d.W_out = 53; d.C_out = 64;
+    d.Kh = 5; d.Kw = 5;
+    d.stride_h = 1; d.stride_w = 1; d.pad_h = 2; d.pad_w = 2;
+    d.relu = true;
+    n_fail += RunCase(*mcs, "Mixed_5b-shape 5×5 s=1 SAME 48→64", d);
+  }
+
+  // Case 6: 7×1 stride-1 SAME (Mixed_6b–6e branch7x7 asymmetric).
+  // E.g. Mixed_6b: 128 → 128 channels with kernel (7,1).
+  {
+    ConvDesc d{};
+    d.B = 1; d.H_in = 11; d.W_in = 26; d.C_in = 128;
+    d.H_out = 11; d.W_out = 26; d.C_out = 128;
+    d.Kh = 7; d.Kw = 1;
+    d.stride_h = 1; d.stride_w = 1; d.pad_h = 3; d.pad_w = 0;
+    d.relu = true;
+    n_fail += RunCase(*mcs, "Mixed_6b-shape 7×1 s=1 SAME 128→128", d);
+  }
+
+  // Case 7: 1×7 stride-1 SAME (Mixed_6b–6e branch7x7 asymmetric).
+  {
+    ConvDesc d{};
+    d.B = 1; d.H_in = 11; d.W_in = 26; d.C_in = 128;
+    d.H_out = 11; d.W_out = 26; d.C_out = 192;
+    d.Kh = 1; d.Kw = 7;
+    d.stride_h = 1; d.stride_w = 1; d.pad_h = 0; d.pad_w = 3;
+    d.relu = true;
+    n_fail += RunCase(*mcs, "Mixed_6b-shape 1×7 s=1 SAME 128→192", d);
+  }
+
+  // Case 8: 1×3 stride-1 SAME (Mixed_7b/7c branch3x3 asymmetric split).
+  {
+    ConvDesc d{};
+    d.B = 1; d.H_in = 5; d.W_in = 12; d.C_in = 384;
+    d.H_out = 5; d.W_out = 12; d.C_out = 384;
+    d.Kh = 1; d.Kw = 3;
+    d.stride_h = 1; d.stride_w = 1; d.pad_h = 0; d.pad_w = 1;
+    d.relu = true;
+    n_fail += RunCase(*mcs, "Mixed_7b-shape 1×3 s=1 SAME 384→384", d);
+  }
+
+  // Case 9: 3×1 stride-1 SAME (Mixed_7b/7c branch3x3 asymmetric split).
+  {
+    ConvDesc d{};
+    d.B = 1; d.H_in = 5; d.W_in = 12; d.C_in = 384;
+    d.H_out = 5; d.W_out = 12; d.C_out = 384;
+    d.Kh = 3; d.Kw = 1;
+    d.stride_h = 1; d.stride_w = 1; d.pad_h = 1; d.pad_w = 0;
+    d.relu = true;
+    n_fail += RunCase(*mcs, "Mixed_7b-shape 3×1 s=1 SAME 384→384", d);
+  }
+
+  // Case 10: 1×1 stride-1 SAME, large channels (Mixed_7c branch1x1 320→320).
+  {
+    ConvDesc d{};
+    d.B = 1; d.H_in = 5; d.W_in = 12; d.C_in = 1280;
+    d.H_out = 5; d.W_out = 12; d.C_out = 320;
+    d.Kh = 1; d.Kw = 1;
+    d.stride_h = 1; d.stride_w = 1; d.pad_h = 0; d.pad_w = 0;
+    d.relu = true;
+    n_fail += RunCase(*mcs, "Mixed_7c-shape 1×1 s=1 1280→320", d);
+  }
+
+  // Case 11: 3×3 stride-2 VALID (Mixed_6a/7a reduction blocks).
+  {
+    ConvDesc d{};
+    d.B = 1; d.H_in = 23; d.W_in = 53; d.C_in = 96;
+    d.H_out = 11; d.W_out = 26; d.C_out = 96;
+    d.Kh = 3; d.Kw = 3;
+    d.stride_h = 2; d.stride_w = 2; d.pad_h = 0; d.pad_w = 0;
+    d.relu = true;
+    n_fail += RunCase(*mcs, "Mixed_6a-shape 3×3 s=2 VALID 96→96", d);
+  }
+
+  std::printf("\n%d/11 cases FAILED\n", n_fail);
   return n_fail == 0 ? 0 : 1;
 }
 
