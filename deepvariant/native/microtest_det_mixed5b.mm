@@ -131,8 +131,9 @@ int Run(const std::string& dvw_path, const std::string& ref_dir) {
   auto conv_serial = MetalConvSerial::Create();
   auto bn_relu = MetalBnRelu::Create();
   auto avg_pool = MetalAvgPool::Create();
+  auto max_pool = MetalMaxPool::Create();
   auto concat = MetalConcat::Create();
-  if (!conv_serial || !bn_relu || !avg_pool || !concat) {
+  if (!conv_serial || !bn_relu || !avg_pool || !max_pool || !concat) {
     std::fprintf(stderr, "FAIL: kernel dispatcher creation failed\n");
     return 1;
   }
@@ -156,8 +157,8 @@ int Run(const std::string& dvw_path, const std::string& ref_dir) {
   // 6) Dispatch.
   id<MTLCommandBuffer> cb = [queue commandBuffer];
   if (!DispatchDetMixedBlock(cb, conv_serial.get(), bn_relu.get(),
-                              avg_pool.get(), concat.get(), block,
-                              input_buf, B)) {
+                              avg_pool.get(), max_pool.get(), concat.get(),
+                              block, input_buf, B)) {
     std::fprintf(stderr, "FAIL: DispatchDetMixedBlock\n");
     return 1;
   }
