@@ -154,6 +154,7 @@ target_link_libraries(dv_metal_inference PUBLIC
   dv_weights
   dv_metal_conv_serial
   dv_metal_det_kernels
+  dv_metal_det_mixed
   absl::log
   "-framework Metal"
   "-framework MetalPerformanceShadersGraph"

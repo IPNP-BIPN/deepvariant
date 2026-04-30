@@ -30,6 +30,10 @@
 #include "deepvariant/native/dv_weights.h"
 #include "deepvariant/native/metal_bn_relu.h"
 #include "deepvariant/native/metal_conv_serial.h"
+#include "deepvariant/native/metal_avg_pool.h"
+#include "deepvariant/native/metal_concat.h"
+#include "deepvariant/native/metal_det_mixed.h"
+#include "deepvariant/native/metal_global_avg_pool.h"
 
 namespace deepvariant {
 
@@ -642,6 +646,15 @@ struct MetalInception::Impl {
   std::unique_ptr<MetalMaxPool> max_pool;
   std::unique_ptr<MetalBnRelu> bn_relu;     // Phase 5.5f, lazy-init
   std::vector<DetLayer> det_layers;
+  // Phase 8 / Tier 6.0 — full-network det Inception path. When non-empty,
+  // Predict() runs det stem chain → det_blocks chain → global_avg_pool →
+  // output, completely bypassing MPSGraph on the conv path. Bit-deterministic
+  // across runs/chips. Activated by DV_METAL_SERIAL_FULL=1 env var.
+  std::vector<DetMixedBlock> det_blocks;
+  std::unique_ptr<MetalAvgPool> avg_pool;
+  std::unique_ptr<MetalConcat> concat;
+  std::unique_ptr<MetalGlobalAvgPool> gap_pool;
+  id<MTLBuffer> gap_out_buf = nil;          // (max_B, 2048) FP32 — output of global avg pool
   // Cached post-graph executable per batch size (the post-graph itself is
   // already in det_layers[0].post_graph).
   NSMutableDictionary<NSNumber*, MPSGraphExecutable*>* post_exec_cache = nil;
@@ -962,6 +975,67 @@ std::unique_ptr<MetalInception> MetalInception::Create(
       I.det_layers.push_back(std::move(det));
     }
 
+    // Phase 8 / Tier 6.0 — full-network det path: when DV_METAL_SERIAL_FULL=1
+    // is set AND the stem chain is full (s1a→mp5a) AND unfolded BN is on,
+    // build all 11 Inception blocks (Mixed_5b…7c) + global avg pool. Predict()
+    // will route through them, bypassing MPSGraph entirely on the conv path.
+    const char* serial_full_env = std::getenv("DV_METAL_SERIAL_FULL");
+    const bool serial_full =
+        (serial_full_env && std::string(serial_full_env) != "0" &&
+         std::string(serial_full_env) != "false");
+    if (serial_full && chain_len == 7 && unfolded_bn) {
+      LOG(INFO) << "Phase 8/Tier 6.0: building full-network det path "
+                << "(11 Inception blocks + global avg pool)";
+      // Geometry input to Mixed_5b = output of stem_mp5a.
+      const DetLayer& last_stem = I.det_layers.back();
+      int blk_H = last_stem.H_out;
+      int blk_W = last_stem.W_out;
+      int blk_C = last_stem.C_out;
+      // Use a generous max_B; we don't know batch size at Create time.
+      // Allocations scale ~ 250 MB total across 11 blocks at B=128, fine on
+      // M4 Max unified memory.
+      const int max_B = 2048;
+      I.avg_pool = MetalAvgPool::Create();
+      I.concat = MetalConcat::Create();
+      I.gap_pool = MetalGlobalAvgPool::Create();
+      if (!I.avg_pool || !I.concat || !I.gap_pool) {
+        LOG(ERROR) << "Tier 6.0: avg_pool/concat/gap_pool create failed";
+        return nullptr;
+      }
+      using BuilderFn = bool(*)(id<MTLDevice>, const DvwWeights&, int, int, int, int, DetMixedBlock*);
+      static const std::pair<BuilderFn, const char*> kBlockSpecs[] = {
+          {BuildDetMixed5b, "5b"}, {BuildDetMixed5c, "5c"},
+          {BuildDetMixed5d, "5d"}, {BuildDetMixed6a, "6a"},
+          {BuildDetMixed6b, "6b"}, {BuildDetMixed6c, "6c"},
+          {BuildDetMixed6d, "6d"}, {BuildDetMixed6e, "6e"},
+          {BuildDetMixed7a, "7a"}, {BuildDetMixed7b, "7b"},
+          {BuildDetMixed7c, "7c"},
+      };
+      I.det_blocks.resize(sizeof(kBlockSpecs) / sizeof(kBlockSpecs[0]));
+      for (size_t i = 0; i < I.det_blocks.size(); ++i) {
+        if (!kBlockSpecs[i].first(I.device, *I.weights, max_B, blk_H, blk_W, blk_C,
+                                   &I.det_blocks[i])) {
+          LOG(ERROR) << "Tier 6.0: build " << kBlockSpecs[i].second << " failed";
+          return nullptr;
+        }
+        blk_H = I.det_blocks[i].H_out;
+        blk_W = I.det_blocks[i].W_out;
+        blk_C = I.det_blocks[i].C_out;
+      }
+      // Allocate gap output buffer (max_B, C_out_7c=2048).
+      const size_t gap_bytes = (size_t)max_B * blk_C * sizeof(float);
+      I.gap_out_buf =
+          [I.device newBufferWithLength:gap_bytes
+                                options:MTLResourceStorageModeShared];
+      if (!I.gap_out_buf) {
+        LOG(ERROR) << "Tier 6.0: gap_out_buf alloc failed";
+        return nullptr;
+      }
+      I.feature_dim = blk_C;
+      LOG(INFO) << "Phase 8/Tier 6.0: " << I.det_blocks.size()
+                << " Inception blocks built; gap output dim = " << blk_C;
+    }
+
     // Build ONE post-graph that starts after the last det stage.
     const DetLayer& last = I.det_layers.back();
     const std::string& last_tap = last.tap_name;
@@ -1105,6 +1179,44 @@ bool MetalInception::Predict(const float* input, int batch_size,
     }
     [cb commit];
     [cb waitUntilCompleted];
+
+    // Phase 8 / Tier 6.0 — full-network det path: bypass MPSGraph entirely
+    // by chaining all 11 Inception blocks + global avg pool, then copying
+    // the result to `output`. Only active when det_blocks is non-empty
+    // (built when DV_METAL_SERIAL_FULL=1 + full stem chain + unfolded BN).
+    if (!I.det_blocks.empty()) {
+      id<MTLCommandBuffer> cb_blk = [I.queue commandBuffer];
+      id<MTLBuffer> blk_in = cur_buf;
+      for (size_t i = 0; i < I.det_blocks.size(); ++i) {
+        if (!DispatchDetMixedBlock(cb_blk, I.conv_serial.get(),
+                                    I.bn_relu.get(), I.avg_pool.get(),
+                                    I.max_pool.get(), I.concat.get(),
+                                    I.det_blocks[i], blk_in, batch_size)) {
+          LOG(ERROR) << "MetalInception::Predict(SERIAL_FULL): block "
+                     << I.det_blocks[i].tap_name << " failed";
+          return false;
+        }
+        blk_in = I.det_blocks[i].concat_out;
+      }
+      // Global avg pool: (B, H, W, C) → (B, C). Last block output spatial:
+      // 1×5 (after 7c on DV pileup geometry).
+      const DetMixedBlock& last_blk = I.det_blocks.back();
+      GlobalAvgPoolDesc gap_d{};
+      gap_d.B = batch_size;
+      gap_d.H_in = last_blk.H_out;
+      gap_d.W_in = last_blk.W_out;
+      gap_d.C = last_blk.C_out;
+      if (!I.gap_pool->Encode(cb_blk, blk_in, I.gap_out_buf, gap_d)) {
+        LOG(ERROR) << "MetalInception::Predict(SERIAL_FULL): gap failed";
+        return false;
+      }
+      [cb_blk commit];
+      [cb_blk waitUntilCompleted];
+      // Copy (B, feature_dim) FP32 result to `output`.
+      const size_t out_bytes = (size_t)batch_size * I.feature_dim * sizeof(float);
+      std::memcpy(output, [I.gap_out_buf contents], out_bytes);
+      return true;
+    }
 
     // 3) Run post-graph (last det layer output → gap) using cur_buf as
     // the placeholder.
