@@ -25,9 +25,57 @@ namespace {
 
 constexpr float kBNEpsilon = 1e-3f;
 
+// When true, BuildBranchOp folds BN into conv weights at build time
+// (matches the baseline MPSGraph CBR path that produces 160 FM vs Docker
+// at chr20-full scale). When false, builds raw conv + separate BN+ReLU
+// (the UNFOLDED path that produces 8837 FM regression at chr20-full scale
+// — provided only as a research toggle via DV_METAL_DET_UNFOLDED=1).
+bool g_det_use_folded = true;
+
 std::string DetAttr(int n, const char* attr) {
   return "layer_with_weights-" + std::to_string(n) +
          "/" + attr + "/.ATTRIBUTES/VARIABLE_VALUE";
+}
+
+// Local copy of the FoldConvBn pattern from metal_inference.mm. Folds
+// (Conv HWIO + BN gamma=1, beta, mean, var, eps) into a single
+// (W' HWIO, b') pair where:
+//   scale[o] = 1 / sqrt(var[o] + eps)
+//   W'[h,w,i,o] = W[h,w,i,o] * scale[o]
+//   b'[o] = beta[o] - mean[o] * scale[o]
+struct DetFusedConv {
+  std::vector<float> weights_hwio;
+  std::vector<float> bias;
+  int O = 0, I = 0, H = 0, W = 0;
+};
+DetFusedConv DetFoldConvBn(const DvwWeights& dvw, int conv_n, int bn_n) {
+  const auto* k = dvw.Get(DetAttr(conv_n, "kernel"));
+  const auto* beta = dvw.Get(DetAttr(bn_n, "beta"));
+  const auto* mean = dvw.Get(DetAttr(bn_n, "moving_mean"));
+  const auto* var = dvw.Get(DetAttr(bn_n, "moving_variance"));
+  if (!k || !beta || !mean || !var || k->shape.size() != 4u) return {};
+  const int Hk = k->shape[0], Wk = k->shape[1];
+  const int Ik = k->shape[2], Ok = k->shape[3];
+  DetFusedConv out;
+  out.H = Hk; out.W = Wk; out.I = Ik; out.O = Ok;
+  std::vector<float> scale(Ok), offset(Ok);
+  for (int o = 0; o < Ok; ++o) {
+    scale[o] = 1.0f / std::sqrt(var->data[o] + kBNEpsilon);
+    offset[o] = beta->data[o] - mean->data[o] * scale[o];
+  }
+  out.bias = std::move(offset);
+  out.weights_hwio.resize((size_t)Hk * Wk * Ik * Ok);
+  for (size_t h = 0; h < (size_t)Hk; ++h) {
+    for (size_t w = 0; w < (size_t)Wk; ++w) {
+      for (size_t i = 0; i < (size_t)Ik; ++i) {
+        for (size_t o = 0; o < (size_t)Ok; ++o) {
+          const size_t idx = ((h * Wk + w) * Ik + i) * Ok + o;
+          out.weights_hwio[idx] = k->data[idx] * scale[o];
+        }
+      }
+    }
+  }
+  return out;
 }
 
 id<MTLBuffer> NewBuf(id<MTLDevice> dev, size_t bytes) {
@@ -35,75 +83,105 @@ id<MTLBuffer> NewBuf(id<MTLDevice> dev, size_t bytes) {
                           options:MTLResourceStorageModeShared];
 }
 
-// Build one CBR (conv + BN + ReLU) op. Allocates raw_buf + out_buf
-// for batch up to max_B at the (H_out, W_out) geometry. The kernel
-// shape (Hk, Wk) is read from the .dvw weight tensor itself.
+// Build one CBR (conv + BN + ReLU) op. By default uses FOLDED weights
+// (W' = W*scale, bias = offset, fused ReLU in conv) — bit-equivalent
+// to the baseline MPSGraph CBR path that achieves 100 % FILTER parity
+// on chr20:10M-10.1M and 160 FM on chr20 full HG003.
+//
+// The unfolded path (raw conv + separate MetalBnRelu) is bit-different
+// at scale (8837 FM regression confirmed in chr20 full HG003 testing —
+// same magnitude as Probe C2 unfolded MPSGraph) and is provided only
+// as a research toggle via g_det_use_folded = false.
 bool BuildBranchOp(id<MTLDevice> device, const DvwWeights& dvw,
                    int conv_n, int bn_n,
                    int H_in, int W_in, int C_in,
                    int H_out, int W_out, int stride_h, int stride_w,
                    bool same_padding, int max_B,
                    DetBranchOp* op) {
+  if (g_det_use_folded) {
+    // ── FOLDED path ── conv emits final activation with bias + ReLU
+    // applied in the kernel. No mean/var/beta needed at runtime.
+    DetFusedConv fc = DetFoldConvBn(dvw, conv_n, bn_n);
+    if (fc.weights_hwio.empty()) {
+      LOG(ERROR) << "BuildBranchOp: FoldConvBn failed for conv=" << conv_n
+                 << " bn=" << bn_n;
+      return false;
+    }
+    if (fc.I != C_in) {
+      LOG(ERROR) << "BuildBranchOp(folded): weight C_in=" << fc.I
+                 << " mismatch geom C_in=" << C_in
+                 << " (conv=" << conv_n << ")";
+      return false;
+    }
+    op->conv.B = max_B;
+    op->conv.H_in = H_in;     op->conv.W_in = W_in;     op->conv.C_in = C_in;
+    op->conv.H_out = H_out;   op->conv.W_out = W_out;   op->conv.C_out = fc.O;
+    op->conv.Kh = fc.H;       op->conv.Kw = fc.W;
+    op->conv.stride_h = stride_h; op->conv.stride_w = stride_w;
+    op->conv.pad_h = same_padding ? (fc.H - 1) / 2 : 0;
+    op->conv.pad_w = same_padding ? (fc.W - 1) / 2 : 0;
+    op->conv.relu = true;     // fused ReLU
+    op->w =
+        [device newBufferWithBytes:fc.weights_hwio.data()
+                            length:fc.weights_hwio.size() * sizeof(float)
+                           options:MTLResourceStorageModeShared];
+    op->bias =
+        [device newBufferWithBytes:fc.bias.data()
+                            length:fc.bias.size() * sizeof(float)
+                           options:MTLResourceStorageModeShared];
+    op->mean = nil;     // unused in folded path
+    op->var = nil;
+    op->beta = nil;
+    op->raw_buf = nil;  // no separate BN intermediate
+    const size_t act_bytes = (size_t)max_B * H_out * W_out * fc.O * sizeof(float);
+    op->out_buf = NewBuf(device, act_bytes);
+    if (!op->w || !op->bias || !op->out_buf) {
+      LOG(ERROR) << "BuildBranchOp(folded): alloc failed for conv=" << conv_n;
+      return false;
+    }
+    op->out_H = H_out; op->out_W = W_out; op->out_C = fc.O;
+    return true;
+  }
+
+  // ── UNFOLDED path (research toggle) ─── raw conv + separate BN+ReLU.
   const auto* k = dvw.Get(DetAttr(conv_n, "kernel"));
   const auto* beta = dvw.Get(DetAttr(bn_n, "beta"));
   const auto* mean = dvw.Get(DetAttr(bn_n, "moving_mean"));
   const auto* var = dvw.Get(DetAttr(bn_n, "moving_variance"));
   if (!k || !beta || !mean || !var || k->shape.size() != 4u) {
-    LOG(ERROR) << "BuildBranchOp: missing weights for conv=" << conv_n
+    LOG(ERROR) << "BuildBranchOp(unfolded): missing weights for conv=" << conv_n
                << " bn=" << bn_n;
     return false;
   }
   const int Hk = k->shape[0], Wk = k->shape[1];
   const int Ik = k->shape[2], Ok = k->shape[3];
-  if (Ik != C_in) {
-    LOG(ERROR) << "BuildBranchOp: weight C_in=" << Ik
-               << " mismatch geometry C_in=" << C_in
-               << " (conv=" << conv_n << ")";
-    return false;
-  }
-
+  if (Ik != C_in) return false;
   op->conv.B = max_B;
-  op->conv.H_in = H_in;
-  op->conv.W_in = W_in;
-  op->conv.C_in = C_in;
-  op->conv.H_out = H_out;
-  op->conv.W_out = W_out;
-  op->conv.C_out = Ok;
-  op->conv.Kh = Hk;
-  op->conv.Kw = Wk;
-  op->conv.stride_h = stride_h;
-  op->conv.stride_w = stride_w;
+  op->conv.H_in = H_in; op->conv.W_in = W_in; op->conv.C_in = C_in;
+  op->conv.H_out = H_out; op->conv.W_out = W_out; op->conv.C_out = Ok;
+  op->conv.Kh = Hk; op->conv.Kw = Wk;
+  op->conv.stride_h = stride_h; op->conv.stride_w = stride_w;
   op->conv.pad_h = same_padding ? (Hk - 1) / 2 : 0;
   op->conv.pad_w = same_padding ? (Wk - 1) / 2 : 0;
   op->conv.relu = false;
-
-  op->w = [device newBufferWithBytes:k->data
-                              length:k->n_bytes
+  op->w = [device newBufferWithBytes:k->data length:k->n_bytes
                              options:MTLResourceStorageModeShared];
   std::vector<float> zero_bias(Ok, 0.0f);
   op->bias = [device newBufferWithBytes:zero_bias.data()
                                  length:Ok * sizeof(float)
                                 options:MTLResourceStorageModeShared];
-  op->mean = [device newBufferWithBytes:mean->data
-                                 length:Ok * sizeof(float)
+  op->mean = [device newBufferWithBytes:mean->data length:Ok * sizeof(float)
                                 options:MTLResourceStorageModeShared];
-  op->var = [device newBufferWithBytes:var->data
-                                length:Ok * sizeof(float)
+  op->var = [device newBufferWithBytes:var->data length:Ok * sizeof(float)
                                options:MTLResourceStorageModeShared];
-  op->beta = [device newBufferWithBytes:beta->data
-                                 length:Ok * sizeof(float)
+  op->beta = [device newBufferWithBytes:beta->data length:Ok * sizeof(float)
                                 options:MTLResourceStorageModeShared];
   const size_t act_bytes = (size_t)max_B * H_out * W_out * Ok * sizeof(float);
   op->raw_buf = NewBuf(device, act_bytes);
   op->out_buf = NewBuf(device, act_bytes);
   if (!op->w || !op->bias || !op->mean || !op->var || !op->beta ||
-      !op->raw_buf || !op->out_buf) {
-    LOG(ERROR) << "BuildBranchOp: alloc failed for conv=" << conv_n;
-    return false;
-  }
-  op->out_H = H_out;
-  op->out_W = W_out;
-  op->out_C = Ok;
+      !op->raw_buf || !op->out_buf) return false;
+  op->out_H = H_out; op->out_W = W_out; op->out_C = Ok;
   return true;
 }
 
@@ -650,7 +728,9 @@ bool DispatchDetMixedBlock(id<MTLCommandBuffer> cb,
                            const DetMixedBlock& block,
                            id<MTLBuffer> input_buf,
                            int batch_size) {
-  if (!cb || !conv_serial || !bn_relu || !avg_pool || !concat || !input_buf) {
+  // bn_relu may be nil in folded mode (BN baked into conv weights).
+  // max_pool may be nil for blocks without max-pool branch.
+  if (!cb || !conv_serial || !avg_pool || !concat || !input_buf) {
     LOG(ERROR) << "DispatchDetMixedBlock: nil arg";
     return false;
   }
@@ -701,21 +781,28 @@ bool DispatchDetMixedBlock(id<MTLCommandBuffer> cb,
         const DetBranchOp& op = br.ops[oi];
         ConvDesc cd = op.conv;
         cd.B = batch_size;
+        // Folded path: conv writes directly to out_buf (bias + ReLU
+        // fused). Unfolded path: conv writes to raw_buf, then BN+ReLU
+        // produces out_buf.
+        const bool folded = (op.mean == nil);
+        id<MTLBuffer> conv_dst = folded ? op.out_buf : op.raw_buf;
         if (!conv_serial->Encode(cb, branch_in, op.w, op.bias,
-                                  op.raw_buf, cd)) {
+                                  conv_dst, cd)) {
           LOG(ERROR) << "conv failed (br " << bi << " op " << oi
                      << ", " << block.tap_name << ")";
           return false;
         }
-        BnReluDesc bnd{};
-        bnd.B = batch_size;
-        bnd.H = op.out_H; bnd.W = op.out_W; bnd.C = op.out_C;
-        bnd.eps = kBNEpsilon; bnd.relu = true;
-        if (!bn_relu->Encode(cb, op.raw_buf, op.mean, op.var, op.beta,
-                              op.out_buf, bnd)) {
-          LOG(ERROR) << "bn_relu failed (br " << bi << " op " << oi
-                     << ", " << block.tap_name << ")";
-          return false;
+        if (!folded) {
+          BnReluDesc bnd{};
+          bnd.B = batch_size;
+          bnd.H = op.out_H; bnd.W = op.out_W; bnd.C = op.out_C;
+          bnd.eps = kBNEpsilon; bnd.relu = true;
+          if (!bn_relu->Encode(cb, op.raw_buf, op.mean, op.var, op.beta,
+                                op.out_buf, bnd)) {
+            LOG(ERROR) << "bn_relu failed (br " << bi << " op " << oi
+                       << ", " << block.tap_name << ")";
+            return false;
+          }
         }
         branch_in = op.out_buf;
       }
@@ -724,45 +811,31 @@ bool DispatchDetMixedBlock(id<MTLCommandBuffer> cb,
     } else {
       // Split branch: trunk (sequential ops[0..trunk_size-1]), then 2 parallel
       // ops on trunk_end -> concat into split_concat_out.
-      for (int oi = 0; oi < br.trunk_size; ++oi) {
-        const DetBranchOp& op = br.ops[oi];
+      auto encode_op = [&](const DetBranchOp& op, id<MTLBuffer> in) -> bool {
         ConvDesc cd = op.conv;
         cd.B = batch_size;
-        if (!conv_serial->Encode(cb, branch_in, op.w, op.bias,
-                                  op.raw_buf, cd)) return false;
-        BnReluDesc bnd{};
-        bnd.B = batch_size;
-        bnd.H = op.out_H; bnd.W = op.out_W; bnd.C = op.out_C;
-        bnd.eps = kBNEpsilon; bnd.relu = true;
-        if (!bn_relu->Encode(cb, op.raw_buf, op.mean, op.var, op.beta,
-                              op.out_buf, bnd)) return false;
-        branch_in = op.out_buf;
+        const bool folded = (op.mean == nil);
+        id<MTLBuffer> conv_dst = folded ? op.out_buf : op.raw_buf;
+        if (!conv_serial->Encode(cb, in, op.w, op.bias, conv_dst, cd))
+          return false;
+        if (!folded) {
+          BnReluDesc bnd{};
+          bnd.B = batch_size; bnd.H = op.out_H; bnd.W = op.out_W;
+          bnd.C = op.out_C; bnd.eps = kBNEpsilon; bnd.relu = true;
+          if (!bn_relu->Encode(cb, op.raw_buf, op.mean, op.var, op.beta,
+                                op.out_buf, bnd)) return false;
+        }
+        return true;
+      };
+      for (int oi = 0; oi < br.trunk_size; ++oi) {
+        if (!encode_op(br.ops[oi], branch_in)) return false;
+        branch_in = br.ops[oi].out_buf;
       }
       // 2 parallel ops on `branch_in`.
       const DetBranchOp& opa = br.ops[br.trunk_size];
       const DetBranchOp& opb = br.ops[br.trunk_size + 1];
-      {
-        ConvDesc cd = opa.conv;
-        cd.B = batch_size;
-        if (!conv_serial->Encode(cb, branch_in, opa.w, opa.bias,
-                                  opa.raw_buf, cd)) return false;
-        BnReluDesc bnd{};
-        bnd.B = batch_size; bnd.H = opa.out_H; bnd.W = opa.out_W;
-        bnd.C = opa.out_C; bnd.eps = kBNEpsilon; bnd.relu = true;
-        if (!bn_relu->Encode(cb, opa.raw_buf, opa.mean, opa.var, opa.beta,
-                              opa.out_buf, bnd)) return false;
-      }
-      {
-        ConvDesc cd = opb.conv;
-        cd.B = batch_size;
-        if (!conv_serial->Encode(cb, branch_in, opb.w, opb.bias,
-                                  opb.raw_buf, cd)) return false;
-        BnReluDesc bnd{};
-        bnd.B = batch_size; bnd.H = opb.out_H; bnd.W = opb.out_W;
-        bnd.C = opb.out_C; bnd.eps = kBNEpsilon; bnd.relu = true;
-        if (!bn_relu->Encode(cb, opb.raw_buf, opb.mean, opb.var, opb.beta,
-                              opb.out_buf, bnd)) return false;
-      }
+      if (!encode_op(opa, branch_in)) return false;
+      if (!encode_op(opb, branch_in)) return false;
       // Intra-branch concat: opa.out_buf + opb.out_buf -> split_concat_out.
       ConcatDesc icd{};
       icd.B = batch_size;

@@ -983,7 +983,7 @@ std::unique_ptr<MetalInception> MetalInception::Create(
     const bool serial_full =
         (serial_full_env && std::string(serial_full_env) != "0" &&
          std::string(serial_full_env) != "false");
-    if (serial_full && chain_len == 7 && unfolded_bn) {
+    if (serial_full && chain_len == 7) {
       LOG(INFO) << "Phase 8/Tier 6.0: building full-network det path "
                 << "(11 Inception blocks + global avg pool)";
       // Geometry input to Mixed_5b = output of stem_mp5a.
