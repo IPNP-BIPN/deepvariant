@@ -700,14 +700,14 @@ RealignerOptionsFromFlags() {
   opts.mutable_aln_config()->set_gap_open(absl::GetFlag(FLAGS_aln_gap_open));
   opts.mutable_aln_config()->set_gap_extend(absl::GetFlag(FLAGS_aln_gap_extend));
   if (absl::GetFlag(FLAGS_dbg_disable_graph_pruning)) {
-    // Empirically: setting min_edge_weight=0 (Prune still runs but keeps
-    // all non-ref edges, then prunes unreachable vertices) gives a
-    // tighter candidate set than calling PruneLite() (which keeps
-    // unreachable vertices too). Tested on chr20:10M-10.1M HG003 +
-    // pangenome: PruneLite added 9 spurious only_ours candidates with
-    // no recovery on the only_docker side. The min_edge_weight=0 path
-    // is what we ship.
-    opts.mutable_dbg_config()->set_min_edge_weight(0);
+    // Match upstream make_examples_core.py: dbg_disable_graph_pruning=true
+    // dispatches to PruneLite() (debruijn_graph.cc:257-258), which only
+    // removes orphan vertices instead of unreachable + low-weight edges.
+    // Critical for pangenome at sites with adjacent insertions: keeping
+    // low-weight haplotypes lets reads supporting the simple SNP
+    // realign correctly instead of being absorbed by the long insertion
+    // haplotype.
+    opts.mutable_dbg_config()->set_disable_graph_pruning(true);
   }
   return opts;
 }
