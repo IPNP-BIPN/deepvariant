@@ -166,9 +166,66 @@ Step-2 progression:
 
 Pending: tumor-only mode + FFPE mode (same gate per mode).
 
-### Step 3 — Pangenome-aware DV (pending)
+### Step 3 — Pangenome-aware DV (in progress, commit `18ffb771`)
 
-Adds GBZ reader (mmap) on top of multi-sample plumbing; same hard gate vs Docker pangenome run.
+Pangenome orchestration end-to-end. Apples-to-apples (our binary vs
+Docker, BOTH using the same extracted pangenome BAM as input) on
+chr20:10M-10.1M:
+
+- 252/322 site-set parity (78.3%)
+- 9 FILTER mismatches on shared sites (3.5%, NoCall ↔ PASS / NoCall ↔ RefCall borderline)
+- 60 only_ours, 70 only_docker (candidate-generation gap)
+
+Reference captures:
+
+- Docker(GBZ direct)         : 327 sites (ground truth)
+- Docker(our extracted BAM)  : 322 sites — 5 sites lost to BAM extraction
+- Our native(BAM)            : 312 sites
+
+Step 3-v1 (`2f65ecf2`) — orchestration end-to-end. Pangenome flags +
+2-sample SampleOptions (pangenome=0, reads=1) mirroring
+`make_examples_pangenome_aware_dv.py:reads_and_pangenome_samples_from_flags`.
+Per-sample fields: `skip_output_generation`, `skip_phasing`,
+`skip_normalization`, `keep_only_window_spanning_reads`,
+`alt_aligned_pileup="none"`, `channels_enum_to_blank`. Pic-level
+`sort_by_haplotypes=true`, `trim_reads_for_pileup=true`,
+AlleleCounter `normalize_reads=true`. cli.cc `RunAllPangenome`
+dispatch (1× make_examples + 1× call_variants + 1× postprocess).
+Pangenome runs through the existing multi-sample worker (trio/somatic
+sharing).
+
+Step 3-v2 (`05e23f3a`) — `--min_mapping_quality=0` per pangenome
+example_info.json:flags_for_calling. Note pangenome uses GLOBAL
+default `vsc_min_fraction_{snps,indels}` (0.12 / 0.06); only mapq is
+overridden.
+
+Step 3-v3 (`18ffb771`) — `keep_legacy_allele_counter_behavior=true` +
+`keep_supplementary_alignments=true` per pangenome example_info.json
+(no measurable effect on chr20:10M-10.1M).
+
+GBZ at runtime is **out of scope** for v2 (gbwt/gbwtgraph/sdsl-lite/
+libdivsufsort/libhandlegraph not in Homebrew, ~5+ libs to vendor +
+Boost interprocess shm). Users must convert GBZ→BAM via Docker
+preprocessing once. The Docker preprocessing on chr20:10M-10.1M
+produced 89 synthetic haplotype reads from `hprc-v1.1-mc-grch38.gbz`;
+the BAM is reproducible via the documented pipeline (3.3 GB GBZ
+download + Python script using `sam.SamReader.query`).
+
+Pangenome model bundle: extracted via `tools/conversion/extract_weights.py`
+on `/opt/models/pangenome_aware_deepvariant/wgs/` →
+`pangenome.wgs.dvw` (378 tensors, 87 MB). Pangenome WGS doesn't ship
+a small_model.
+
+Probable remaining root causes for the 60 only_ours / 70 only_docker /
+9 FM gap:
+
+- **Realigner aln_* params** — we use 4/6/8/2 (match/mismatch/gap_open/
+  gap_extend); pangenome wants 2/5/10/1. SSW alignment differences
+  change which candidates the realigner accepts. Requires native flag
+  plumbing for per-mode aln params.
+- **`dbg_disable_graph_pruning=true`** — realigner's de-Bruijn graph
+  pruning. Not yet wired natively; default is false.
+- **GBZ→BAM extraction** caps at 322/327 ceiling (~1.5% intrinsic loss).
 
 ## Pitfalls already known (mine before re-discovering)
 
