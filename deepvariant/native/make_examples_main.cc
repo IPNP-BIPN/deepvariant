@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -154,6 +155,47 @@ ABSL_FLAG(std::string, small_model_cvo_outfile_parent1, "",
           "Trio mode: small_model CVO output path for parent1.");
 ABSL_FLAG(std::string, small_model_cvo_outfile_parent2, "",
           "Trio mode: small_model CVO output path for parent2.");
+
+// ----------------------------------------------------------------------------
+// DeepSomatic mode (Step 2):
+//   tumor + normal: 2 samples — normal at index 0, tumor at index 1 (=main).
+//   tumor_only:     1 sample  — tumor at index 0 (=main).
+// Mirrors deepvariant/make_examples_somatic.py:tumor_normal_samples_from_flags.
+// Critical somatic-specific override: vsc_min_fraction_multiplier=inf so
+// candidates from the non-target (normal) sample are excluded from the
+// tumor candidate set (somatic ≠ trio: we don't want normal-only variants
+// in the tumor's call list).
+// ----------------------------------------------------------------------------
+ABSL_FLAG(std::string, reads_tumor, "",
+          "Somatic mode: BAM/CRAM for the tumor sample. When set, make_examples "
+          "runs as DeepSomatic (tumor + optional normal; tumor = main).");
+ABSL_FLAG(std::string, reads_normal, "",
+          "Somatic mode: BAM/CRAM for the normal sample. If empty, runs in "
+          "tumor-only mode.");
+ABSL_FLAG(std::string, sample_name_tumor, "",
+          "Somatic mode: tumor sample name (inferred from BAM if empty).");
+ABSL_FLAG(std::string, sample_name_normal, "",
+          "Somatic mode: normal sample name (inferred from BAM if empty).");
+ABSL_FLAG(int, pileup_image_height_tumor, 0,
+          "Somatic mode: pileup image height for the tumor sample. 0 = default "
+          "(100 per upstream dv_constants.PILEUP_DEFAULT_HEIGHT).");
+ABSL_FLAG(int, pileup_image_height_normal, 0,
+          "Somatic mode: pileup image height for the normal sample. 0 = default "
+          "(100 per upstream dv_constants.PILEUP_DEFAULT_HEIGHT).");
+ABSL_FLAG(double, downsample_fraction_tumor, 0.0,
+          "Somatic mode: downsample fraction applied to tumor reads.");
+ABSL_FLAG(double, downsample_fraction_normal, 0.0,
+          "Somatic mode: downsample fraction applied to normal reads.");
+ABSL_FLAG(std::string, small_model_path_somatic, "",
+          "Somatic mode: small_model weights directory for the tumor.");
+ABSL_FLAG(std::string, small_model_cvo_outfile_tumor, "",
+          "Somatic mode: small_model CVO output path for the tumor sample.");
+ABSL_FLAG(std::string, examples_tumor, "",
+          "Somatic mode: examples output path for the tumor sample. "
+          "If empty, the existing --examples flag is used.");
+ABSL_FLAG(std::string, examples_normal, "",
+          "Somatic mode: examples output path for the normal sample "
+          "(usually unused since normal has skip_output_generation=true).");
 
 namespace deepvariant {
 
@@ -335,6 +377,74 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
     // MAIN_SAMPLE_INDEX = 1 (child) per deeptrio/make_examples.py:48.
     opts.set_main_sample_index(1);
     opts.set_sample_role_to_train("child");
+  } else if (!absl::GetFlag(FLAGS_reads_tumor).empty()) {
+    // ──────────────── DeepSomatic mode ────────────────
+    // samples_in_order = [normal(0), tumor(1)] when normal provided
+    //                  = [tumor(0)]            for tumor-only.
+    // Mirrors deepvariant/make_examples_somatic.py:152-218.
+    const std::string normal_reads = absl::GetFlag(FLAGS_reads_normal);
+    const std::string tumor_reads  = absl::GetFlag(FLAGS_reads_tumor);
+    const bool has_normal = !normal_reads.empty();
+    int tumor_h  = absl::GetFlag(FLAGS_pileup_image_height_tumor);
+    int normal_h = absl::GetFlag(FLAGS_pileup_image_height_normal);
+    if (tumor_h  <= 0) tumor_h  = 100;  // dv_constants.PILEUP_DEFAULT_HEIGHT
+    if (normal_h <= 0) normal_h = 100;
+    const double ds_tumor  = absl::GetFlag(FLAGS_downsample_fraction_tumor);
+    const double ds_normal = absl::GetFlag(FLAGS_downsample_fraction_normal);
+    const std::string tumor_name  = absl::GetFlag(FLAGS_sample_name_tumor);
+    const std::string normal_name = absl::GetFlag(FLAGS_sample_name_normal);
+
+    auto add_somatic_sample = [&](const std::string& role,
+                                    const std::string& name,
+                                    const std::string& reads, int height,
+                                    double ds, std::initializer_list<int> order,
+                                    bool skip_output, bool is_tumor) {
+      SampleOptions* s = opts.add_sample_options();
+      s->set_role(role);
+      s->set_name(name);
+      if (!reads.empty()) s->add_reads_filenames(reads);
+      s->set_pileup_height(height);
+      *s->mutable_variant_caller_options() = vc_opts;
+      s->mutable_variant_caller_options()->set_sample_name(name);
+      // Somatic mirrors make_examples_somatic.py:149:
+      //   FLAGS.set_default('vsc_min_fraction_multiplier', float('inf'))
+      // The infinity makes the joint-promotion threshold infeasible, so
+      // candidates only get promoted when the TARGET sample's own
+      // VAF >= min_fraction (i.e. no normal-only candidates leak into
+      // the tumor list). The std::numeric_limits<float>::infinity() value
+      // is preserved in the proto float field as a true IEEE infinity.
+      s->mutable_variant_caller_options()->set_min_fraction_multiplier(
+          std::numeric_limits<float>::infinity());
+      for (int o : order) s->add_order(o);
+      s->set_skip_output_generation(skip_output);
+      if (is_tumor) {
+        if (!absl::GetFlag(FLAGS_small_model_path_somatic).empty()) {
+          s->set_small_model_path(
+              absl::GetFlag(FLAGS_small_model_path_somatic));
+        }
+      }
+      if (ds > 0.0) s->set_downsample_fraction(static_cast<float>(ds));
+    };
+
+    if (has_normal) {
+      // Order in samples_in_order: [normal(0), tumor(1)]. Tumor's
+      // sample.options.order = [0, 1] places normal first in the pileup
+      // stack — mirrors make_examples_somatic.py:198.
+      add_somatic_sample("normal", normal_name.empty() ? "normal" : normal_name,
+                          normal_reads, normal_h, ds_normal,
+                          {0, 1}, /*skip_output=*/true, /*is_tumor=*/false);
+      add_somatic_sample("tumor", tumor_name.empty() ? "tumor" : tumor_name,
+                          tumor_reads, tumor_h, ds_tumor,
+                          {0, 1}, /*skip_output=*/false, /*is_tumor=*/true);
+      opts.set_main_sample_index(1);  // tumor at index 1
+    } else {
+      // Tumor-only: single sample at index 0, order=[0].
+      add_somatic_sample("tumor", tumor_name.empty() ? "tumor" : tumor_name,
+                          tumor_reads, tumor_h, ds_tumor,
+                          {0}, /*skip_output=*/false, /*is_tumor=*/true);
+      opts.set_main_sample_index(0);
+    }
+    opts.set_sample_role_to_train("tumor");
   } else {
     SampleOptions* sopt = opts.add_sample_options();
     sopt->set_role("sample");
@@ -358,6 +468,16 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
 // Returns true when --reads_parent1 was set (trio mode active).
 bool IsTrioMode() {
   return !absl::GetFlag(FLAGS_reads_parent1).empty();
+}
+
+// Returns true when --reads_tumor was set (somatic mode active).
+bool IsSomaticMode() {
+  return !absl::GetFlag(FLAGS_reads_tumor).empty();
+}
+
+// Returns true when somatic mode AND --reads_normal is also set.
+bool IsSomaticTumorNormalMode() {
+  return IsSomaticMode() && !absl::GetFlag(FLAGS_reads_normal).empty();
 }
 
 // Infer sample name from the first RG:SM field in the BAM header.
@@ -470,17 +590,28 @@ int RunMakeExamples(int argc, char** argv) {
   const std::string ref_path = absl::GetFlag(FLAGS_ref);
   const std::string examples_path = absl::GetFlag(FLAGS_examples);
 
-  if (reads_path.empty() || ref_path.empty()) {
-    LOG(ERROR) << "Required: --reads, --ref";
+  if (ref_path.empty()) {
+    LOG(ERROR) << "Required: --ref";
+    return 1;
+  }
+  if (reads_path.empty() && !IsSomaticMode()) {
+    LOG(ERROR) << "Required: --reads (or --reads_tumor for somatic mode)";
     return 1;
   }
   // Trio mode: at least one of --examples / --examples_child must be set.
-  // Parents are optional (skip_parent_calling), but child is mandatory.
   if (IsTrioMode()) {
     const std::string ex_child = absl::GetFlag(FLAGS_examples_child);
     if (examples_path.empty() && ex_child.empty()) {
       LOG(ERROR)
           << "Trio mode requires --examples_child (or --examples as alias).";
+      return 1;
+    }
+  } else if (IsSomaticMode()) {
+    // Somatic: tumor's examples are mandatory; normal has skip_output=true.
+    const std::string ex_tumor = absl::GetFlag(FLAGS_examples_tumor);
+    if (examples_path.empty() && ex_tumor.empty()) {
+      LOG(ERROR)
+          << "Somatic mode requires --examples_tumor (or --examples as alias).";
       return 1;
     }
   } else if (examples_path.empty()) {
@@ -501,18 +632,27 @@ int RunMakeExamples(int argc, char** argv) {
   auto ref_reader_main = std::move(ref_or.ValueOrDie());
 
   // ── Infer sample name from the BAM header (cheap, single read). ──────────
+  // For somatic mode, use the tumor BAM (no --reads needed); for trio we
+  // also infer from the (child) --reads. Fall back to a default name if
+  // the user passed neither.
   nucleus::genomics::v1::SamReaderOptions sam_opts;
   sam_opts.mutable_read_requirements()->set_min_mapping_quality(
       absl::GetFlag(FLAGS_min_mapping_quality));
   {
-    auto sam_or = nucleus::SamReader::FromFile(reads_path, sam_opts);
-    CHECK(sam_or.ok()) << "Failed to open BAM: " << reads_path;
-    auto tmp_reader = std::move(sam_or.ValueOrDie());
-    std::string sn = absl::GetFlag(FLAGS_sample_name);
-    if (sn.empty()) {
-      sn = InferSampleName(tmp_reader->Header());
-      LOG(INFO) << "Inferred sample name: " << sn;
-      absl::SetFlag(&FLAGS_sample_name, sn);
+    std::string probe_bam = reads_path;
+    if (probe_bam.empty() && IsSomaticMode()) {
+      probe_bam = absl::GetFlag(FLAGS_reads_tumor);
+    }
+    if (!probe_bam.empty()) {
+      auto sam_or = nucleus::SamReader::FromFile(probe_bam, sam_opts);
+      CHECK(sam_or.ok()) << "Failed to open BAM: " << probe_bam;
+      auto tmp_reader = std::move(sam_or.ValueOrDie());
+      std::string sn = absl::GetFlag(FLAGS_sample_name);
+      if (sn.empty()) {
+        sn = InferSampleName(tmp_reader->Header());
+        LOG(INFO) << "Inferred sample name: " << sn;
+        absl::SetFlag(&FLAGS_sample_name, sn);
+      }
     }
   }
   const std::string sample_name = absl::GetFlag(FLAGS_sample_name);
@@ -600,14 +740,17 @@ int RunMakeExamples(int argc, char** argv) {
   // below is unchanged (preserves the WGS chr20 100% FILTER parity
   // gate already achieved at 5.5d/10).
   // ──────────────────────────────────────────────────────────────────
+  // Multi-sample worker: handles BOTH trio (3 samples: parent1, child,
+  // parent2) AND somatic (1-2 samples: tumor[, normal]). Same processing
+  // pipeline; only role names + flag plumbing differ.
   auto run_trio_worker = [&](int tid, WorkerStats* out_stats) {
     auto t_ref_or = nucleus::IndexedFastaReader::FromFile(
         ref_path, absl::StrCat(ref_path, ".fai"));
     CHECK(t_ref_or.ok()) << "thread " << tid << ": ref reopen failed";
     auto ref_reader = std::move(t_ref_or.ValueOrDie());
 
-    // Per-role context. Index 0=parent1, 1=child, 2=parent2 (mirrors
-    // upstream samples_in_order at deeptrio/make_examples.py:318).
+    // Per-role context. Up to 3 sample slots; trio uses all 3 (parent1,
+    // child, parent2), somatic uses 1-2 (tumor[, normal]).
     struct SampleCtx {
       std::string role;
       std::string name;
@@ -624,16 +767,15 @@ int RunMakeExamples(int argc, char** argv) {
       int64_t total_small_hits = 0;
       int64_t total_big_dispatched = 0;
     };
+    const int n_samples = opts.sample_options_size();
     std::array<SampleCtx, 3> ctx;
-    for (int s = 0; s < 3; ++s) {
+    for (int s = 0; s < n_samples; ++s) {
       const auto& so = opts.sample_options(s);
       ctx[s].role = so.role();
       ctx[s].name = so.name();
       ctx[s].pileup_height = so.pileup_height();
       ctx[s].skip_output = so.skip_output_generation();
       for (int o : so.order()) ctx[s].order.push_back(o);
-      // Open BAM (only if reads_filenames is set; pangenome's pangenome-
-      // sample has no BAM, but trio always has all 3).
       if (so.reads_filenames_size() > 0) {
         auto sr_or = nucleus::SamReader::FromFile(so.reads_filenames(0),
                                                     sam_opts);
@@ -643,12 +785,9 @@ int RunMakeExamples(int argc, char** argv) {
       }
     }
 
-    // Per-target small_model + small_cvo writer + examples path.
-    // Trio convention: child uses --small_model_path_child; parent1/2
-    // share --small_model_path_parent. Per-sample examples paths come
-    // from --examples_{child,parent1,parent2} (or fall back to
-    // --examples for child for backward compat).
-    auto trio_examples_path = [&](const std::string& role) -> std::string {
+    // Per-role examples path lookup. Handles both trio roles
+    // (parent1/child/parent2) and somatic roles (tumor/normal).
+    auto multi_examples_path = [&](const std::string& role) -> std::string {
       std::string base;
       if (role == "child")
         base = absl::GetFlag(FLAGS_examples_child).empty()
@@ -656,39 +795,57 @@ int RunMakeExamples(int argc, char** argv) {
                    : absl::GetFlag(FLAGS_examples_child);
       else if (role == "parent1")
         base = absl::GetFlag(FLAGS_examples_parent1);
-      else  // parent2
+      else if (role == "parent2")
         base = absl::GetFlag(FLAGS_examples_parent2);
+      else if (role == "tumor")
+        base = absl::GetFlag(FLAGS_examples_tumor).empty()
+                   ? examples_path
+                   : absl::GetFlag(FLAGS_examples_tumor);
+      else if (role == "normal")
+        base = absl::GetFlag(FLAGS_examples_normal);
       if (base.empty()) return "";
       return n_threads == 1 ? base : ShardName(base, tid);
     };
-    auto trio_small_cvo_path = [&](const std::string& role) -> std::string {
+    auto multi_small_cvo_path = [&](const std::string& role) -> std::string {
       std::string base;
       if (role == "child")
         base = absl::GetFlag(FLAGS_small_model_cvo_outfile_child);
       else if (role == "parent1")
         base = absl::GetFlag(FLAGS_small_model_cvo_outfile_parent1);
-      else
+      else if (role == "parent2")
         base = absl::GetFlag(FLAGS_small_model_cvo_outfile_parent2);
+      else if (role == "tumor")
+        base = absl::GetFlag(FLAGS_small_model_cvo_outfile_tumor);
+      // normal: skip_output=true → no CVO
       if (base.empty()) return "";
       return n_threads == 1 ? base : ShardName(base, tid);
     };
 
-    const std::string sm_child  = absl::GetFlag(FLAGS_small_model_path_child);
-    const std::string sm_parent = absl::GetFlag(FLAGS_small_model_path_parent);
+    const std::string sm_child   = absl::GetFlag(FLAGS_small_model_path_child);
+    const std::string sm_parent  = absl::GetFlag(FLAGS_small_model_path_parent);
+    const std::string sm_somatic = absl::GetFlag(FLAGS_small_model_path_somatic);
+
+    auto sm_path_for_role = [&](const std::string& role) -> const std::string& {
+      static const std::string empty;
+      if (role == "child")   return sm_child;
+      if (role == "parent1" || role == "parent2") return sm_parent;
+      if (role == "tumor")   return sm_somatic;
+      return empty;
+    };
 
     std::unordered_map<std::string, std::string> example_filenames;
-    for (auto& c : ctx) {
-      c.examples_path = trio_examples_path(c.role);
+    for (int s = 0; s < n_samples; ++s) {
+      auto& c = ctx[s];
+      c.examples_path = multi_examples_path(c.role);
       if (!c.skip_output && !c.examples_path.empty()) {
         example_filenames[c.role] = c.examples_path;
       }
-      // Small-model load — child or parent share-of-two depending on role.
-      const std::string& sm_path = (c.role == "child") ? sm_child : sm_parent;
+      const std::string& sm_path = sm_path_for_role(c.role);
       if (!sm_path.empty() && !c.skip_output) {
         c.small_model = SmallModel::Load(sm_path);
         CHECK(c.small_model) << "thread " << tid << " " << c.role
                               << ": small_model load failed: " << sm_path;
-        const std::string scp = trio_small_cvo_path(c.role);
+        const std::string scp = multi_small_cvo_path(c.role);
         if (!scp.empty()) {
           c.small_cvo_writer = TFRecordWriter::New(scp);
           CHECK(c.small_cvo_writer)
@@ -718,7 +875,7 @@ int RunMakeExamples(int argc, char** argv) {
       std::array<std::vector<nucleus::genomics::v1::Read>, 3> reads_per_sample_v;
       const int max_rpp = static_cast<int>(opts.max_reads_per_partition());
       const bool realigner_enabled = absl::GetFlag(FLAGS_realigner_enabled);
-      for (int s = 0; s < 3; ++s) {
+      for (int s = 0; s < n_samples; ++s) {
         if (!ctx[s].sam_reader) continue;
         auto reads_or = ctx[s].sam_reader->Query(region);
         if (!reads_or.ok()) {
@@ -812,7 +969,7 @@ int RunMakeExamples(int argc, char** argv) {
 
       // Step 1: per-sample probe to compute per-sample candidate positions.
       std::array<std::unique_ptr<AlleleCounter>, 3> probes;
-      for (int s = 0; s < 3; ++s) {
+      for (int s = 0; s < n_samples; ++s) {
         if (!ctx[s].sam_reader) continue;
         probes[s] = std::make_unique<AlleleCounter>(
             ref_reader.get(), region, /*positions=*/std::vector<int>{},
@@ -828,10 +985,10 @@ int RunMakeExamples(int argc, char** argv) {
       std::array<std::vector<int>, 3> per_sample_cand_positions;
       {
         std::unordered_map<std::string, AlleleCounter*> probe_map;
-        for (int s = 0; s < 3; ++s) {
+        for (int s = 0; s < n_samples; ++s) {
           if (probes[s]) probe_map[ctx[s].name] = probes[s].get();
         }
-        for (int s = 0; s < 3; ++s) {
+        for (int s = 0; s < n_samples; ++s) {
           if (!probes[s]) continue;
           per_sample_cand_positions[s] =
               caller.CallPositionsFromAlleleCounts(
@@ -840,7 +997,7 @@ int RunMakeExamples(int argc, char** argv) {
       }
 
       // Step 3: rebuild each AlleleCounter with its OWN candidate_positions.
-      for (int s = 0; s < 3; ++s) {
+      for (int s = 0; s < n_samples; ++s) {
         if (!ctx[s].sam_reader) continue;
         counters[s] = std::make_unique<AlleleCounter>(
             ref_reader.get(), region, per_sample_cand_positions[s],
@@ -854,14 +1011,14 @@ int RunMakeExamples(int argc, char** argv) {
       // Build the unordered_map<sample_name, AlleleCounter*> map for
       // multi_sample::VariantCaller.
       std::unordered_map<std::string, AlleleCounter*> ac_map;
-      for (int s = 0; s < 3; ++s) {
+      for (int s = 0; s < n_samples; ++s) {
         if (counters[s]) ac_map[ctx[s].name] = counters[s].get();
       }
 
       // For each target sample (child, parent1, parent2): generate
       // candidates with the multi-sample API, run small_model dispatch,
       // emit examples + CVOs. Skip parents when --skip_parent_calling.
-      for (int s = 0; s < 3; ++s) {
+      for (int s = 0; s < n_samples; ++s) {
         SampleCtx& C = ctx[s];
         if (C.skip_output) continue;
 
@@ -1008,7 +1165,9 @@ int RunMakeExamples(int argc, char** argv) {
   // `next_region` until the queue is exhausted. Writes only to its own
   // per-thread files; no inter-thread mutation.
   auto run_worker = [&](int tid, WorkerStats* out_stats) {
-    if (IsTrioMode()) {
+    if (IsTrioMode() || IsSomaticMode()) {
+      // Multi-sample worker handles both trio (3 samples) and somatic
+      // (1-2 samples) — dispatched on opts.sample_options_size().
       run_trio_worker(tid, out_stats);
       return;
     }
