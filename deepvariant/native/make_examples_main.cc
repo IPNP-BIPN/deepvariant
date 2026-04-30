@@ -700,7 +700,13 @@ RealignerOptionsFromFlags() {
   opts.mutable_aln_config()->set_gap_open(absl::GetFlag(FLAGS_aln_gap_open));
   opts.mutable_aln_config()->set_gap_extend(absl::GetFlag(FLAGS_aln_gap_extend));
   if (absl::GetFlag(FLAGS_dbg_disable_graph_pruning)) {
-    // Skip pruning by setting min_edge_weight to 0 (no pruning).
+    // Empirically: setting min_edge_weight=0 (Prune still runs but keeps
+    // all non-ref edges, then prunes unreachable vertices) gives a
+    // tighter candidate set than calling PruneLite() (which keeps
+    // unreachable vertices too). Tested on chr20:10M-10.1M HG003 +
+    // pangenome: PruneLite added 9 spurious only_ours candidates with
+    // no recovery on the only_docker side. The min_edge_weight=0 path
+    // is what we ship.
     opts.mutable_dbg_config()->set_min_edge_weight(0);
   }
   return opts;
