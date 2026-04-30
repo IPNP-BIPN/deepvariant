@@ -415,6 +415,17 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
       // is preserved in the proto float field as a true IEEE infinity.
       s->mutable_variant_caller_options()->set_min_fraction_multiplier(
           std::numeric_limits<float>::infinity());
+      // Somatic non-target (normal) AF cap from
+      // /opt/models/deepsomatic/wgs/model.example_info.json:
+      //   vsc_max_fraction_{snps,indels}_for_non_target_sample = 0.5
+      // Candidates where the normal sample has alt VAF > 0.5 are skipped
+      // (they're clear germline het/hom). Used by AlleleFilter at
+      // variant_calling_multisample.cc:271-288. Default is 0 which
+      // disables the filter.
+      s->mutable_variant_caller_options()
+          ->set_max_fraction_snps_for_non_target_sample(0.5f);
+      s->mutable_variant_caller_options()
+          ->set_max_fraction_indels_for_non_target_sample(0.5f);
       for (int o : order) s->add_order(o);
       s->set_skip_output_generation(skip_output);
       if (is_tumor) {
