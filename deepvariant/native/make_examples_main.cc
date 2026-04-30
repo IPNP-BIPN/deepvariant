@@ -197,6 +197,56 @@ ABSL_FLAG(std::string, examples_normal, "",
           "Somatic mode: examples output path for the normal sample "
           "(usually unused since normal has skip_output_generation=true).");
 
+// ----------------------------------------------------------------------------
+// Pangenome-aware DV mode (Step 3):
+//   2 samples — pangenome at index 0, reads at index 1 (=main).
+// Mirrors deepvariant/make_examples_pangenome_aware_dv.py:
+//   reads_and_pangenome_samples_from_flags. Critical pangenome-specific
+//   overrides on the pangenome sample (mirrors pangenome_sample_options
+//   in upstream Python at line 239):
+//   - skip_output_generation=true  (only reads' examples are emitted)
+//   - skip_phasing=true            (haplotype tags from reads only)
+//   - skip_normalization=true      (no read normalization on synthetic haplotypes)
+//   - keep_only_window_spanning_reads (drop reads not spanning the window)
+//   - channels_enum_to_blank: CH_HAPLOTYPE_TAG, CH_DIFF_CHANNELS_*,
+//     CH_BASE_QUALITY, CH_MAPPING_QUALITY  (5 channels blanked in pangenome rows)
+//   - alt_aligned_pileup="none"    (no alt-alignment for pangenome)
+// Plus pic-level flag: trim_reads_for_pileup=true (pangenome reads
+// are trimmed to fit the example window).
+// At runtime the --pangenome flag accepts BAM/CRAM only; GBZ input is
+// out of scope for v2 (users pre-extract via Docker's
+// load_gbz_into_shared_memory if needed).
+// ----------------------------------------------------------------------------
+ABSL_FLAG(std::string, reads_pangenome, "",
+          "Pangenome mode: BAM/CRAM for the pangenome panel. When set, "
+          "make_examples runs as pangenome-aware DV (pangenome + reads; "
+          "reads = main). Note: GBZ input is not supported in the native "
+          "binary; convert GBZ→BAM via Docker preprocessing.");
+ABSL_FLAG(std::string, sample_name_pangenome, "pangenome",
+          "Pangenome mode: pangenome sample name "
+          "(default 'pangenome').");
+ABSL_FLAG(std::string, sample_name_reads, "",
+          "Pangenome mode: reads sample name (inferred from BAM if empty).");
+ABSL_FLAG(int, pileup_image_height_pangenome, 0,
+          "Pangenome mode: pileup image height for the pangenome sample. "
+          "0 = default 100.");
+ABSL_FLAG(int, pileup_image_height_reads, 0,
+          "Pangenome mode: pileup image height for the reads sample. "
+          "0 = default 100.");
+ABSL_FLAG(double, downsample_fraction_reads, 0.0,
+          "Pangenome mode: downsample fraction applied to reads.");
+ABSL_FLAG(std::string, small_model_path_pangenome, "",
+          "Pangenome mode: small_model weights directory for the reads "
+          "sample.");
+ABSL_FLAG(std::string, small_model_cvo_outfile_reads, "",
+          "Pangenome mode: small_model CVO output path for the reads sample.");
+ABSL_FLAG(std::string, examples_reads, "",
+          "Pangenome mode: examples output path for the reads sample. "
+          "If empty, the existing --examples flag is used.");
+ABSL_FLAG(std::string, examples_pangenome, "",
+          "Pangenome mode: examples output path for the pangenome sample "
+          "(unused since pangenome has skip_output_generation=true).");
+
 namespace deepvariant {
 
 using namespace learning::genomics::deepvariant;  // NOLINT
@@ -473,6 +523,109 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
       opts.set_main_sample_index(0);
     }
     opts.set_sample_role_to_train("tumor");
+  } else if (!absl::GetFlag(FLAGS_reads_pangenome).empty()) {
+    // ──────────────── Pangenome-aware DV mode ────────────────
+    // samples_in_order = [pangenome(0), reads(1)]; reads = main.
+    // Mirrors deepvariant/make_examples_pangenome_aware_dv.py:
+    //   reads_and_pangenome_samples_from_flags (line 207-287).
+    //
+    // Pangenome example_info.json:flags_for_calling per
+    // /opt/models/pangenome_aware_deepvariant/wgs/model.example_info.json:
+    //   keep_legacy_allele_counter_behavior: true
+    //   keep_only_window_spanning_haplotypes: true
+    //   keep_supplementary_alignments: true
+    //   min_mapping_quality: 0
+    //   normalize_reads: true
+    //   pileup_image_height_pangenome: 100
+    //   pileup_image_height_reads: 100
+    //   pileup_image_width: 221
+    //   sort_by_haplotypes: true
+    //   trim_reads_for_pileup: true
+    //   dbg_disable_graph_pruning: true
+    //   aln_match=2 / aln_mismatch=5 / aln_gap_open=10 / aln_gap_extend=1
+    // Of these, the per-sample-affecting ones are applied below; pic-
+    // level (sort_by_haplotypes, trim_reads_for_pileup) are applied on
+    // opts.pic_options; opts-level normalize_reads is set on opts itself.
+    opts.mutable_pic_options()->set_sort_by_haplotypes(true);
+    opts.set_trim_reads_for_pileup(true);
+    // normalize_reads is on AlleleCounterOptions, not MakeExamplesOptions.
+    opts.mutable_allele_counter_options()->set_normalize_reads(true);
+
+    const std::string pangenome_reads = absl::GetFlag(FLAGS_reads_pangenome);
+    const std::string main_reads      = absl::GetFlag(FLAGS_reads);
+    int pangenome_h = absl::GetFlag(FLAGS_pileup_image_height_pangenome);
+    int reads_h     = absl::GetFlag(FLAGS_pileup_image_height_reads);
+    if (pangenome_h <= 0) pangenome_h = 100;
+    if (reads_h <= 0) reads_h = 100;
+    const double ds_reads = absl::GetFlag(FLAGS_downsample_fraction_reads);
+    const std::string reads_name      = absl::GetFlag(FLAGS_sample_name_reads);
+    const std::string pangenome_name  = absl::GetFlag(FLAGS_sample_name_pangenome);
+
+    // Reads sample (index 1, main): order=[0,1] (pangenome first, then reads).
+    {
+      SampleOptions* s = opts.add_sample_options();
+      s->set_role("reads");
+      s->set_name(reads_name.empty() ? sample_name : reads_name);
+      if (!main_reads.empty()) s->add_reads_filenames(main_reads);
+      s->set_pileup_height(reads_h);
+      *s->mutable_variant_caller_options() = vc_opts;
+      s->mutable_variant_caller_options()->set_sample_name(
+          reads_name.empty() ? sample_name : reads_name);
+      // Mirror upstream Python:
+      //   FLAGS.set_default('vsc_min_fraction_multiplier', float('inf'))
+      // — drop candidates from the non-target (pangenome) sample.
+      s->mutable_variant_caller_options()->set_min_fraction_multiplier(
+          std::numeric_limits<float>::infinity());
+      s->add_order(0);
+      s->add_order(1);
+      if (ds_reads > 0.0) s->set_downsample_fraction(static_cast<float>(ds_reads));
+      if (!absl::GetFlag(FLAGS_small_model_path_pangenome).empty()) {
+        s->set_small_model_path(
+            absl::GetFlag(FLAGS_small_model_path_pangenome));
+      }
+    }
+    // Pangenome sample (index 0, non-target): blank channels, skip_phasing,
+    // skip_normalization, keep_only_window_spanning_reads.
+    {
+      SampleOptions* s = opts.add_sample_options();
+      s->set_role("pangenome");
+      s->set_name(pangenome_name);
+      s->add_reads_filenames(pangenome_reads);
+      s->set_pileup_height(pangenome_h);
+      *s->mutable_variant_caller_options() = vc_opts;
+      s->mutable_variant_caller_options()->set_sample_name(pangenome_name);
+      s->mutable_variant_caller_options()->set_min_fraction_multiplier(
+          std::numeric_limits<float>::infinity());
+      s->set_skip_output_generation(true);
+      s->set_keep_only_window_spanning_reads(true);
+      s->set_skip_phasing(true);
+      s->set_skip_normalization(true);
+      s->set_alt_aligned_pileup("none");
+      // Per upstream make_examples_pangenome_aware_dv.py:250-256,
+      // pangenome rows zero out 5 channels: HAPLOTYPE_TAG (channel 8),
+      // DIFF_CHANNELS_ALTERNATE_ALLELE_1 (15), _2 (16), BASE_QUALITY (2),
+      // MAPPING_QUALITY (3). Enum values are from
+      // deepvariant.proto:DeepVariantChannelEnum.
+      s->add_channels_enum_to_blank(::learning::genomics::deepvariant::
+                                       CH_HAPLOTYPE_TAG);
+      s->add_channels_enum_to_blank(::learning::genomics::deepvariant::
+                                       CH_DIFF_CHANNELS_ALTERNATE_ALLELE_1);
+      s->add_channels_enum_to_blank(::learning::genomics::deepvariant::
+                                       CH_DIFF_CHANNELS_ALTERNATE_ALLELE_2);
+      s->add_channels_enum_to_blank(::learning::genomics::deepvariant::
+                                       CH_BASE_QUALITY);
+      s->add_channels_enum_to_blank(::learning::genomics::deepvariant::
+                                       CH_MAPPING_QUALITY);
+    }
+    // Note: Python pushes [pangenome, reads] but we build [reads, pangenome]
+    // because main_sample_index=1 must point at reads. The Python
+    // samples_in_order list builds them in [pangenome, reads] order with
+    // PANGENOME_SAMPLE_INDEX=0, MAIN_SAMPLE_INDEX=1; we match that
+    // ordering by swapping our additions. Re-order:
+    auto* mut = opts.mutable_sample_options();
+    if (mut->size() == 2) std::swap(*mut->Mutable(0), *mut->Mutable(1));
+    opts.set_main_sample_index(1);  // reads at index 1
+    opts.set_sample_role_to_train("reads");
   } else {
     SampleOptions* sopt = opts.add_sample_options();
     sopt->set_role("sample");
@@ -506,6 +659,11 @@ bool IsSomaticMode() {
 // Returns true when somatic mode AND --reads_normal is also set.
 bool IsSomaticTumorNormalMode() {
   return IsSomaticMode() && !absl::GetFlag(FLAGS_reads_normal).empty();
+}
+
+// Returns true when --reads_pangenome was set (pangenome-aware DV mode).
+bool IsPangenomeMode() {
+  return !absl::GetFlag(FLAGS_reads_pangenome).empty();
 }
 
 // Infer sample name from the first RG:SM field in the BAM header.
@@ -640,6 +798,14 @@ int RunMakeExamples(int argc, char** argv) {
     if (examples_path.empty() && ex_tumor.empty()) {
       LOG(ERROR)
           << "Somatic mode requires --examples_tumor (or --examples as alias).";
+      return 1;
+    }
+  } else if (IsPangenomeMode()) {
+    // Pangenome: reads' examples are mandatory; pangenome has skip_output=true.
+    const std::string ex_reads = absl::GetFlag(FLAGS_examples_reads);
+    if (examples_path.empty() && ex_reads.empty()) {
+      LOG(ERROR)
+          << "Pangenome mode requires --examples_reads (or --examples).";
       return 1;
     }
   } else if (examples_path.empty()) {
@@ -831,6 +997,12 @@ int RunMakeExamples(int argc, char** argv) {
                    : absl::GetFlag(FLAGS_examples_tumor);
       else if (role == "normal")
         base = absl::GetFlag(FLAGS_examples_normal);
+      else if (role == "reads")
+        base = absl::GetFlag(FLAGS_examples_reads).empty()
+                   ? examples_path
+                   : absl::GetFlag(FLAGS_examples_reads);
+      else if (role == "pangenome")
+        base = absl::GetFlag(FLAGS_examples_pangenome);
       if (base.empty()) return "";
       return n_threads == 1 ? base : ShardName(base, tid);
     };
@@ -844,20 +1016,24 @@ int RunMakeExamples(int argc, char** argv) {
         base = absl::GetFlag(FLAGS_small_model_cvo_outfile_parent2);
       else if (role == "tumor")
         base = absl::GetFlag(FLAGS_small_model_cvo_outfile_tumor);
-      // normal: skip_output=true → no CVO
+      else if (role == "reads")
+        base = absl::GetFlag(FLAGS_small_model_cvo_outfile_reads);
+      // normal/pangenome: skip_output=true → no CVO
       if (base.empty()) return "";
       return n_threads == 1 ? base : ShardName(base, tid);
     };
 
-    const std::string sm_child   = absl::GetFlag(FLAGS_small_model_path_child);
-    const std::string sm_parent  = absl::GetFlag(FLAGS_small_model_path_parent);
-    const std::string sm_somatic = absl::GetFlag(FLAGS_small_model_path_somatic);
+    const std::string sm_child     = absl::GetFlag(FLAGS_small_model_path_child);
+    const std::string sm_parent    = absl::GetFlag(FLAGS_small_model_path_parent);
+    const std::string sm_somatic   = absl::GetFlag(FLAGS_small_model_path_somatic);
+    const std::string sm_pangenome = absl::GetFlag(FLAGS_small_model_path_pangenome);
 
     auto sm_path_for_role = [&](const std::string& role) -> const std::string& {
       static const std::string empty;
       if (role == "child")   return sm_child;
       if (role == "parent1" || role == "parent2") return sm_parent;
       if (role == "tumor")   return sm_somatic;
+      if (role == "reads")   return sm_pangenome;
       return empty;
     };
 
@@ -1193,9 +1369,9 @@ int RunMakeExamples(int argc, char** argv) {
   // `next_region` until the queue is exhausted. Writes only to its own
   // per-thread files; no inter-thread mutation.
   auto run_worker = [&](int tid, WorkerStats* out_stats) {
-    if (IsTrioMode() || IsSomaticMode()) {
-      // Multi-sample worker handles both trio (3 samples) and somatic
-      // (1-2 samples) — dispatched on opts.sample_options_size().
+    if (IsTrioMode() || IsSomaticMode() || IsPangenomeMode()) {
+      // Multi-sample worker handles trio (3 samples), somatic (1-2),
+      // and pangenome-aware (2). Dispatched on opts.sample_options_size().
       run_trio_worker(tid, out_stats);
       return;
     }
