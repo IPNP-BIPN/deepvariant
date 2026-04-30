@@ -75,9 +75,11 @@ add_library(dv_metal_det_kernels STATIC
   metal_avg_pool.mm
   metal_concat.mm
   metal_global_avg_pool.mm
+  metal_bn_relu.mm
 )
 set_source_files_properties(
   metal_avg_pool.mm metal_concat.mm metal_global_avg_pool.mm
+  metal_bn_relu.mm
   PROPERTIES COMPILE_FLAGS "-fobjc-arc"
 )
 target_include_directories(dv_metal_det_kernels PUBLIC
