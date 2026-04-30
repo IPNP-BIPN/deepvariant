@@ -70,6 +70,20 @@ ABSL_FLAG(std::string, output_gvcf_parent1, "",
 ABSL_FLAG(std::string, output_gvcf_parent2, "",
           "Trio mode: output gVCF for parent2.");
 
+// DeepSomatic (Step 2) — somatic mode flags. When --reads_tumor is set,
+// run mode dispatches 1× call_variants on the tumor model and emits a
+// single tumor VCF. tumor_only mode = no --reads_normal.
+ABSL_DECLARE_FLAG(std::string, reads_tumor);
+ABSL_DECLARE_FLAG(std::string, reads_normal);
+ABSL_DECLARE_FLAG(std::string, sample_name_tumor);
+ABSL_DECLARE_FLAG(std::string, sample_name_normal);
+ABSL_DECLARE_FLAG(std::string, examples_tumor);
+ABSL_DECLARE_FLAG(std::string, examples_normal);
+ABSL_DECLARE_FLAG(std::string, small_model_path_somatic);
+ABSL_DECLARE_FLAG(std::string, small_model_cvo_outfile_tumor);
+ABSL_DECLARE_FLAG(int, pileup_image_height_tumor);
+ABSL_DECLARE_FLAG(int, pileup_image_height_normal);
+
 namespace deepvariant {
 
 namespace {
@@ -102,8 +116,9 @@ std::string ModelPath(const std::string& model_type) {
 
 }  // namespace
 
-// Forward decl: trio dispatch implementation (defined below RunAll).
+// Forward decls.
 int RunAllTrio(int argc, char** argv);
+int RunAllSomatic(int argc, char** argv);
 
 int RunAll(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
@@ -111,6 +126,12 @@ int RunAll(int argc, char** argv) {
   // Trio mode: --reads_parent1 set → dispatch the 3-sample pipeline.
   if (!absl::GetFlag(FLAGS_reads_parent1).empty()) {
     return RunAllTrio(argc, argv);
+  }
+
+  // Somatic mode: --reads_tumor set → dispatch the 2-sample (tumor+
+  // normal) or 1-sample (tumor_only) pipeline. Single tumor VCF output.
+  if (!absl::GetFlag(FLAGS_reads_tumor).empty()) {
+    return RunAllSomatic(argc, argv);
   }
 
   const std::string model_type = absl::GetFlag(FLAGS_model_type);
@@ -513,6 +534,164 @@ int RunAllTrio(int argc, char** argv) {
 
   LOG(INFO) << "Trio: done. 3 VCFs at " << out_child << ", " << out_parent1
             << ", " << out_parent2;
+  return 0;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// DeepSomatic dispatch: one make_examples (tumor + optional normal),
+// 1× call_variants on the tumor model only (normal has skip_output=true),
+// 1× postprocess writing a single tumor VCF. Mirrors run_deepsomatic.py
+// command sequence.
+// ──────────────────────────────────────────────────────────────────────
+int RunAllSomatic(int argc, char** argv) {
+  const std::string ref_flag = absl::GetFlag(FLAGS_ref);
+  const std::string regions_flag = absl::GetFlag(FLAGS_regions);
+  const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
+  const int num_shards = absl::GetFlag(FLAGS_num_shards);
+  const int n_threads = std::max(1, num_shards);
+
+  const std::string reads_tumor  = absl::GetFlag(FLAGS_reads_tumor);
+  const std::string reads_normal = absl::GetFlag(FLAGS_reads_normal);
+  if (reads_tumor.empty()) {
+    LOG(ERROR) << "Somatic: --reads_tumor required";
+    return 1;
+  }
+  const bool has_normal = !reads_normal.empty();
+
+  const std::string out_vcf = absl::GetFlag(FLAGS_output_vcf);
+  if (out_vcf.empty()) {
+    LOG(ERROR) << "Somatic: --output_vcf required";
+    return 1;
+  }
+
+  std::string ckpt = absl::GetFlag(FLAGS_checkpoint);
+  if (ckpt.empty()) {
+    LOG(ERROR) << "Somatic: --checkpoint (.dvw) required";
+    return 1;
+  }
+
+  const std::string sm_path =
+      absl::GetFlag(FLAGS_small_model_path_somatic);
+
+  const std::string inference_backend =
+      absl::GetFlag(FLAGS_inference_backend);
+
+  // Per-stage intermediate paths.
+  const std::string examples_pattern  =
+      n_threads > 1
+          ? absl::StrCat(tmp_dir, "/examples_tumor.tfrecord@", n_threads)
+          : absl::StrCat(tmp_dir, "/examples_tumor.tfrecord");
+  const std::string small_cvo_pattern =
+      n_threads > 1
+          ? absl::StrCat(tmp_dir, "/small_cvo_tumor.tfrecord@", n_threads)
+          : absl::StrCat(tmp_dir, "/small_cvo_tumor.tfrecord");
+  const std::string cvo_path        =
+      absl::StrCat(tmp_dir, "/cvo_tumor.tfrecord");
+  const std::string merged_cvo_path =
+      absl::StrCat(tmp_dir, "/merged_cvo_tumor.tfrecord");
+
+  // ── Stage 1: make_examples (tumor + optional normal). ────────────
+  LOG(INFO) << "Somatic Stage 1: make_examples ("
+            << (has_normal ? "tumor+normal" : "tumor-only")
+            << ", --threads=" << n_threads << ")";
+  {
+    std::vector<std::string> me_args = {
+        absl::StrCat("--reads_tumor=", reads_tumor),
+        absl::StrCat("--ref=", ref_flag),
+        absl::StrCat("--examples_tumor=", examples_pattern),
+        absl::StrCat("--threads=", n_threads),
+        "--task_id=0",
+        "--num_shards=1",
+        "--realigner_enabled=true",
+    };
+    if (has_normal) {
+      me_args.push_back(absl::StrCat("--reads_normal=", reads_normal));
+    }
+    if (!regions_flag.empty()) {
+      me_args.push_back(absl::StrCat("--regions=", regions_flag));
+    }
+    if (!absl::GetFlag(FLAGS_sample_name_tumor).empty()) {
+      me_args.push_back(absl::StrCat("--sample_name_tumor=",
+                                      absl::GetFlag(FLAGS_sample_name_tumor)));
+    }
+    if (!absl::GetFlag(FLAGS_sample_name_normal).empty()) {
+      me_args.push_back(absl::StrCat("--sample_name_normal=",
+                                      absl::GetFlag(FLAGS_sample_name_normal)));
+    }
+    if (!sm_path.empty()) {
+      me_args.push_back(absl::StrCat("--small_model_path_somatic=", sm_path));
+      me_args.push_back(absl::StrCat("--small_model_cvo_outfile_tumor=",
+                                      small_cvo_pattern));
+    }
+    auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
+    int n = static_cast<int>(argv_me.size()) - 1;
+    if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
+      LOG(ERROR) << "Somatic: make_examples failed";
+      return rc;
+    }
+  }
+
+  // ── Stage 2: call_variants on the tumor model. ────────────
+  LOG(INFO) << "Somatic Stage 2: call_variants";
+  {
+    // Somatic WGS pileup is 200×221×7 (tumor 100 + normal 100). For
+    // tumor_only the height is 100. Pass via --input_height.
+    const int tumor_h_default = has_normal ? 200 : 100;
+    std::vector<std::string> cv_args = {
+        absl::StrCat("--examples=", examples_pattern),
+        absl::StrCat("--outfile=", cvo_path),
+        absl::StrCat("--checkpoint=", ckpt),
+        absl::StrCat("--batch_size=", absl::GetFlag(FLAGS_batch_size)),
+        absl::StrCat("--inference_backend=", inference_backend),
+        absl::StrCat("--input_height=", tumor_h_default),
+        "--input_channels=7",
+    };
+    auto argv_cv = MakeArgv("deepvariant_call_variants", cv_args);
+    int n = static_cast<int>(argv_cv.size()) - 1;
+    if (int rc = RunCallVariants(n, argv_cv.data()); rc != 0) {
+      LOG(ERROR) << "Somatic: call_variants failed";
+      return rc;
+    }
+  }
+
+  // ── Stage 2.5: merge small_cvo into cvo (if SM was used). ──
+  LOG(INFO) << "Somatic Stage 2.5: merge → " << merged_cvo_path;
+  {
+    std::vector<std::string> cmd = {
+        "/bin/sh", "-c",
+        absl::StrCat("cat ", cvo_path, " > ", merged_cvo_path)};
+    if (!sm_path.empty()) {
+      // Pre-pend small_cvo records.
+      cmd[2] = absl::StrCat(
+          "cat ",
+          n_threads > 1 ? absl::StrCat(tmp_dir, "/small_cvo_tumor.tfrecord-*")
+                        : small_cvo_pattern,
+          " ", cvo_path, " > ", merged_cvo_path);
+    }
+    int rc = std::system(cmd[2].c_str());
+    if (rc != 0) {
+      LOG(ERROR) << "Somatic: merge step failed";
+      return 1;
+    }
+  }
+
+  // ── Stage 3: postprocess. ────────────
+  LOG(INFO) << "Somatic Stage 3: postprocess_variants";
+  {
+    std::vector<std::string> pp_args = {
+        absl::StrCat("--ref=", ref_flag),
+        absl::StrCat("--infile=", merged_cvo_path),
+        absl::StrCat("--output_vcf_outfile=", out_vcf),
+    };
+    auto argv_pp = MakeArgv("deepvariant_postprocess", pp_args);
+    int n = static_cast<int>(argv_pp.size()) - 1;
+    if (int rc = RunPostprocessVariants(n, argv_pp.data()); rc != 0) {
+      LOG(ERROR) << "Somatic: postprocess_variants failed";
+      return rc;
+    }
+  }
+
+  LOG(INFO) << "Somatic: done. VCF at " << out_vcf;
   return 0;
 }
 
