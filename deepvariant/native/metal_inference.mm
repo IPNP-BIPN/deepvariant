@@ -28,6 +28,7 @@
 #include "absl/log/log.h"
 #include "absl/strings/str_split.h"
 #include "deepvariant/native/dv_weights.h"
+#include "deepvariant/native/metal_bn_relu.h"
 #include "deepvariant/native/metal_conv_serial.h"
 
 namespace deepvariant {
@@ -191,6 +192,84 @@ MPSGraphTensor* AddConv(MPSGraph* g, MPSGraphTensor* x,
                                   name:[name stringByAppendingString:@"_bias"]];
 }
 
+// Phase 5.5f: when true, CBR/AvgCBR build conv + primitive-op BN + ReLU
+// (raw kernel weights, BN as separate MPSGraph ops). Gated on
+// DV_METAL_UNFOLDED_BN environment variable; set once at MetalInception::
+// Create().
+static bool g_unfold_bn_for_graph = false;
+
+// Phase 5.5f Conv→BN→ReLU using primitive MPSGraph ops (no FoldConvBn).
+//   conv_raw      = conv2D(x, raw_kernel)
+//   bn(z) = (z - mean) * inv_std + beta,  inv_std = 1 / sqrt(var + eps)
+//   y             = relu(bn(conv_raw))
+// inv_std is precomputed host-side (same value as TF computes; only the
+// reduction-order through the conv differs from the folded path).
+MPSGraphTensor* CBRUnfolded(MPSGraph* g, MPSGraphTensor* x,
+                              const DvwWeights& dvw,
+                              int conv_n, int bn_n,
+                              int stride_y, int stride_x,
+                              bool same_padding,
+                              NSString* name) {
+  const auto* k = dvw.Get(AttrCpp(conv_n, "kernel"));
+  const auto* beta = dvw.Get(AttrCpp(bn_n, "beta"));
+  const auto* mean = dvw.Get(AttrCpp(bn_n, "moving_mean"));
+  const auto* var = dvw.Get(AttrCpp(bn_n, "moving_variance"));
+  if (!k || !beta || !mean || !var || k->shape.size() != 4u) {
+    LOG(ERROR) << "CBRUnfolded: missing weight for conv=" << conv_n
+               << " bn=" << bn_n;
+    return nullptr;
+  }
+  const int Hk = k->shape[0], Wk = k->shape[1];
+  const int Ik = k->shape[2], Ok = k->shape[3];
+
+  // Raw conv2D, no bias.
+  NSArray* w_shape = @[@(Hk), @(Wk), @(Ik), @(Ok)];
+  MPSGraphTensor* W = ConstFloat32(g, k->data, w_shape,
+                                   [name stringByAppendingString:@"_w"]);
+  MPSGraphConvolution2DOpDescriptor* desc =
+      [MPSGraphConvolution2DOpDescriptor
+          descriptorWithStrideInX:stride_x
+                        strideInY:stride_y
+                  dilationRateInX:1
+                  dilationRateInY:1
+                           groups:1
+                     paddingStyle:same_padding ? MPSGraphPaddingStyleTF_SAME
+                                               : MPSGraphPaddingStyleTF_VALID
+                       dataLayout:MPSGraphTensorNamedDataLayoutNHWC
+                    weightsLayout:MPSGraphTensorNamedDataLayoutHWIO];
+  MPSGraphTensor* conv = [g convolution2DWithSourceTensor:x
+                                             weightsTensor:W
+                                                descriptor:desc
+                                                      name:name];
+
+  // Primitive BN: (conv - mean) * inv_std + beta, with inv_std precomputed
+  // host-side. Each tensor is a (1, 1, 1, Ok) constant for NHWC broadcast.
+  std::vector<float> inv_std_host(Ok), neg_mean_host(Ok);
+  for (int o = 0; o < Ok; ++o) {
+    inv_std_host[o] = 1.0f / std::sqrt(var->data[o] + kBNEpsilon);
+    neg_mean_host[o] = -mean->data[o];
+  }
+  NSArray* bn_shape = @[@1, @1, @1, @(Ok)];
+  MPSGraphTensor* mean_t = ConstFloat32(g, mean->data, bn_shape,
+      [name stringByAppendingString:@"_bn_mean"]);
+  MPSGraphTensor* inv_std_t = ConstFloat32(g, inv_std_host.data(), bn_shape,
+      [name stringByAppendingString:@"_bn_inv_std"]);
+  MPSGraphTensor* beta_t = ConstFloat32(g, beta->data, bn_shape,
+      [name stringByAppendingString:@"_bn_beta"]);
+
+  MPSGraphTensor* centered =
+      [g subtractionWithPrimaryTensor:conv secondaryTensor:mean_t
+                                  name:[name stringByAppendingString:@"_bn_sub"]];
+  MPSGraphTensor* scaled =
+      [g multiplicationWithPrimaryTensor:centered secondaryTensor:inv_std_t
+                                    name:[name stringByAppendingString:@"_bn_mul"]];
+  MPSGraphTensor* shifted =
+      [g additionWithPrimaryTensor:scaled secondaryTensor:beta_t
+                              name:[name stringByAppendingString:@"_bn_add"]];
+  return [g reLUWithTensor:shifted
+                       name:[name stringByAppendingString:@"_r"]];
+}
+
 // Conv-BN-ReLU: emits the fused conv + bias + relu.
 MPSGraphTensor* CBR(MPSGraph* g, MPSGraphTensor* x,
                     const DvwWeights& dvw,
@@ -198,6 +277,10 @@ MPSGraphTensor* CBR(MPSGraph* g, MPSGraphTensor* x,
                     int stride_y, int stride_x,
                     bool same_padding,
                     NSString* name) {
+  if (g_unfold_bn_for_graph) {
+    return CBRUnfolded(g, x, dvw, conv_n, bn_n, stride_y, stride_x,
+                        same_padding, name);
+  }
   FusedConv fc = FoldConvBn(dvw, conv_n, bn_n);
   if (fc.weights_hwio.empty()) return nullptr;
   MPSGraphTensor* y = AddConv(g, x, fc, stride_y, stride_x, same_padding, name);
@@ -505,6 +588,18 @@ struct DetLayer {
   ConvDesc conv_desc{};
   id<MTLBuffer> weights_buf = nil;
   id<MTLBuffer> bias_buf = nil;
+  // Phase 5.5f — unfolded conv→BN→ReLU. When `use_unfolded_bn` is set,
+  // weights_buf holds RAW kernel HWIO (no inv_std scaling) and bias_buf
+  // is an all-zero buffer. The conv is encoded with relu=false; a
+  // separate MetalBnRelu pass consumes its output using the BN params
+  // below and applies ReLU. Bit-match measurement (Phase 5.5f Day 1)
+  // shows this path matches TF/oneDNN to ±2 ULP per element vs ±93 ULP
+  // for the folded path.
+  bool use_unfolded_bn = false;
+  id<MTLBuffer> bn_mean_buf = nil;
+  id<MTLBuffer> bn_var_buf = nil;
+  id<MTLBuffer> bn_beta_buf = nil;
+  id<MTLBuffer> bn_inter_buf = nil;     // post-conv pre-BN intermediate
   // MaxPool-specific (kind == kMaxPool):
   MaxPoolDesc pool_desc{};
   // The MPSGraph "post-graph" — only populated on the LAST det stage in
@@ -545,6 +640,7 @@ struct MetalInception::Impl {
   // first 7 layers (s1a, s2a, s2b, mp3a, s3b, s4a, mp5a).
   std::unique_ptr<MetalConvSerial> conv_serial;
   std::unique_ptr<MetalMaxPool> max_pool;
+  std::unique_ptr<MetalBnRelu> bn_relu;     // Phase 5.5f, lazy-init
   std::vector<DetLayer> det_layers;
   // Cached post-graph executable per batch size (the post-graph itself is
   // already in det_layers[0].post_graph).
@@ -566,6 +662,19 @@ std::unique_ptr<MetalInception> MetalInception::Create(
   auto& I = *self->impl_;
   I.input_height = input_height;
   I.input_channels = input_channels;
+
+  // Phase 5.5f: read DV_METAL_UNFOLDED_BN before any graph stages are
+  // built so CBR()/CBRUnfolded() dispatch correctly throughout. This
+  // global flag is also reused by the det-path env-var check below.
+  {
+    const char* env = std::getenv("DV_METAL_UNFOLDED_BN");
+    g_unfold_bn_for_graph =
+        (env && std::string(env) != "0" && std::string(env) != "false");
+    if (g_unfold_bn_for_graph) {
+      LOG(INFO) << "Phase 5.5f: unfolded conv→BN→ReLU active for full graph "
+                << "(every CBR call uses raw conv + primitive BN ops)";
+    }
+  }
 
   I.weights = DvwWeights::Open(dvw_path);
   if (!I.weights) {
@@ -720,6 +829,22 @@ std::unique_ptr<MetalInception> MetalInception::Create(
       LOG(ERROR) << "MetalInception::Create: kernel pipeline creation failed";
       return nullptr;
     }
+
+    // Phase 5.5f — DV_METAL_UNFOLDED_BN=1 enables the conv→BN→ReLU
+    // separation that bit-matches TF/oneDNN to ±2 ULP. Without it, the
+    // det path uses FoldConvBn which drifts up to 93 ULP per element.
+    const char* unfolded_env = std::getenv("DV_METAL_UNFOLDED_BN");
+    const bool unfolded_bn =
+        (unfolded_env && std::string(unfolded_env) != "0" &&
+         std::string(unfolded_env) != "false");
+    if (unfolded_bn) {
+      I.bn_relu = MetalBnRelu::Create();
+      if (!I.bn_relu) {
+        LOG(ERROR) << "MetalInception::Create: BN+ReLU pipeline failed";
+        return nullptr;
+      }
+      LOG(INFO) << "Phase 5.5f: unfolded conv→BN→ReLU active for det path";
+    }
     I.post_exec_cache = [NSMutableDictionary dictionary];
 
     // Build a det entry for each stage in the chain.
@@ -735,32 +860,84 @@ std::unique_ptr<MetalInception> MetalInception::Create(
       det.H_out = s.H_out;
       det.W_out = s.W_out;
       if (s.kind == kSCBR) {
-        FusedConv fc = FoldConvBn(*I.weights, s.conv, s.bn);
-        if (fc.weights_hwio.empty()) {
-          LOG(ERROR) << "MetalInception::Create: failed to fold "
-                     << s.tap << " weights";
-          return nullptr;
-        }
-        det.conv_desc.C_in = fc.I;
-        det.conv_desc.C_out = fc.O;
-        det.conv_desc.Kh = fc.H;
-        det.conv_desc.Kw = fc.W;
-        det.conv_desc.stride_h = s.sy;
-        det.conv_desc.stride_w = s.sx;
-        det.conv_desc.pad_h = s.same ? (fc.H - 1) / 2 : 0;
-        det.conv_desc.pad_w = s.same ? (fc.W - 1) / 2 : 0;
-        det.conv_desc.relu = true;
-        det.weights_buf =
-            [I.device newBufferWithBytes:fc.weights_hwio.data()
-                                  length:fc.weights_hwio.size() * sizeof(float)
-                                 options:MTLResourceStorageModeShared];
-        det.bias_buf =
-            [I.device newBufferWithBytes:fc.bias.data()
-                                  length:fc.bias.size() * sizeof(float)
-                                 options:MTLResourceStorageModeShared];
-        if (!det.weights_buf || !det.bias_buf) {
-          LOG(ERROR) << "MetalInception::Create: alloc failed for " << s.tap;
-          return nullptr;
+        if (unfolded_bn) {
+          // Phase 5.5f: load raw conv kernel + raw BN params; defer fold.
+          const auto* k = I.weights->Get(AttrCpp(s.conv, "kernel"));
+          const auto* beta = I.weights->Get(AttrCpp(s.bn, "beta"));
+          const auto* mean = I.weights->Get(AttrCpp(s.bn, "moving_mean"));
+          const auto* var = I.weights->Get(AttrCpp(s.bn, "moving_variance"));
+          if (!k || !beta || !mean || !var || k->shape.size() != 4u) {
+            LOG(ERROR) << "MetalInception::Create: missing raw weight for "
+                       << s.tap;
+            return nullptr;
+          }
+          const int Hk = k->shape[0], Wk = k->shape[1];
+          const int Ik = k->shape[2], Ok = k->shape[3];
+          det.conv_desc.C_in = Ik;
+          det.conv_desc.C_out = Ok;
+          det.conv_desc.Kh = Hk;
+          det.conv_desc.Kw = Wk;
+          det.conv_desc.stride_h = s.sy;
+          det.conv_desc.stride_w = s.sx;
+          det.conv_desc.pad_h = s.same ? (Hk - 1) / 2 : 0;
+          det.conv_desc.pad_w = s.same ? (Wk - 1) / 2 : 0;
+          det.conv_desc.relu = false;   // ReLU happens after BN
+          det.use_unfolded_bn = true;
+          det.weights_buf =
+              [I.device newBufferWithBytes:k->data
+                                    length:k->n_bytes
+                                   options:MTLResourceStorageModeShared];
+          // All-zeros bias so conv output stays raw.
+          std::vector<float> zero_bias(Ok, 0.0f);
+          det.bias_buf =
+              [I.device newBufferWithBytes:zero_bias.data()
+                                    length:Ok * sizeof(float)
+                                   options:MTLResourceStorageModeShared];
+          det.bn_mean_buf =
+              [I.device newBufferWithBytes:mean->data
+                                    length:Ok * sizeof(float)
+                                   options:MTLResourceStorageModeShared];
+          det.bn_var_buf =
+              [I.device newBufferWithBytes:var->data
+                                    length:Ok * sizeof(float)
+                                   options:MTLResourceStorageModeShared];
+          det.bn_beta_buf =
+              [I.device newBufferWithBytes:beta->data
+                                    length:Ok * sizeof(float)
+                                   options:MTLResourceStorageModeShared];
+          if (!det.weights_buf || !det.bias_buf || !det.bn_mean_buf ||
+              !det.bn_var_buf || !det.bn_beta_buf) {
+            LOG(ERROR) << "MetalInception::Create: alloc failed for " << s.tap;
+            return nullptr;
+          }
+        } else {
+          FusedConv fc = FoldConvBn(*I.weights, s.conv, s.bn);
+          if (fc.weights_hwio.empty()) {
+            LOG(ERROR) << "MetalInception::Create: failed to fold "
+                       << s.tap << " weights";
+            return nullptr;
+          }
+          det.conv_desc.C_in = fc.I;
+          det.conv_desc.C_out = fc.O;
+          det.conv_desc.Kh = fc.H;
+          det.conv_desc.Kw = fc.W;
+          det.conv_desc.stride_h = s.sy;
+          det.conv_desc.stride_w = s.sx;
+          det.conv_desc.pad_h = s.same ? (fc.H - 1) / 2 : 0;
+          det.conv_desc.pad_w = s.same ? (fc.W - 1) / 2 : 0;
+          det.conv_desc.relu = true;
+          det.weights_buf =
+              [I.device newBufferWithBytes:fc.weights_hwio.data()
+                                    length:fc.weights_hwio.size() * sizeof(float)
+                                   options:MTLResourceStorageModeShared];
+          det.bias_buf =
+              [I.device newBufferWithBytes:fc.bias.data()
+                                    length:fc.bias.size() * sizeof(float)
+                                   options:MTLResourceStorageModeShared];
+          if (!det.weights_buf || !det.bias_buf) {
+            LOG(ERROR) << "MetalInception::Create: alloc failed for " << s.tap;
+            return nullptr;
+          }
         }
       } else {
         // MaxPool: 3×3 stride-2 VALID, no learned params.
@@ -869,8 +1046,36 @@ bool MetalInception::Predict(const float* input, int batch_size,
         d.W_in = det.W_in;
         d.H_out = det.H_out;
         d.W_out = det.W_out;
-        ok = I.conv_serial->Encode(cb, cur_buf, det.weights_buf,
-                                    det.bias_buf, dst_buf, d);
+        if (det.use_unfolded_bn) {
+          // Phase 5.5f: conv (raw, no bias, no ReLU) → bn_relu (with ReLU).
+          // Use a separate intermediate buffer for the conv output, then
+          // BN+ReLU writes the final dst_buf.
+          id<MTLBuffer> inter_buf = [I.device
+              newBufferWithLength:n_dst * sizeof(float)
+                           options:MTLResourceStorageModeShared];
+          if (!inter_buf) {
+            LOG(ERROR) << "MetalInception::Predict(det): inter buffer alloc "
+                       << "failed for stage " << det.tap_name;
+            return false;
+          }
+          ok = I.conv_serial->Encode(cb, cur_buf, det.weights_buf,
+                                      det.bias_buf, inter_buf, d);
+          if (ok) {
+            BnReluDesc bn_d{};
+            bn_d.B = batch_size;
+            bn_d.H = det.H_out;
+            bn_d.W = det.W_out;
+            bn_d.C = det.C_out;
+            bn_d.eps = kBNEpsilon;
+            bn_d.relu = true;   // post-BN ReLU
+            ok = I.bn_relu->Encode(cb, inter_buf, det.bn_mean_buf,
+                                     det.bn_var_buf, det.bn_beta_buf,
+                                     dst_buf, bn_d);
+          }
+        } else {
+          ok = I.conv_serial->Encode(cb, cur_buf, det.weights_buf,
+                                      det.bias_buf, dst_buf, d);
+        }
       } else {
         MaxPoolDesc d = det.pool_desc;
         d.B = batch_size;
