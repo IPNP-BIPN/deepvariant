@@ -84,6 +84,18 @@ ABSL_DECLARE_FLAG(std::string, small_model_cvo_outfile_tumor);
 ABSL_DECLARE_FLAG(int, pileup_image_height_tumor);
 ABSL_DECLARE_FLAG(int, pileup_image_height_normal);
 
+// Pangenome-aware DV (Step 3) — When --reads_pangenome is set, run mode
+// dispatches a 2-sample pangenome pipeline (pangenome=0, reads=1=main).
+// Single VCF output for the reads sample.
+ABSL_DECLARE_FLAG(std::string, reads_pangenome);
+ABSL_DECLARE_FLAG(std::string, sample_name_pangenome);
+ABSL_DECLARE_FLAG(std::string, sample_name_reads);
+ABSL_DECLARE_FLAG(std::string, examples_reads);
+ABSL_DECLARE_FLAG(std::string, small_model_path_pangenome);
+ABSL_DECLARE_FLAG(std::string, small_model_cvo_outfile_reads);
+ABSL_DECLARE_FLAG(int, pileup_image_height_pangenome);
+ABSL_DECLARE_FLAG(int, pileup_image_height_reads);
+
 namespace deepvariant {
 
 namespace {
@@ -119,6 +131,7 @@ std::string ModelPath(const std::string& model_type) {
 // Forward decls.
 int RunAllTrio(int argc, char** argv);
 int RunAllSomatic(int argc, char** argv);
+int RunAllPangenome(int argc, char** argv);
 
 int RunAll(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
@@ -132,6 +145,12 @@ int RunAll(int argc, char** argv) {
   // normal) or 1-sample (tumor_only) pipeline. Single tumor VCF output.
   if (!absl::GetFlag(FLAGS_reads_tumor).empty()) {
     return RunAllSomatic(argc, argv);
+  }
+
+  // Pangenome-aware mode: --reads_pangenome set → 2-sample pipeline
+  // (pangenome=0, reads=1=main). Single VCF output for the reads sample.
+  if (!absl::GetFlag(FLAGS_reads_pangenome).empty()) {
+    return RunAllPangenome(argc, argv);
   }
 
   const std::string model_type = absl::GetFlag(FLAGS_model_type);
@@ -703,6 +722,162 @@ int RunAllSomatic(int argc, char** argv) {
   }
 
   LOG(INFO) << "Somatic: done. VCF at " << out_vcf;
+  return 0;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Pangenome-aware DV dispatch: 2-sample make_examples
+// (pangenome=0, reads=1=main); 1× call_variants on the pangenome
+// model (pangenome has skip_output=true); 1× postprocess writing a
+// single VCF for the reads sample. Mirrors
+// run_pangenome_aware_deepvariant.py command sequence.
+// ──────────────────────────────────────────────────────────────────────
+int RunAllPangenome(int argc, char** argv) {
+  const std::string ref_flag = absl::GetFlag(FLAGS_ref);
+  const std::string regions_flag = absl::GetFlag(FLAGS_regions);
+  const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
+  const int num_shards = absl::GetFlag(FLAGS_num_shards);
+  const int n_threads = std::max(1, num_shards);
+
+  const std::string reads_main      = absl::GetFlag(FLAGS_reads);
+  const std::string reads_pangenome = absl::GetFlag(FLAGS_reads_pangenome);
+  if (reads_main.empty()) {
+    LOG(ERROR) << "Pangenome: --reads required";
+    return 1;
+  }
+  if (reads_pangenome.empty()) {
+    LOG(ERROR) << "Pangenome: --reads_pangenome required";
+    return 1;
+  }
+
+  const std::string out_vcf = absl::GetFlag(FLAGS_output_vcf);
+  if (out_vcf.empty()) {
+    LOG(ERROR) << "Pangenome: --output_vcf required";
+    return 1;
+  }
+
+  std::string ckpt = absl::GetFlag(FLAGS_checkpoint);
+  if (ckpt.empty()) {
+    LOG(ERROR) << "Pangenome: --checkpoint (.dvw) required";
+    return 1;
+  }
+
+  const std::string sm_path =
+      absl::GetFlag(FLAGS_small_model_path_pangenome);
+
+  const std::string inference_backend =
+      absl::GetFlag(FLAGS_inference_backend);
+
+  // Per-stage intermediate paths (named after the reads sample).
+  const std::string examples_pattern  =
+      n_threads > 1
+          ? absl::StrCat(tmp_dir, "/examples_reads.tfrecord@", n_threads)
+          : absl::StrCat(tmp_dir, "/examples_reads.tfrecord");
+  const std::string small_cvo_pattern =
+      n_threads > 1
+          ? absl::StrCat(tmp_dir, "/small_cvo_reads.tfrecord@", n_threads)
+          : absl::StrCat(tmp_dir, "/small_cvo_reads.tfrecord");
+  const std::string cvo_path        =
+      absl::StrCat(tmp_dir, "/cvo_reads.tfrecord");
+  const std::string merged_cvo_path =
+      absl::StrCat(tmp_dir, "/merged_cvo_reads.tfrecord");
+
+  // ── Stage 1: make_examples (reads + pangenome). ────────────
+  LOG(INFO) << "Pangenome Stage 1: make_examples (--threads=" << n_threads
+            << ")";
+  {
+    std::vector<std::string> me_args = {
+        absl::StrCat("--reads=", reads_main),
+        absl::StrCat("--reads_pangenome=", reads_pangenome),
+        absl::StrCat("--ref=", ref_flag),
+        absl::StrCat("--examples_reads=", examples_pattern),
+        absl::StrCat("--threads=", n_threads),
+        "--task_id=0",
+        "--num_shards=1",
+        "--realigner_enabled=true",
+    };
+    if (!regions_flag.empty()) {
+      me_args.push_back(absl::StrCat("--regions=", regions_flag));
+    }
+    if (!absl::GetFlag(FLAGS_sample_name_reads).empty()) {
+      me_args.push_back(absl::StrCat("--sample_name_reads=",
+                                      absl::GetFlag(FLAGS_sample_name_reads)));
+    }
+    if (!absl::GetFlag(FLAGS_sample_name_pangenome).empty()) {
+      me_args.push_back(absl::StrCat("--sample_name_pangenome=",
+                                      absl::GetFlag(FLAGS_sample_name_pangenome)));
+    }
+    if (!sm_path.empty()) {
+      me_args.push_back(absl::StrCat("--small_model_path_pangenome=", sm_path));
+      me_args.push_back(absl::StrCat("--small_model_cvo_outfile_reads=",
+                                      small_cvo_pattern));
+    }
+    auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
+    int n = static_cast<int>(argv_me.size()) - 1;
+    if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
+      LOG(ERROR) << "Pangenome: make_examples failed";
+      return rc;
+    }
+  }
+
+  // ── Stage 2: call_variants on the pangenome model. ────────────
+  LOG(INFO) << "Pangenome Stage 2: call_variants";
+  {
+    // Pangenome WGS pileup is 200×221×7 (pangenome 100 + reads 100).
+    std::vector<std::string> cv_args = {
+        absl::StrCat("--examples=", examples_pattern),
+        absl::StrCat("--outfile=", cvo_path),
+        absl::StrCat("--checkpoint=", ckpt),
+        absl::StrCat("--batch_size=", absl::GetFlag(FLAGS_batch_size)),
+        absl::StrCat("--inference_backend=", inference_backend),
+        "--input_height=200",
+        "--input_channels=7",
+    };
+    auto argv_cv = MakeArgv("deepvariant_call_variants", cv_args);
+    int n = static_cast<int>(argv_cv.size()) - 1;
+    if (int rc = RunCallVariants(n, argv_cv.data()); rc != 0) {
+      LOG(ERROR) << "Pangenome: call_variants failed";
+      return rc;
+    }
+  }
+
+  // ── Stage 2.5: merge small_cvo into cvo. ──
+  LOG(INFO) << "Pangenome Stage 2.5: merge → " << merged_cvo_path;
+  {
+    std::vector<std::string> cmd = {
+        "/bin/sh", "-c",
+        absl::StrCat("cat ", cvo_path, " > ", merged_cvo_path)};
+    if (!sm_path.empty()) {
+      cmd[2] = absl::StrCat(
+          "cat ",
+          n_threads > 1 ? absl::StrCat(tmp_dir, "/small_cvo_reads.tfrecord-*")
+                        : small_cvo_pattern,
+          " ", cvo_path, " > ", merged_cvo_path);
+    }
+    int rc = std::system(cmd[2].c_str());
+    if (rc != 0) {
+      LOG(ERROR) << "Pangenome: merge step failed";
+      return 1;
+    }
+  }
+
+  // ── Stage 3: postprocess. ────────────
+  LOG(INFO) << "Pangenome Stage 3: postprocess_variants";
+  {
+    std::vector<std::string> pp_args = {
+        absl::StrCat("--ref=", ref_flag),
+        absl::StrCat("--infile=", merged_cvo_path),
+        absl::StrCat("--output_vcf_outfile=", out_vcf),
+    };
+    auto argv_pp = MakeArgv("deepvariant_postprocess", pp_args);
+    int n = static_cast<int>(argv_pp.size()) - 1;
+    if (int rc = RunPostprocessVariants(n, argv_pp.data()); rc != 0) {
+      LOG(ERROR) << "Pangenome: postprocess_variants failed";
+      return rc;
+    }
+  }
+
+  LOG(INFO) << "Pangenome: done. VCF at " << out_vcf;
   return 0;
 }
 
