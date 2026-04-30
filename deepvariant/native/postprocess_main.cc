@@ -60,6 +60,10 @@ ABSL_FLAG(double, qual_filter, 1.0,
 ABSL_FLAG(double, cnn_homref_call_min_gq, 20.0,
           "All CNN RefCalls whose GQ is less than this become ./. NoCall "
           "instead of 0/0 RefCall (matches upstream default 20.0).");
+ABSL_FLAG(bool, process_somatic, false,
+          "Enable DeepSomatic-style postprocess: heterozygous (0/1) calls "
+          "are reclassified as GERMLINE 0/0 (mirrors third_party/nucleus/"
+          "io/vcf_writer.cc::WriteSomatic logic).");
 
 namespace deepvariant {
 
@@ -333,6 +337,13 @@ nucleus::genomics::v1::VcfHeader MakeVcfHeader(
     auto* f = hdr.add_filters();
     f->set_id(fi.id);
     f->set_description(fi.desc);
+  }
+  // Somatic-only filter: GERMLINE for non-somatic variants. Mirrors
+  // upstream postprocess_variants.py:2303-2308 + dv_vcf_constants.
+  if (absl::GetFlag(FLAGS_process_somatic)) {
+    auto* f = hdr.add_filters();
+    f->set_id("GERMLINE");
+    f->set_description("Non somatic variants");
   }
 
   // INFO fields.
@@ -782,7 +793,30 @@ int RunPostprocessVariants(int argc, char** argv) {
             << variants_buffer.size() << " variants ...";
   ::deepvariant::MaybeResolveConflictingVariants(&variants_buffer, qual_filter);
 
-  for (const auto& v : variants_buffer) {
+  const bool process_somatic = absl::GetFlag(FLAGS_process_somatic);
+  for (auto v : variants_buffer) {  // copy so we can mutate
+    if (process_somatic && v.calls_size() > 0) {
+      // Mirror nucleus/io/vcf_writer.cc::WriteSomatic: any non-{0/0,
+      // 1/1, ./.} GT (i.e. heterozygous) gets reclassified as
+      // GERMLINE 0/0. The biological assumption: a het call in a
+      // tumor+normal pair is most likely a germline variant the
+      // patient inherited (hom-alt would suggest LOH = somatic event).
+      auto* call = v.mutable_calls(0);
+      const auto& g = call->genotype();
+      const bool is_homref = (g.size() == 2 && g.Get(0) == 0 && g.Get(1) == 0);
+      const bool is_homalt = (g.size() == 2 && g.Get(0) == 1 && g.Get(1) == 1);
+      const bool is_nocall = (g.size() == 2 && g.Get(0) < 0 && g.Get(1) < 0);
+      if (!is_homref && !is_homalt && !is_nocall) {
+        // Reclassify as GERMLINE 0/0.
+        call->clear_genotype();
+        call->add_genotype(0);
+        call->add_genotype(0);
+        if (v.filter_size() > 0) {
+          v.clear_filter();
+          v.add_filter("GERMLINE");
+        }
+      }
+    }
     auto status = vcf_writer->Write(v);
     if (!status.ok()) {
       LOG(WARNING) << "Failed to write variant at "
