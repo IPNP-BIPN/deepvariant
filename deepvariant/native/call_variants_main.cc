@@ -236,21 +236,19 @@ int RunCallVariants(int argc, char** argv) {
     K = coreml_model->NumClasses();
   } else if (backend == "metal") {
     LOG(INFO) << "Loading Metal/BNNS model: " << checkpoint_path;
-    metal_model = MetalInception::Create(checkpoint_path);
+    // Pass --input_height / --input_channels to MetalInception so the
+    // MPSGraph placeholder is built with the right shape. Defaults
+    // (100×221×7) match WGS; trio passes 140 via --input_height.
+    H = absl::GetFlag(FLAGS_input_height);
+    W = 221;
+    C = absl::GetFlag(FLAGS_input_channels);
+    K = 3;
+    metal_model = MetalInception::Create(checkpoint_path, H, C);
     metal_finalize = BnnsFinalize::Create(checkpoint_path);
     if (!metal_model || !metal_finalize) {
       LOG(ERROR) << "Failed to load Metal/BNNS model: " << checkpoint_path;
       return 1;
     }
-    // The Metal backbone runs Inception-v3 with the input geometry
-    // baked into the example data. Default: WGS (100×221×7). Trio
-    // overrides to 140×221×7 (DEEP_TRIO_WGS_PILEUP_HEIGHT_CHILD=60 +
-    // 2×PARENT=40 = 140) via --input_height. Pangenome eventually uses
-    // 100×221×9 with --input_channels.
-    H = absl::GetFlag(FLAGS_input_height);
-    W = 221;
-    C = absl::GetFlag(FLAGS_input_channels);
-    K = 3;
   } else {
     LOG(ERROR) << "Unknown --inference_backend=" << backend
                << " (expected 'coreml' or 'metal')";
