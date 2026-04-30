@@ -786,65 +786,70 @@ int RunMakeExamples(int argc, char** argv) {
       }
 
       // Build 3 AlleleCounters keyed by sample_name. Two-pass: probe
-      // (no candidate positions) → collect candidate positions → re-
-      // build with candidate_positions for ref-read tracking. Same
-      // as single-sample path; here we two-pass per sample.
+      // per sample (no candidate positions) → compute per-sample
+      // candidate_positions via the multi-sample VariantCaller →
+      // rebuild each AlleleCounter with its own candidate_positions.
       std::array<std::unique_ptr<AlleleCounter>, 3> counters;
-      // First pass: probe per sample.
-      std::vector<int> all_candidate_positions;
-      for (int s = 0; s < 3; ++s) {
-        if (!ctx[s].sam_reader) continue;
-        AlleleCounter probe(ref_reader.get(), region, /*positions=*/{},
-                            opts.allele_counter_options());
-        for (const auto& r : reads_per_sample_v[s]) {
-          probe.Add(r, ctx[s].name);
-        }
-        // Collect probe candidate positions across all samples — the
-        // multi_sample::VariantCaller will join across samples; we
-        // give every counter the union of candidate positions so
-        // ref-read tracking works for joint candidates from another
-        // sample's evidence.
-        // (Mirror of upstream make_examples_core.py:_make_allele_counter_for_region
-        // which uses the joint candidate set for all samples.)
-        // Rough approximation: get probe candidates positions; we'll
-        // union after the loop.
-        // Simpler: rebuild every counter with same merged positions.
-      }
-      // Simpler approach (chr20 quick-start fixture): probe → union of
-      // candidate positions → rebuild each AlleleCounter with the
-      // unioned positions. Matches upstream's "positions known up-front"
-      // pattern.
-      for (int s = 0; s < 3; ++s) {
-        if (!ctx[s].sam_reader) continue;
-        AlleleCounter probe(ref_reader.get(), region, /*positions=*/{},
-                            opts.allele_counter_options());
-        for (const auto& r : reads_per_sample_v[s]) {
-          probe.Add(r, ctx[s].name);
-        }
-        // No public position-extractor on AlleleCounter; iterate Counts().
-        for (const auto& ac : probe.Counts()) {
-          if (!ac.read_alleles().empty()) {
-            all_candidate_positions.push_back(
-                static_cast<int>(ac.position().position()));
-          }
-        }
-      }
-      std::sort(all_candidate_positions.begin(),
-                all_candidate_positions.end());
-      all_candidate_positions.erase(
-          std::unique(all_candidate_positions.begin(),
-                      all_candidate_positions.end()),
-          all_candidate_positions.end());
+      // PER-SAMPLE candidate positions (not the union, mirrors upstream
+      // make_examples_core.py:2898 — `sample.variant_caller.get_candidate_
+      // positions(allele_counters, sample_name)` runs per sample with a
+      // single target_sample, so each sample's candidate_positions are
+      // determined by THAT sample's evidence.
+      //
+      // Why this matters: with track_ref_reads=ON, ref reads are added to
+      // AlleleCount.read_alleles ONLY at the sample's own candidate
+      // positions. If a sample has no alt evidence at a position (e.g.
+      // parent2 at an indel only seen in parent1+child), that position
+      // is NOT a candidate for parent2 → parent2's read_alleles is empty
+      // there → the candidate's ref_support_ext does not include parent2
+      // reads at that position → small_model features for parent2 are 0.
+      //
+      // Our previous code used the UNION across all samples, which forced
+      // every sample to track ref reads at every union-candidate position.
+      // That inflated the small_model's combined-block total_depth (which
+      // sums across all 3 samples in ref_support_ext) and produced wrong
+      // SM probabilities at sites with asymmetric per-sample coverage.
 
+      // Step 1: per-sample probe to compute per-sample candidate positions.
+      std::array<std::unique_ptr<AlleleCounter>, 3> probes;
+      for (int s = 0; s < 3; ++s) {
+        if (!ctx[s].sam_reader) continue;
+        probes[s] = std::make_unique<AlleleCounter>(
+            ref_reader.get(), region, /*positions=*/std::vector<int>{},
+            opts.allele_counter_options());
+        for (const auto& r : reads_per_sample_v[s]) {
+          probes[s]->Add(r, ctx[s].name);
+        }
+      }
+
+      // Step 2: build per-sample candidate_positions via the multi-sample
+      // VariantCaller's CallPositionsFromAlleleCounts (mirrors upstream's
+      // sample.variant_caller.get_candidate_positions invocation per sample).
+      std::array<std::vector<int>, 3> per_sample_cand_positions;
+      {
+        std::unordered_map<std::string, AlleleCounter*> probe_map;
+        for (int s = 0; s < 3; ++s) {
+          if (probes[s]) probe_map[ctx[s].name] = probes[s].get();
+        }
+        for (int s = 0; s < 3; ++s) {
+          if (!probes[s]) continue;
+          per_sample_cand_positions[s] =
+              caller.CallPositionsFromAlleleCounts(
+                  probe_map, ctx[s].name, ctx[s].role);
+        }
+      }
+
+      // Step 3: rebuild each AlleleCounter with its OWN candidate_positions.
       for (int s = 0; s < 3; ++s) {
         if (!ctx[s].sam_reader) continue;
         counters[s] = std::make_unique<AlleleCounter>(
-            ref_reader.get(), region, all_candidate_positions,
+            ref_reader.get(), region, per_sample_cand_positions[s],
             opts.allele_counter_options());
         for (const auto& r : reads_per_sample_v[s]) {
           counters[s]->Add(r, ctx[s].name);
         }
       }
+      probes = {};  // free probe memory
 
       // Build the unordered_map<sample_name, AlleleCounter*> map for
       // multi_sample::VariantCaller.
