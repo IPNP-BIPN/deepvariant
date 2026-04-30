@@ -382,6 +382,16 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
     // samples_in_order = [normal(0), tumor(1)] when normal provided
     //                  = [tumor(0)]            for tumor-only.
     // Mirrors deepvariant/make_examples_somatic.py:152-218.
+    //
+    // Apply somatic-specific pic_options overrides per
+    // /opt/models/deepsomatic/wgs/model.example_info.json:flags_for_calling.
+    // sort_by_alt_allele_support=true groups reads by which alt they
+    // support before the position sort — without this, the tumor pileup
+    // rows are ordered purely by alignment position and diverge from
+    // Docker's pileup at sites with multiple alt alleles (visible at
+    // chr20:10023577 etc.). Channels stay 7; height stays 100 per
+    // sample; only the row-sort key changes.
+    opts.mutable_pic_options()->set_sort_by_alt_allele_support(true);
     const std::string normal_reads = absl::GetFlag(FLAGS_reads_normal);
     const std::string tumor_reads  = absl::GetFlag(FLAGS_reads_tumor);
     const bool has_normal = !normal_reads.empty();
@@ -426,6 +436,12 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
           ->set_max_fraction_snps_for_non_target_sample(0.5f);
       s->mutable_variant_caller_options()
           ->set_max_fraction_indels_for_non_target_sample(0.5f);
+      // Adjacent VAF context window for the small_model. DeepSomatic
+      // WGS uses 51; the small_model is trained with a 51-position
+      // VAF context block. Used by variant_calling_multisample.cc:1160
+      // → AddAdjacentAlleleFractionsAtPosition.
+      s->mutable_variant_caller_options()
+          ->set_small_model_vaf_context_window_size(51);
       for (int o : order) s->add_order(o);
       s->set_skip_output_generation(skip_output);
       if (is_tumor) {
@@ -440,10 +456,11 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
     if (has_normal) {
       // Order in samples_in_order: [normal(0), tumor(1)]. Tumor's
       // sample.options.order = [0, 1] places normal first in the pileup
-      // stack — mirrors make_examples_somatic.py:198.
+      // stack — mirrors make_examples_somatic.py:198. Normal does NOT
+      // set order (upstream only assigns order on the tumor branch).
       add_somatic_sample("normal", normal_name.empty() ? "normal" : normal_name,
                           normal_reads, normal_h, ds_normal,
-                          {0, 1}, /*skip_output=*/true, /*is_tumor=*/false);
+                          {}, /*skip_output=*/true, /*is_tumor=*/false);
       add_somatic_sample("tumor", tumor_name.empty() ? "tumor" : tumor_name,
                           tumor_reads, tumor_h, ds_tumor,
                           {0, 1}, /*skip_output=*/false, /*is_tumor=*/true);
