@@ -51,9 +51,10 @@ ABSL_FLAG(int, input_height, 100,
 ABSL_FLAG(int, input_channels, 7,
           "Pileup-image channels for the Metal backend. WGS/Trio=7, "
           "pangenome=9.");
-ABSL_FLAG(std::string, inference_backend, "coreml",
-          "Inference backend: coreml (Phase 2 default, Core ML .mlpackage) "
-          "or metal (Phase 5.5 bit-parity, MPSGraph + BNNS .dvw).");
+ABSL_FLAG(std::string, inference_backend, "metal",
+          "Inference backend: metal (Phase 5.5 default, MPSGraph + BNNS "
+          ".dvw — GPU on Apple Silicon) or coreml (Phase 2 fallback, "
+          "Core ML .mlpackage). The shipped Homebrew binary uses metal.");
 
 namespace deepvariant {
 
