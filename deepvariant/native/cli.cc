@@ -819,6 +819,12 @@ int RunAllPangenome(int argc, char** argv) {
     // the GLOBAL default vsc_min_fraction_{snps,indels} (0.12 / 0.06);
     // only min_mapping_quality is overridden to 0 (vs default 5).
     me_args.push_back("--min_mapping_quality=0");
+    // Realigner SSW alignment scoring (defaults are 4/6/8/2 for WGS).
+    me_args.push_back("--aln_match=2");
+    me_args.push_back("--aln_mismatch=5");
+    me_args.push_back("--aln_gap_open=10");
+    me_args.push_back("--aln_gap_extend=1");
+    me_args.push_back("--dbg_disable_graph_pruning=true");
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {

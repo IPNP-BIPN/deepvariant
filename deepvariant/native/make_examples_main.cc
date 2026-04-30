@@ -97,6 +97,19 @@ ABSL_FLAG(int, small_model_indel_gq_threshold, 28,
 ABSL_FLAG(bool, realigner_enabled, false,
           "Enable upstream's realigner (DeBruijnGraph + FastPassAligner) "
           "to recover candidates in indel-rich regions.");
+// Realigner aligner SSW scoring params. Defaults match WGS:
+// aln_match=4, aln_mismatch=6, aln_gap_open=8, aln_gap_extend=2.
+// Pangenome example_info.json:flags_for_calling overrides these to
+// 2/5/10/1 (more permissive matches for synthetic haplotypes vs reads).
+ABSL_FLAG(int, aln_match, 4, "Realigner SSW aligner match score.");
+ABSL_FLAG(int, aln_mismatch, 6, "Realigner SSW aligner mismatch penalty.");
+ABSL_FLAG(int, aln_gap_open, 8, "Realigner SSW aligner gap-open penalty.");
+ABSL_FLAG(int, aln_gap_extend, 2, "Realigner SSW aligner gap-extend penalty.");
+// dbg_disable_graph_pruning: when true, the de-Bruijn graph pruning
+// step in the realigner is skipped. Pangenome enables this to retain
+// haplotype paths that would otherwise be pruned for low edge weight.
+ABSL_FLAG(bool, dbg_disable_graph_pruning, false,
+          "If true, skip de-Bruijn graph pruning in the realigner.");
 ABSL_FLAG(int, threads, 1,
           "Worker threads inside this process. >1 enables true intra-process "
           "parallelism (one process showing N×100 % CPU). Each worker opens "
@@ -676,6 +689,23 @@ bool IsPangenomeMode() {
   return !absl::GetFlag(FLAGS_reads_pangenome).empty();
 }
 
+// DefaultRealignerOptions() with per-flag overrides. Lets pangenome
+// supply its aln_match=2/aln_mismatch=5/aln_gap_open=10/aln_gap_extend=1
+// + dbg_disable_graph_pruning=true via command-line flags.
+::learning::genomics::deepvariant::RealignerOptions
+RealignerOptionsFromFlags() {
+  auto opts = DefaultRealignerOptions();
+  opts.mutable_aln_config()->set_match(absl::GetFlag(FLAGS_aln_match));
+  opts.mutable_aln_config()->set_mismatch(absl::GetFlag(FLAGS_aln_mismatch));
+  opts.mutable_aln_config()->set_gap_open(absl::GetFlag(FLAGS_aln_gap_open));
+  opts.mutable_aln_config()->set_gap_extend(absl::GetFlag(FLAGS_aln_gap_extend));
+  if (absl::GetFlag(FLAGS_dbg_disable_graph_pruning)) {
+    // Skip pruning by setting min_edge_weight to 0 (no pruning).
+    opts.mutable_dbg_config()->set_min_edge_weight(0);
+  }
+  return opts;
+}
+
 // Infer sample name from the first RG:SM field in the BAM header.
 std::string InferSampleName(
     const nucleus::genomics::v1::SamHeader& header) {
@@ -1123,7 +1153,7 @@ int RunMakeExamples(int argc, char** argv) {
         // de Bruijn graph haplotypes, eliminating misalignment-induced
         // phantom alleles that inflate the AlleleCounter Counts.
         if (realigner_enabled) {
-          const auto realigner_opts = DefaultRealignerOptions();
+          const auto realigner_opts = RealignerOptionsFromFlags();
           const int expand_bp =
               realigner_opts.ws_config().region_expansion_in_bp();
           auto contig_or = ref_reader->Contig(region.reference_name());
@@ -1483,7 +1513,7 @@ int RunMakeExamples(int argc, char** argv) {
       // expanded region (region_expansion_in_bp=20). The candidate-
       // emission AlleleCounter further down uses the looser
       // make_examples thresholds (10/10) — they're separate counters.
-      const auto realigner_opts = DefaultRealignerOptions();
+      const auto realigner_opts = RealignerOptionsFromFlags();
       const int expand_bp = realigner_opts.ws_config().region_expansion_in_bp();
       auto contig_or = ref_reader->Contig(region.reference_name());
       const int64_t contig_n =
