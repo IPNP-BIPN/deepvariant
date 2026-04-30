@@ -812,6 +812,13 @@ int RunAllPangenome(int argc, char** argv) {
       me_args.push_back(absl::StrCat("--small_model_cvo_outfile_reads=",
                                       small_cvo_pattern));
     }
+    // Pangenome WGS overrides per /opt/models/pangenome_aware_deepvariant/
+    // wgs/model.example_info.json:flags_for_calling. Upstream's
+    // make_examples_core.py:apply_flags_for_calling reads this file at
+    // runtime; we hard-code the WGS values here. Note: pangenome uses
+    // the GLOBAL default vsc_min_fraction_{snps,indels} (0.12 / 0.06);
+    // only min_mapping_quality is overridden to 0 (vs default 5).
+    me_args.push_back("--min_mapping_quality=0");
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
