@@ -175,26 +175,31 @@ chr20:10M-10.1M:
 | Run | shared | only_ours | only_docker | FM on shared |
 |---|---|---|---|---|
 | v1 (89 reads, no aln_*) | 252 | 60 | 70 | 9 |
-| v3 (+ legacy/supplementary) | 252 | 60 | 70 | 9 |
 | v4 (+ aln_*=2/5/10/1) | 259 | 60 | 63 | 11 |
 | v5 (+ 8722-read BAM) | 259 | 39 | 63 | 2 |
-| v7 (skip realigner pang) | 259 | 39 | 63 | 2 |
-| **v8 (+ partition_size=25000)** | **321** | **0** | **1** | **0** |
+| v8 (+ partition_size=25000) | 321 | 0 | 1 | 0 |
+| **v9 (+ PruneLite)** | **322** | **0** | **0** | **0** |
 
-The v8 step closed the gap from 80% → 99.69% site-set parity in
-two flag changes:
-1. Skip realigner for pangenome sample (mirrors upstream
+Three flag changes closed the entire gap from 80% → 100%:
+
+1. **v7**: Skip realigner for pangenome sample (mirrors upstream
    make_examples_core.py:2208 `can_realign`).
-2. `--partition_size=25000` matching upstream's
-   run_pangenome_aware_deepvariant.py invocation. Smaller
-   partitions caused the AlleleCounter's `ref_supporting_read_count`
-   to differ from Docker at boundary positions (chr20:10000884
-   docker DP=8, ours DP=45). With partition_size=25000 the counts
-   converge.
+2. **v8**: `--partition_size=25000` matching upstream's
+   run_pangenome_aware_deepvariant.py invocation. Smaller partitions
+   caused the AlleleCounter's `ref_supporting_read_count` to differ
+   from Docker at boundary positions.
+3. **v9**: `dbg_disable_graph_pruning=true` → PruneLite (not
+   min_edge_weight=0). At chr20:10035373 a long ~89bp insertion alt
+   co-occurs with a C>G SNP. Our previous Prune+min_edge_weight=0
+   stripped unreachable vertices, removing the alt-G haplotype path
+   → reads were reassigned during realignment → no candidate
+   emitted. PruneLite keeps low-weight paths, alt-G haplotype is
+   preserved, candidate generated → matches Docker bit-for-bit.
 
-PASS parity: 246/247 (1 borderline missing call: chr20:10035373 C>G,
-Docker GQ=4 / QUAL=4.1 — likely realigner-haplotype interaction with
-adjacent long insertion).
+Final state: 322/322 shared, 247/247 PASS, 67/67 RefCall, 8/8 NoCall,
+0 GT diffs, 0 FILTER mismatches. Wall time 2 min on M4 Max
+(14 threads, auto-detected). Pangenome joins WGS, DeepTrio, DeepSomatic
+at 100% Docker FILTER parity on chr20:10M-10.1M.
 
 Reference captures:
 
