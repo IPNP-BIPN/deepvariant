@@ -682,6 +682,7 @@ int RunAllSomatic(int argc, char** argv) {
         absl::StrCat("--ref=", ref_flag),
         absl::StrCat("--infile=", merged_cvo_path),
         absl::StrCat("--output_vcf_outfile=", out_vcf),
+        "--process_somatic=true",
     };
     auto argv_pp = MakeArgv("deepvariant_postprocess", pp_args);
     int n = static_cast<int>(argv_pp.size()) - 1;
