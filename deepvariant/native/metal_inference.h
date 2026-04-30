@@ -35,8 +35,14 @@ class MetalInception {
   // Open the `.dvw` weight bundle and build the MPSGraph.  Returns
   // nullptr on any error (file missing, weight tensor missing, MPSGraph
   // failure).
+  //
+  // input_height/input_channels parameterize the placeholder input
+  // shape: WGS uses (100, 221, 7); DeepTrio WGS uses (140, 221, 7);
+  // pangenome uses (100, 221, 9), etc. Width is fixed at 221.
   static std::unique_ptr<MetalInception> Create(
-      const std::string& dvw_path);
+      const std::string& dvw_path,
+      int input_height = 100,
+      int input_channels = 7);
 
   ~MetalInception();
 
