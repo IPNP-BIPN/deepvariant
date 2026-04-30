@@ -113,19 +113,58 @@ Sub-phases (per the master plan):
 
 PL/QUAL/MID byte-level drift from FP32 non-associativity remains the explicit non-goal (carry-over from Phase 5.5d). FILTER classification, GT, and the variant set itself MUST be byte-identical to Docker, replicating the WGS guarantee for every tool.
 
-### Step 1 — DeepTrio (in progress)
+### Step 1 — DeepTrio ✅ DONE 2026-04-30 (commit `e5bd9185`)
 
-- **1.1+1.2** ✅ trio flags + 3-sample SampleOptions builder mirroring `deeptrio/make_examples.py:trio_samples_from_flags`. Per-sample `order` permutations: child/parent1=`[0,1,2]`, parent2=`[2,1,0]`. Default heights 60/40/40 (`DEEP_TRIO_WGS_PILEUP_HEIGHT_*`).
-- **1.3** ✅ `multi_sample::VariantCaller::CallsFromAlleleCounts(map, target, role)` integration in run_trio_worker.
-- **1.5** ✅ `cli.cc` trio dispatch — 3× call_variants chaining + 3 per-sample VCFs + per-role checkpoint paths (`--checkpoint_child / _parent`).
-- **1.6** ✅ DeepTrio WGS .dvw bundles extracted (`validation/work/deeptrio.wgs_{child,parent}.dvw`, 87.27 MB each).
-- **1.3-bis** ✅ per-sample realigner wired (mirrors upstream's `realign_reads_per_sample_multisample`). Closes only_docker gap (~31 → ~12 per sample on chr20:10M-10.1M).
-- **M1** Docker reference captured at `tools/reference/output/deeptrio/{HG002,HG003,HG004}.output.vcf.gz` for the chr20:10M-10.1M quick-start fixture.
-- **1.7** ⏳ FILTER-parity gate: end-to-end runs in ~14 s on M4 Max producing 3 VCFs. Current status (with realigner): shared 360/357/329 (HG002/HG003/HG004), only_ours 1634/1788/1599, only_docker 12/11/10, PASS 198/181/170 (vs Docker 262/265/222). Remaining gap = ~1500 only_ours per sample (mostly low-GQ RefCalls from realigner-induced phantom alleles). Iterative root-cause loop (5.5d-style) ongoing.
+100% FILTER parity on chr20:10M-10.1M vs `google/deeptrio:1.10.0`:
 
-### Step 2 — DeepSomatic (pending)
+- HG002 (child):   0 site-set diffs, 0 FILTER mismatches, 262/262 PASS
+- HG003 (parent1): 0 site-set diffs, 0 FILTER mismatches, 265/265 PASS
+- HG004 (parent2): 0 site-set diffs, 0 FILTER mismatches, 222/222 PASS
 
-Same multi-sample plumbing as trio (2 samples instead of 3); 12 .mlpackage already extracted; same hard gate per operating mode (tumor+normal / tumor-only / FFPE).
+Two root-cause fixes resolved the trio gap (5.5d/12 + 5.5d/13). Both
+are documented in detail in the trio status memory; summary:
+
+- 5.5d/12: per-sample candidate_positions (was UNION, mirrors upstream's
+  per-sample `get_candidate_positions(allele_counters, sample_name)`).
+  Without this, parent2's AlleleCounter tracked ref reads at non-target
+  positions → inflated `ref_support_ext` in the small_model combined block.
+- 5.5d/13: parameterized Metal Inception-v3 input height/channels.
+  `metal_inference.mm` had THREE hardcoded `100` references; trio's
+  140-row pileup (60+40+40) was silently truncated.
+
+### Step 2 — DeepSomatic ✅ DONE 2026-04-30 (commit `3f3f3060`)
+
+100% FILTER parity on chr20:10M-10.1M (HG002 tumor + HG003 normal) vs
+`google/deepsomatic:1.10.0`:
+
+- 0 site-set diffs, 0 FILTER mismatches across 693 sites
+- 34/34 PASS, 92/92 GERMLINE, 13/13 NoCall, 554/554 RefCall identical
+- 0 GT diffs across shared sites
+- 6/6 verified pileups byte-identical to Docker
+
+Step-2 progression:
+
+- **2-v1** (commit `c61a391a`) — somatic orchestration end-to-end: 11
+  flags, IsSomaticMode helpers, multi-sample wiring, postprocess
+  invocation, cli.cc somatic dispatch.
+- **2-v2** (commit `1d529405`) — GERMLINE filter ported (mirror of
+  `nucleus/io/vcf_writer.cc::WriteSomatic`): hets reclassified as
+  homref + GERMLINE filter at write time.
+- **2-v3** (commit `0e6d03ed`) — somatic threshold overrides
+  (`vsc_min_fraction_*`, `small_model_*_gq_threshold`).
+- **2-v4** (commit `3f3f3060`) — closes the last 5 FM. Root cause:
+  `model.example_info.json:flags_for_calling` declares
+  `sort_by_alt_allele_support: true` and
+  `small_model_vaf_context_window_size: 51`. We applied the
+  variant-caller overrides earlier but missed these two pic-level
+  options. Without sort_by_alt_allele_support, our pileup rows are
+  sorted purely by alignment position; Docker sorts by
+  (haplotype, alt_support_group, position), so multi-alt sites have
+  their tumor reads in different row order. At chr20:10023577 A>{G,T},
+  21.66 % of tumor-half pixels differed → argmax flipped from homalt
+  to homref → missing PASS.
+
+Pending: tumor-only mode + FFPE mode (same gate per mode).
 
 ### Step 3 — Pangenome-aware DV (pending)
 
