@@ -360,6 +360,30 @@ target_link_libraries(microtest_conv_serial PRIVATE
 )
 
 # ---------------------------------------------------------------------------
+# microtest_det_mixed5b — Phase 8/Tier 6.0 validation: det Mixed_5b
+# block dispatch vs TF reference (/tmp/dv_per_layer/{stem_mp5a,5b}.npy).
+# ---------------------------------------------------------------------------
+add_executable(microtest_det_mixed5b
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_det_mixed5b.mm"
+)
+set_source_files_properties(
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_det_mixed5b.mm" PROPERTIES
+  COMPILE_FLAGS "-fobjc-arc"
+)
+target_include_directories(microtest_det_mixed5b PRIVATE
+  ${ME_INCLUDE_DIRS}
+  "${CMAKE_SOURCE_DIR}"
+  "${ABSL_PREFIX}/include"
+)
+target_link_libraries(microtest_det_mixed5b PRIVATE
+  dv_metal_det_mixed
+  dv_weights
+  absl::log
+  "-framework Metal"
+  "-framework Foundation"
+)
+
+# ---------------------------------------------------------------------------
 # microtest_conv_kahan — Phase 5.5e/Path B hand-verifiable test for the
 # Kahan-compensated Conv2D kernel. Compares GPU dispatch output against
 # a scalar Kahan reference and reports the precision improvement vs
