@@ -166,15 +166,22 @@ Step-2 progression:
 
 Pending: tumor-only mode + FFPE mode (same gate per mode).
 
-### Step 3 — Pangenome-aware DV (in progress, commit `18ffb771`)
+### Step 3 — Pangenome-aware DV (in progress, latest: commit `fccec22d`)
 
 Pangenome orchestration end-to-end. Apples-to-apples (our binary vs
 Docker, BOTH using the same extracted pangenome BAM as input) on
 chr20:10M-10.1M:
 
-- 252/322 site-set parity (78.3%)
-- 9 FILTER mismatches on shared sites (3.5%, NoCall ↔ PASS / NoCall ↔ RefCall borderline)
-- 60 only_ours, 70 only_docker (candidate-generation gap)
+| Run | shared | only_ours | only_docker | FM on shared |
+|---|---|---|---|---|
+| v1 (89 reads, no aln_*) | 252 | 60 | 70 | 9 |
+| v3 (+ legacy/supplementary) | 252 | 60 | 70 | 9 |
+| v4 (+ aln_*=2/5/10/1) | 259 | 60 | 63 | 11 (FP-noise) |
+| **v5 (+ 8722-read BAM)** | **259** | **39** | **63** | **2** |
+
+The v5 jump came from re-extracting the pangenome BAM in 1-kb chunks
+instead of one big query() call (89 reads → 8722 reads). FM on shared
+sites collapsed from 11 to 2 (NoCall ↔ PASS / RefCall borderline).
 
 Reference captures:
 
