@@ -1,15 +1,13 @@
 // Phase 8 / Tier 6.0 — Deterministic Inception block dispatch.
 //
-// Each Mixed_X block is encoded as a DetMixedBlock that holds raw
-// conv weights + BN params + intermediate MTLBuffers per branch.
-// Dispatch fans out branches in parallel onto a single
-// MTLCommandBuffer, then concats along the channel axis.
+// Each of the 11 Mixed_X blocks (5b, 5c, 5d, 6a, 6b-6e, 7a, 7b-7c) is
+// encoded as a DetMixedBlock with its branches' raw conv weights +
+// BN params + intermediate MTLBuffers. Dispatch fans out branches in
+// parallel onto a single MTLCommandBuffer, then concats along the
+// channel axis.
 //
 // Bypasses MPSGraph entirely → output is bit-deterministic across
 // reduction orders (per-thread sequential FMA via MetalConvSerial).
-// Combined with the existing det stem chain, replacing all 11 Mixed
-// blocks with this dispatch gives 100% deterministic Inception-v3
-// inference on Apple GPU.
 
 #pragma once
 
@@ -31,83 +29,111 @@
 
 namespace deepvariant {
 
-// One conv+BN+ReLU op within a branch. The "raw_buf" holds the conv
-// output before BN (since we're using unfolded BN); "out_buf" holds
-// the BN+ReLU output that feeds the next op or the concat.
 struct DetBranchOp {
 #ifdef __OBJC__
   ConvDesc conv;
   id<MTLBuffer> w;          // raw HWIO kernel
-  id<MTLBuffer> bias;       // all-zero (unfolded BN: bias absorbed in beta)
-  id<MTLBuffer> mean;       // BN moving_mean
-  id<MTLBuffer> var;        // BN moving_variance
-  id<MTLBuffer> beta;       // BN beta
-  id<MTLBuffer> raw_buf;    // post-conv pre-BN scratch
-  id<MTLBuffer> out_buf;    // post-BN+ReLU output (chains forward)
+  id<MTLBuffer> bias;       // all-zero (unfolded BN)
+  id<MTLBuffer> mean;
+  id<MTLBuffer> var;
+  id<MTLBuffer> beta;
+  id<MTLBuffer> raw_buf;    // post-conv pre-BN
+  id<MTLBuffer> out_buf;    // post-BN+ReLU
 #endif
   int out_H = 0, out_W = 0, out_C = 0;
 };
 
-// One branch within a Mixed block. May be preceded by an avg-pool
-// (the "pool" branch in Mixed_5x/6b-e/7b-c) or a max-pool. Most
-// branches are a sequential chain of conv+BN+ReLU ops.
+// One branch within a Mixed block.
+//
+// Sequential branch (`is_split == false`):
+//   ops[0] -> ops[1] -> ... -> ops[N-1]
+//   Branch output buffer = ops.back().out_buf
+//
+// Split branch (`is_split == true`):
+//   ops[0..trunk_size-1] form a sequential trunk.
+//   ops[trunk_size] and ops[trunk_size+1] both consume the trunk's
+//   final output and run in parallel (e.g. 1×3 and 3×1 in Mixed_7b/7c).
+//   Branch output = concat(ops[trunk_size].out_buf, ops[trunk_size+1].out_buf)
+//   stored in split_concat_out.
 struct DetBranch {
   bool has_avg_pool_pre = false;
+  bool has_max_pool_pre = false;
   AvgPoolDesc avg_pool{};
+  MaxPoolDesc max_pool{};
 #ifdef __OBJC__
-  id<MTLBuffer> avg_pool_out;   // input to first op when has_avg_pool_pre
+  id<MTLBuffer> pool_out;          // input to first op when has_*_pool_pre
 #endif
+  bool pool_only = false;          // branch = pool only, no convs (Mixed_6a/7a max-pool branch)
+
   std::vector<DetBranchOp> ops;
-  // Final branch output — pointer to ops.back().out_buf for plumbing.
+
+  // Split-branch fields (Mixed_7b/7c only):
+  bool is_split = false;
+  int trunk_size = 0;              // # ops in sequential trunk before split
+#ifdef __OBJC__
+  id<MTLBuffer> split_concat_out;
+#endif
+  int split_out_C = 0;             // c_size for block-level concat
 };
 
-// One Inception Mixed_X block. Holds N branches that all consume the
-// same input buffer; their outputs are concatenated along the channel
-// axis to produce the block's output.
 struct DetMixedBlock {
-  std::string tap_name;             // "5b", "5c", ..., "7c"
-  int B = 0;                        // batch size (variable, configured at first dispatch)
+  std::string tap_name;
+  int B = 0;
   int H_in = 0, W_in = 0, C_in = 0;
   int H_out = 0, W_out = 0, C_out = 0;
   std::vector<DetBranch> branches;
 #ifdef __OBJC__
-  id<MTLBuffer> concat_out;   // post-concat output (input to next block)
+  id<MTLBuffer> concat_out;
 #endif
 };
 
-// Build Mixed_5b block layout from .dvw weights + input geometry.
-// Allocates all intermediate + output MTLBuffers on `device` for
-// batch_size up to `max_B`. Returns a fully-populated DetMixedBlock
-// ready for dispatch via DispatchDetMixedBlock().
+// Builders for each block type. Each loads the .dvw weights and
+// allocates per-branch intermediate buffers + output buffer.
 //
-// .dvw weight indices for Mixed_5b (from inception_v3_mil.py audit):
-//   branch1   : (conv=16, bn=20)  1×1  192→64
-//   branch5_a : (conv=12, bn=14)  1×1  192→48
-//   branch5_b : (conv=17, bn=21)  5×5  48→64
-//   branch3_a : (conv=10, bn=11)  1×1  192→64
-//   branch3_b : (conv=13, bn=15)  3×3  64→96
-//   branch3_c : (conv=18, bn=22)  3×3  96→96
-//   branchp   : (conv=19, bn=23)  1×1  192→32  (preceded by 3×3 avg-pool)
-//
-// Returns false on weight-load failure (bundle missing).
+// Returns false on weight-load or alloc failure.
 #ifdef __OBJC__
 bool BuildDetMixed5b(id<MTLDevice> device, const DvwWeights& dvw,
                      int max_B, int H_in, int W_in, int C_in,
-                     DetMixedBlock* out_block);
-#endif
+                     DetMixedBlock* out);
+bool BuildDetMixed5c(id<MTLDevice> device, const DvwWeights& dvw,
+                     int max_B, int H_in, int W_in, int C_in,
+                     DetMixedBlock* out);
+bool BuildDetMixed5d(id<MTLDevice> device, const DvwWeights& dvw,
+                     int max_B, int H_in, int W_in, int C_in,
+                     DetMixedBlock* out);
+bool BuildDetMixed6a(id<MTLDevice> device, const DvwWeights& dvw,
+                     int max_B, int H_in, int W_in, int C_in,
+                     DetMixedBlock* out);
+bool BuildDetMixed6b(id<MTLDevice> device, const DvwWeights& dvw,
+                     int max_B, int H_in, int W_in, int C_in,
+                     DetMixedBlock* out);
+bool BuildDetMixed6c(id<MTLDevice> device, const DvwWeights& dvw,
+                     int max_B, int H_in, int W_in, int C_in,
+                     DetMixedBlock* out);
+bool BuildDetMixed6d(id<MTLDevice> device, const DvwWeights& dvw,
+                     int max_B, int H_in, int W_in, int C_in,
+                     DetMixedBlock* out);
+bool BuildDetMixed6e(id<MTLDevice> device, const DvwWeights& dvw,
+                     int max_B, int H_in, int W_in, int C_in,
+                     DetMixedBlock* out);
+bool BuildDetMixed7a(id<MTLDevice> device, const DvwWeights& dvw,
+                     int max_B, int H_in, int W_in, int C_in,
+                     DetMixedBlock* out);
+bool BuildDetMixed7b(id<MTLDevice> device, const DvwWeights& dvw,
+                     int max_B, int H_in, int W_in, int C_in,
+                     DetMixedBlock* out);
+bool BuildDetMixed7c(id<MTLDevice> device, const DvwWeights& dvw,
+                     int max_B, int H_in, int W_in, int C_in,
+                     DetMixedBlock* out);
 
-// Dispatch one Inception block onto `cb`. Reads from `input_buf`,
-// writes the concatenated output to `block.concat_out`. The block's
-// intermediate buffers are written-and-read internally; caller must
-// not access them concurrently.
-//
-// All four kernels (conv_serial, bn_relu, avg_pool, concat) must be
-// non-null and reside on the same MTLDevice as the block buffers.
-#ifdef __OBJC__
+// Dispatch one block onto `cb`. Reads from input_buf, writes
+// concatenated output to block.concat_out. `max_pool` may be null if
+// no block in the chain uses a max-pool branch (only Mixed_6a/7a do).
 bool DispatchDetMixedBlock(id<MTLCommandBuffer> cb,
                            MetalConvSerial* conv_serial,
                            MetalBnRelu* bn_relu,
                            MetalAvgPool* avg_pool,
+                           MetalMaxPool* max_pool,
                            MetalConcat* concat,
                            const DetMixedBlock& block,
                            id<MTLBuffer> input_buf,

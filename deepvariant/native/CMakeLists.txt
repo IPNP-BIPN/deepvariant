@@ -384,6 +384,30 @@ target_link_libraries(microtest_det_mixed5b PRIVATE
 )
 
 # ---------------------------------------------------------------------------
+# microtest_det_inception — full chain of 11 Mixed_X det blocks vs TF
+# reference (per-block max_abs/mean_abs/max_rel).
+# ---------------------------------------------------------------------------
+add_executable(microtest_det_inception
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_det_inception.mm"
+)
+set_source_files_properties(
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_det_inception.mm" PROPERTIES
+  COMPILE_FLAGS "-fobjc-arc"
+)
+target_include_directories(microtest_det_inception PRIVATE
+  ${ME_INCLUDE_DIRS}
+  "${CMAKE_SOURCE_DIR}"
+  "${ABSL_PREFIX}/include"
+)
+target_link_libraries(microtest_det_inception PRIVATE
+  dv_metal_det_mixed
+  dv_weights
+  absl::log
+  "-framework Metal"
+  "-framework Foundation"
+)
+
+# ---------------------------------------------------------------------------
 # microtest_conv_kahan — Phase 5.5e/Path B hand-verifiable test for the
 # Kahan-compensated Conv2D kernel. Compares GPU dispatch output against
 # a scalar Kahan reference and reports the precision improvement vs
