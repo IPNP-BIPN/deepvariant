@@ -623,6 +623,16 @@ int RunAllSomatic(int argc, char** argv) {
       me_args.push_back(absl::StrCat("--small_model_cvo_outfile_tumor=",
                                       small_cvo_pattern));
     }
+    // DeepSomatic-WGS thresholds from /opt/models/deepsomatic/wgs/
+    // model.example_info.json:flags_for_calling. Upstream's
+    // make_examples_core.py:apply_flags_for_calling reads this file and
+    // overrides flag defaults; we hard-code the WGS values here. (Future:
+    // read a sibling .example_info.json file alongside the .dvw to handle
+    // FFPE/ONT/PacBio model variants automatically.)
+    me_args.push_back("--vsc_min_fraction_snps=0.029");
+    me_args.push_back("--vsc_min_fraction_indels=0.05");
+    me_args.push_back("--small_model_snp_gq_threshold=31");
+    me_args.push_back("--small_model_indel_gq_threshold=29");
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
