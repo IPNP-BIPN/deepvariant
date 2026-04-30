@@ -88,6 +88,29 @@ target_link_libraries(dv_metal_conv_kahan PUBLIC
 )
 
 # ---------------------------------------------------------------------------
+# dv_metal_det_mixed — Phase 8/Tier 6.0 deterministic Inception block
+# dispatch. Wraps MetalConvSerial + MetalBnRelu + MetalAvgPool +
+# MetalConcat into per-block builders + dispatchers (Mixed_5b first,
+# scaled to all 11 blocks 5b–7c).
+# ---------------------------------------------------------------------------
+add_library(dv_metal_det_mixed STATIC metal_det_mixed.mm)
+set_source_files_properties(metal_det_mixed.mm PROPERTIES
+  COMPILE_FLAGS "-fobjc-arc"
+)
+target_include_directories(dv_metal_det_mixed PUBLIC
+  "${CMAKE_SOURCE_DIR}"
+  "${ABSL_PREFIX}/include"
+)
+target_link_libraries(dv_metal_det_mixed PUBLIC
+  dv_weights
+  dv_metal_conv_serial
+  dv_metal_det_kernels
+  absl::log
+  "-framework Metal"
+  "-framework Foundation"
+)
+
+# ---------------------------------------------------------------------------
 # dv_metal_det_kernels — Phase 5.5e deterministic AvgPool / Concat /
 # GlobalAvgPool kernels needed to extend Phase 5.5c to the full
 # Inception-v3 stack (blocks 5b–7c + global-avg-pool). All embed
