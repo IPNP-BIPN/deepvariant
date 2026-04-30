@@ -176,12 +176,25 @@ chr20:10M-10.1M:
 |---|---|---|---|---|
 | v1 (89 reads, no aln_*) | 252 | 60 | 70 | 9 |
 | v3 (+ legacy/supplementary) | 252 | 60 | 70 | 9 |
-| v4 (+ aln_*=2/5/10/1) | 259 | 60 | 63 | 11 (FP-noise) |
-| **v5 (+ 8722-read BAM)** | **259** | **39** | **63** | **2** |
+| v4 (+ aln_*=2/5/10/1) | 259 | 60 | 63 | 11 |
+| v5 (+ 8722-read BAM) | 259 | 39 | 63 | 2 |
+| v7 (skip realigner pang) | 259 | 39 | 63 | 2 |
+| **v8 (+ partition_size=25000)** | **321** | **0** | **1** | **0** |
 
-The v5 jump came from re-extracting the pangenome BAM in 1-kb chunks
-instead of one big query() call (89 reads → 8722 reads). FM on shared
-sites collapsed from 11 to 2 (NoCall ↔ PASS / RefCall borderline).
+The v8 step closed the gap from 80% → 99.69% site-set parity in
+two flag changes:
+1. Skip realigner for pangenome sample (mirrors upstream
+   make_examples_core.py:2208 `can_realign`).
+2. `--partition_size=25000` matching upstream's
+   run_pangenome_aware_deepvariant.py invocation. Smaller
+   partitions caused the AlleleCounter's `ref_supporting_read_count`
+   to differ from Docker at boundary positions (chr20:10000884
+   docker DP=8, ours DP=45). With partition_size=25000 the counts
+   converge.
+
+PASS parity: 246/247 (1 borderline missing call: chr20:10035373 C>G,
+Docker GQ=4 / QUAL=4.1 — likely realigner-haplotype interaction with
+adjacent long insertion).
 
 Reference captures:
 
