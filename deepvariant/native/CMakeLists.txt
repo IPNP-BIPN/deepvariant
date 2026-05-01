@@ -272,6 +272,7 @@ add_library(dv_make_examples_lib STATIC
   "${CMAKE_CURRENT_SOURCE_DIR}/make_examples_main.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/regions.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/realigner_native.cc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/gvcf_emit.cc"
 )
 target_include_directories(dv_make_examples_lib PUBLIC ${ME_INCLUDE_DIRS})
 target_compile_options(dv_make_examples_lib PRIVATE ${ME_COMPILE_OPTS})

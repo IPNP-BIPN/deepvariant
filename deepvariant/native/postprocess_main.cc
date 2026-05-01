@@ -40,8 +40,11 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
+#include "third_party/nucleus/io/merge_variants.h"
 #include "third_party/nucleus/io/reference.h"
+#include "third_party/nucleus/io/variant_reader.h"
 #include "third_party/nucleus/io/vcf_writer.h"
+#include "third_party/nucleus/protos/range.pb.h"
 #include "third_party/nucleus/protos/reference.pb.h"
 #include "third_party/nucleus/protos/struct.pb.h"
 #include "third_party/nucleus/protos/variants.pb.h"
@@ -52,6 +55,11 @@ ABSL_DECLARE_FLAG(std::string, ref);
 ABSL_DECLARE_FLAG(std::string, sample_name);
 ABSL_FLAG(std::string, output_vcf_outfile, "", "Output VCF path.");
 ABSL_FLAG(std::string, gvcf_outfile, "", "gVCF output path (optional).");
+ABSL_FLAG(std::string, nonvariant_site_tfrecord_path, "",
+          "Phase 9 / Step 3 — input non-variant TFRecord(s) produced by "
+          "make_examples --gvcf=... (sharded `name@N` spec). Required when "
+          "--gvcf_outfile is set; merged with the variant CVO stream via "
+          "nucleus::MergeAndWriteVariantsAndNonVariants.");
 ABSL_FLAG(bool, enable_temp_scaling, false,
           "Phase 8 / Tier 4 — apply post-CombineLikelihoods temperature "
           "scaling to softmax probabilities before argmax/QUAL/GQ/PL "
@@ -367,6 +375,25 @@ nucleus::genomics::v1::VcfHeader MakeVcfHeader(
     f->set_description("End position (for symbolic alleles)");
   }
 
+  // FORMAT fields used by gVCF rows (Phase 9 / Step 3). These live in
+  // the per-call info_map (not in INFO at the variant level), so they
+  // need a FORMAT declaration. MIN_DP and MED_DP appear only on
+  // gVCF rows and cost nothing to declare unconditionally.
+  {
+    auto* fi = hdr.add_formats();
+    fi->set_id("MIN_DP");
+    fi->set_number("1");
+    fi->set_type("Integer");
+    fi->set_description("Minimum DP observed within the gVCF block");
+  }
+  {
+    auto* fi = hdr.add_formats();
+    fi->set_id("MED_DP");
+    fi->set_number("1");
+    fi->set_type("Integer");
+    fi->set_description("Median DP observed within the gVCF block");
+  }
+
   // FORMAT fields.
   struct Fmt {
     const char* id;
@@ -413,25 +440,22 @@ int RunPostprocessVariants(int argc, char** argv) {
     return 1;
   }
 
-  // Phase 9 / Step 3 — gVCF output is NOT YET IMPLEMENTED in the native
-  // port. The flag is plumbed CLI → here, but emission requires:
-  //   (1) Porting upstream's Python `_calls_and_gvcfs` reference-row
-  //       generation to C++ (~300-400 LOC). Upstream variant_calling.cc
-  //       has no gVCF support; the per-position homref Variant rows
-  //       with NON_REF alt are constructed in make_examples_core.py.
-  //   (2) New non-variant TFRecord output stream in make_examples_main.cc.
-  //   (3) Reading the non-variant TFRecord here + band-coalescing
-  //       (merge adjacent homref sites with same GQ band into a single
-  //       row with END info field).
-  //   (4) Second VcfWriter for the gVCF stream with END field in header.
-  // Until landed, --gvcf_outfile is silently accepted but produces no
-  // output. Warn the user explicitly so they don't expect a result.
+  // Phase 9 / Step 3 — gVCF output. When --gvcf_outfile is set the
+  // make_examples stage must have produced a non-variant Variant
+  // TFRecord (one homref row per genomic position) at the path passed
+  // via --nonvariant_site_tfrecord_path. After the standard variant
+  // post-processing finishes (haplotype resolution + somatic GERMLINE
+  // reclassification), `nucleus::MergeAndWriteVariantsAndNonVariants`
+  // walks the variant + non-variant streams in lockstep, writes the
+  // VCF stream, and writes the gVCF stream with each variant
+  // converted to its `<NON_REF>`-extended form via TransfromToGvcf.
   const std::string gvcf_outfile = absl::GetFlag(FLAGS_gvcf_outfile);
-  if (!gvcf_outfile.empty()) {
-    LOG(WARNING) << "--gvcf_outfile=" << gvcf_outfile
-                 << " is plumbed but NOT YET IMPLEMENTED (Phase 9 Step 3). "
-                 << "VCF output proceeds; gVCF file will not be written. "
-                 << "Track at https://… (Phase 9 backlog).";
+  const std::string nonvariant_path =
+      absl::GetFlag(FLAGS_nonvariant_site_tfrecord_path);
+  if (!gvcf_outfile.empty() && nonvariant_path.empty()) {
+    LOG(ERROR) << "--gvcf_outfile=" << gvcf_outfile
+               << " requires --nonvariant_site_tfrecord_path to be set.";
+    return 1;
   }
 
   // ── Open reference for contig order ───────────────────────────────────────
@@ -853,8 +877,13 @@ int RunPostprocessVariants(int argc, char** argv) {
   ::deepvariant::MaybeResolveConflictingVariants(&variants_buffer, qual_filter);
 
   const bool process_somatic = absl::GetFlag(FLAGS_process_somatic);
-  for (auto v : variants_buffer) {  // copy so we can mutate
-    if (process_somatic && v.calls_size() > 0) {
+  // Apply the somatic GERMLINE-reclassification mutation in-place
+  // (Phase 9 / Step 3 — needed because the gVCF merge path consumes
+  // variants_buffer through a TFRecord round-trip rather than the
+  // direct VcfWriter::WriteSomatic path).
+  if (process_somatic) {
+    for (auto& v : variants_buffer) {
+      if (v.calls_size() == 0) continue;
       // Mirror nucleus/io/vcf_writer.cc::WriteSomatic: any non-{0/0,
       // 1/1, ./.} GT (i.e. heterozygous) gets reclassified as
       // GERMLINE 0/0. The biological assumption: a het call in a
@@ -866,7 +895,6 @@ int RunPostprocessVariants(int argc, char** argv) {
       const bool is_homalt = (g.size() == 2 && g.Get(0) == 1 && g.Get(1) == 1);
       const bool is_nocall = (g.size() == 2 && g.Get(0) < 0 && g.Get(1) < 0);
       if (!is_homref && !is_homalt && !is_nocall) {
-        // Reclassify as GERMLINE 0/0.
         call->clear_genotype();
         call->add_genotype(0);
         call->add_genotype(0);
@@ -876,13 +904,71 @@ int RunPostprocessVariants(int argc, char** argv) {
         }
       }
     }
-    auto status = vcf_writer->Write(v);
-    if (!status.ok()) {
-      LOG(WARNING) << "Failed to write variant at "
-                   << v.reference_name() << ":" << v.start() << " — " << status;
-    } else {
-      ++written;
+  }
+
+  if (gvcf_outfile.empty()) {
+    // ── Direct VCF write (no gVCF). ────────────────────────────────────
+    for (const auto& v : variants_buffer) {
+      auto status = vcf_writer->Write(v);
+      if (!status.ok()) {
+        LOG(WARNING) << "Failed to write variant at "
+                     << v.reference_name() << ":" << v.start() << " — " << status;
+      } else {
+        ++written;
+      }
     }
+  } else {
+    // ── gVCF merge path (Phase 9 / Step 3). ────────────────────────────
+    // Round-trip variants_buffer through a temp TFRecord so we can hand
+    // it to nucleus::MergeAndWriteVariantsAndNonVariants alongside the
+    // sharded non-variant TFRecord written by make_examples.
+    const std::string tmp_var_tfrecord =
+        absl::StrCat(outfile, ".variants.tmp.tfrecord");
+    {
+      auto w = TFRecordWriter::New(tmp_var_tfrecord);
+      CHECK(w) << "Cannot open temp variant TFRecord: " << tmp_var_tfrecord;
+      for (const auto& v : variants_buffer) {
+        std::string serialized;
+        v.SerializeToString(&serialized);
+        w->WriteRecord(serialized);
+      }
+      w->Close();
+    }
+
+    // Open the variant + non-variant readers and a second VcfWriter
+    // for the gVCF stream (same options + header as the main VCF).
+    absl::flat_hash_map<std::string, uint32_t> contig_index_map;
+    for (uint32_t i = 0; i < contigs.size(); ++i) {
+      contig_index_map[contigs[i].name()] = i;
+    }
+    auto var_reader = nucleus::VariantReader::Open(
+        tmp_var_tfrecord, /*compression=*/"", contig_index_map);
+    CHECK(var_reader) << "Cannot open temp variant TFRecord for read: "
+                      << tmp_var_tfrecord;
+
+    const std::vector<std::string> nv_shards = ExpandShards(nonvariant_path);
+    auto nv_reader =
+        nucleus::ShardedVariantReader::Open(nv_shards, contig_index_map);
+    CHECK(nv_reader) << "Cannot open non-variant TFRecord shards: "
+                     << nonvariant_path;
+
+    auto gvcf_writer_or = nucleus::VcfWriter::ToFile(gvcf_outfile, hdr, wr_opts);
+    CHECK(gvcf_writer_or.ok())
+        << "Failed to open gVCF output: " << gvcf_outfile;
+    auto gvcf_writer = std::move(gvcf_writer_or.ValueOrDie());
+
+    // Empty `ranges` = whole-genome (nucleus::RangesContainVariant is only
+    // applied when ranges is non-empty; the make_examples region filter
+    // already restricted the per-position rows to the user's --regions).
+    std::vector<nucleus::genomics::v1::Range> ranges;
+    nucleus::MergeAndWriteVariantsAndNonVariants(
+        /*only_keep_pass=*/false, var_reader.get(), nv_reader.get(),
+        vcf_writer.get(), gvcf_writer.get(), *ref_reader, ranges,
+        /*process_somatic=*/process_somatic);
+
+    written = static_cast<int>(variants_buffer.size());
+    std::remove(tmp_var_tfrecord.c_str());
+    LOG(INFO) << "gVCF written to " << gvcf_outfile;
   }
 
   // Recount filter classes after haplotype resolution (the per-variant
