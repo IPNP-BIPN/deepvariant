@@ -413,6 +413,27 @@ int RunPostprocessVariants(int argc, char** argv) {
     return 1;
   }
 
+  // Phase 9 / Step 3 — gVCF output is NOT YET IMPLEMENTED in the native
+  // port. The flag is plumbed CLI → here, but emission requires:
+  //   (1) Porting upstream's Python `_calls_and_gvcfs` reference-row
+  //       generation to C++ (~300-400 LOC). Upstream variant_calling.cc
+  //       has no gVCF support; the per-position homref Variant rows
+  //       with NON_REF alt are constructed in make_examples_core.py.
+  //   (2) New non-variant TFRecord output stream in make_examples_main.cc.
+  //   (3) Reading the non-variant TFRecord here + band-coalescing
+  //       (merge adjacent homref sites with same GQ band into a single
+  //       row with END info field).
+  //   (4) Second VcfWriter for the gVCF stream with END field in header.
+  // Until landed, --gvcf_outfile is silently accepted but produces no
+  // output. Warn the user explicitly so they don't expect a result.
+  const std::string gvcf_outfile = absl::GetFlag(FLAGS_gvcf_outfile);
+  if (!gvcf_outfile.empty()) {
+    LOG(WARNING) << "--gvcf_outfile=" << gvcf_outfile
+                 << " is plumbed but NOT YET IMPLEMENTED (Phase 9 Step 3). "
+                 << "VCF output proceeds; gVCF file will not be written. "
+                 << "Track at https://… (Phase 9 backlog).";
+  }
+
   // ── Open reference for contig order ───────────────────────────────────────
   auto ref_or = nucleus::IndexedFastaReader::FromFile(
       ref_path, absl::StrCat(ref_path, ".fai"));
