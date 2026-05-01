@@ -53,6 +53,19 @@
 #include "third_party/nucleus/util/utils.h"
 #include <cmath>
 
+ABSL_FLAG(bool, enable_methylation_calling, false,
+          "Phase 9 / Step 2 — read MM/ML SAM tags for base "
+          "modifications (5mC). When true, AlleleCounter computes "
+          "per-allele methylation fraction (ratio of 5mC-modified "
+          "to total reads supporting that allele) and the pileup "
+          "image gets an extra `base_methylation` channel. Default "
+          "false = no methylation-related fields emitted (matches "
+          "DV WGS/WES baseline). Used for ONT/PacBio methylation "
+          "calling.");
+ABSL_FLAG(double, methylation_calling_threshold, 0.5,
+          "Phase 9 / Step 2 — minimum methylation probability "
+          "(from ML tag) for a base to be classified as 5mC. "
+          "Default 0.5 matches upstream make_examples_options.py.");
 ABSL_FLAG(std::string, alt_aligned_pileup, "",
           "Phase 9 / Step 1 — alt-aligned pileup mode for PacBio/ONT "
           "models. One of: none, base_channels, diff_channels, rows, "
@@ -319,7 +332,19 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   // each AlleleCount.read_alleles map (otherwise the small_model sees
   // num_reads_supports_ref = 0 on every candidate and is biased).
   ac_opts.set_track_ref_reads(true);
+  // Phase 9 / Step 2 — methylation calling. Wires the MM/ML SAM tag
+  // reader (allelecounter.cc::GetMethylationLevel + IsMethylated) to
+  // populate AlleleCount.methylation_level. Default off → byte-identical
+  // baseline. Per-call methylation fraction is later read from these
+  // counts in postprocess to emit MF/MT/MI INFO fields.
+  const bool kMethylationOn = absl::GetFlag(FLAGS_enable_methylation_calling);
+  ac_opts.set_enable_methylation_calling(kMethylationOn);
+  ac_opts.set_methylation_calling_threshold(
+      absl::GetFlag(FLAGS_methylation_calling_threshold));
   *opts.mutable_allele_counter_options() = ac_opts;
+  // Mirror the flag onto MakeExamplesOptions (used by some downstream
+  // code paths, e.g. variant emission / VCF formatting).
+  opts.set_enable_methylation_calling(kMethylationOn);
 
   // Variant caller options.
   VariantCallerOptions vc_opts;
@@ -381,6 +406,13 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   pic.add_channels("read_supports_variant");
   pic.add_channels("base_differs_from_ref");
   pic.add_channels("insert_size");
+  // Phase 9 / Step 2 — append base_methylation channel when
+  // --enable_methylation_calling is on. pileup_image_native.cc reads
+  // AlleleCount.methylation_level (populated by the AlleleCounter
+  // when MM/ML SAM tags are present) and writes it to the channel.
+  if (kMethylationOn) {
+    pic.add_channels("base_methylation");
+  }
   pic.set_num_channels(7);
   *opts.mutable_pic_options() = pic;
 
