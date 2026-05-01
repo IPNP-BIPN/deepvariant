@@ -64,9 +64,16 @@ void ReferenceConfidence(int n_ref, int n_total, double p_error,
   NormalizeLog10Probs(log10_p_ref, log10_p_het, log10_p_alt);
 }
 
+// Mirror upstream variant_caller.py:_quantize_gq exactly. For binsize=5:
+//   raw_gq=48 → bin (48-1)//5=9 → 46
+//   raw_gq=50 → bin (50-1)//5=9 → 46
+// Different from a naive floor(raw/bs)*bs which would split 48 and 50 into
+// separate bins (45 and 50) and emit twice as many gVCF blocks.
 int QuantizeGq(int raw_gq, int binsize) {
+  if (raw_gq < 1) return 0;
   if (binsize <= 1) return raw_gq;
-  return (raw_gq / binsize) * binsize;
+  const int bin_number = (raw_gq - 1) / binsize;
+  return bin_number * binsize + 1;
 }
 
 // Per-site computed values, used for grouping.
@@ -174,6 +181,19 @@ std::vector<nucleus::genomics::v1::Variant> MakeGvcfRows(
       if (include_med_dp) {
         (*info_map)["MED_DP"].add_values()->set_int_value(med_dp);
       }
+      // PL = phred-scaled, zero-shifted log10 likelihoods. Mirrors
+      // nucleus/io/vcf_conversion.cc:1220-1228 exactly:
+      //   normalized = gl - max(gl)   (ZeroShiftLikelihoods)
+      //   phred = -10 * normalized    (Log10PErrorToPhred, double)
+      //   pl = static_cast<int>(phred) (implicit double→int = trunc)
+      {
+        const double max_gl = std::max({min_p[0], min_p[1], min_p[2]});
+        auto* pl_field = &(*info_map)["PL"];
+        for (int g = 0; g < 3; ++g) {
+          const double phred = -10.0 * (min_p[g] - max_gl);
+          pl_field->add_values()->set_int_value(static_cast<int>(phred));
+        }
+      }
       out.push_back(std::move(v));
     } else {
       // Uncalled GT=./. for each site individually (one Variant per site).
@@ -191,6 +211,23 @@ std::vector<nucleus::genomics::v1::Variant> MakeGvcfRows(
         c->add_genotype(-1);
         for (int q = 0; q < 3; ++q) {
           c->add_genotype_likelihood(entries[k].log10_probs[q]);
+        }
+        // PL on uncalled rows (mirrors valid-GL path above).
+        {
+          auto* uc_info = c->mutable_info();
+          (*uc_info)["GQ"].add_values()->set_int_value(entries[k].raw_gq);
+          (*uc_info)["MIN_DP"].add_values()->set_int_value(entries[k].n_total);
+          if (include_med_dp) {
+            (*uc_info)["MED_DP"].add_values()->set_int_value(entries[k].n_total);
+          }
+          const double max_gl = std::max(
+              {entries[k].log10_probs[0], entries[k].log10_probs[1],
+               entries[k].log10_probs[2]});
+          auto* pl_field = &(*uc_info)["PL"];
+          for (int g = 0; g < 3; ++g) {
+            const double phred = -10.0 * (entries[k].log10_probs[g] - max_gl);
+            pl_field->add_values()->set_int_value(static_cast<int>(phred));
+          }
         }
         out.push_back(std::move(v_each));
       }

@@ -39,7 +39,7 @@ std::vector<nucleus::genomics::v1::Variant> MakeGvcfRows(
         summaries,
     const std::string& sample_name,
     double p_error = 1e-3,
-    int gq_resolution = 1,
+    int gq_resolution = 5,    // Matches upstream --gvcf_gq_binsize default.
     int max_gq = 50,
     bool include_med_dp = false);
 

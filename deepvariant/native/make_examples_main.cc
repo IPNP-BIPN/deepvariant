@@ -64,6 +64,17 @@ ABSL_FLAG(std::string, gvcf, "",
           "produce a complete gVCF. Default empty = no gVCF emission "
           "(preserves baseline). Mirrors upstream's --gvcf flag in "
           "make_examples.");
+ABSL_FLAG(int32_t, gvcf_gq_binsize, 5,
+          "Bin size for quantizing gVCF genotype qualities. Larger bins "
+          "merge adjacent positions more aggressively, reducing the gVCF "
+          "row count at the cost of GQ granularity. Mirrors upstream's "
+          "--gvcf_gq_binsize default of 5.");
+ABSL_FLAG(double, p_error, 1e-3,
+          "Per-base sequencing error rate used by the gVCF reference "
+          "confidence model. Mirrors upstream's --p_error default 0.001.");
+ABSL_FLAG(bool, include_med_dp, false,
+          "Emit MED_DP info field in gVCF rows (median DP per block). "
+          "Mirrors upstream's --include_med_dp.");
 ABSL_FLAG(bool, use_direct_phasing, false,
           "Phase 9 / Step 4 — run upstream's DirectPhasing algorithm "
           "(deepvariant/direct_phasing.{h,cc}, Boost-graph max-weight "
@@ -1708,7 +1719,12 @@ int RunMakeExamples(int argc, char** argv) {
     // variant TFRecord via nucleus::MergeAndWriteVariantsAndNonVariants.
     if (gvcf_writer) {
       auto summaries = probe.SummaryCounts(0, 0);
-      auto gvcf_rows = MakeGvcfRows(summaries, sample_name);
+      auto gvcf_rows = MakeGvcfRows(
+          summaries, sample_name,
+          absl::GetFlag(FLAGS_p_error),
+          absl::GetFlag(FLAGS_gvcf_gq_binsize),
+          /*max_gq=*/50,
+          absl::GetFlag(FLAGS_include_med_dp));
       for (const auto& v : gvcf_rows) {
         std::string serialized;
         v.SerializeToString(&serialized);
