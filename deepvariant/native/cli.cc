@@ -208,6 +208,15 @@ int RunAll(int argc, char** argv) {
                     : small_cvo_base;
   const std::string merged_cvo_path =
       absl::StrCat(tmp_dir, "/merged_cvo.tfrecord");
+  // Phase 9 / Step 3 — gVCF intermediate non-variant TFRecord, sharded
+  // per make_examples worker thread. Postprocess merges it with the
+  // variant CVO stream via nucleus::MergeAndWriteVariantsAndNonVariants.
+  const std::string gvcf_tfrecord_base =
+      absl::StrCat(tmp_dir, "/gvcf.tfrecord");
+  const std::string gvcf_tfrecord_path =
+      n_threads > 1 ? absl::StrCat(gvcf_tfrecord_base, "@", n_threads)
+                    : gvcf_tfrecord_base;
+  const std::string gvcf_outfile = absl::GetFlag(FLAGS_output_gvcf);
 
   // For --inference_backend=metal, the user passes a `.dvw` weight bundle
   // via --checkpoint; for coreml (Phase 2), the bundle is a `.mlpackage`
@@ -254,6 +263,9 @@ int RunAll(int argc, char** argv) {
       me_args.push_back(absl::StrCat("--small_model=", small_model_path));
       me_args.push_back(absl::StrCat("--small_model_cvo_outfile=",
                                       small_cvo_path));
+    }
+    if (!gvcf_outfile.empty()) {
+      me_args.push_back(absl::StrCat("--gvcf=", gvcf_tfrecord_path));
     }
     // Phase 9 / Step 1 — alt-aligned pileup default per model_type.
     // PacBio + ONT use `diff_channels` (7 → 9 channels); WGS/WES `none`.
@@ -347,9 +359,10 @@ int RunAll(int argc, char** argv) {
         absl::StrCat("--ref=", ref_flag),
         absl::StrCat("--output_vcf_outfile=", output_vcf_flag),
     };
-    const std::string gvcf_flag = absl::GetFlag(FLAGS_output_gvcf);
-    if (!gvcf_flag.empty()) {
-      pp_args.push_back(absl::StrCat("--gvcf_outfile=", gvcf_flag));
+    if (!gvcf_outfile.empty()) {
+      pp_args.push_back(absl::StrCat("--gvcf_outfile=", gvcf_outfile));
+      pp_args.push_back(absl::StrCat("--nonvariant_site_tfrecord_path=",
+                                      gvcf_tfrecord_path));
     }
     auto argv_pp = MakeArgv("deepvariant_postprocess", pp_args);
     int n = static_cast<int>(argv_pp.size()) - 1;

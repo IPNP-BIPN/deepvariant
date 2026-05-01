@@ -27,6 +27,7 @@
 #include "deepvariant/allelecounter.h"
 #include "deepvariant/direct_phasing.h"
 #include "deepvariant/make_examples_native.h"
+#include "deepvariant/native/gvcf_emit.h"
 #include "deepvariant/native/numpy_mt19937.h"
 #include "deepvariant/native/realigner_native.h"
 #include "deepvariant/native/regions.h"
@@ -54,6 +55,15 @@
 #include "third_party/nucleus/util/utils.h"
 #include <cmath>
 
+ABSL_FLAG(std::string, gvcf, "",
+          "Phase 9 / Step 3 — output non-variant TFRecord path. When "
+          "non-empty, make_examples emits per-region gVCF reference "
+          "rows (homref `<*>` records with GQ + MIN_DP info fields, "
+          "band-coalesced) to this file alongside the regular examples "
+          "output. Postprocess merges these with the variant CVOs to "
+          "produce a complete gVCF. Default empty = no gVCF emission "
+          "(preserves baseline). Mirrors upstream's --gvcf flag in "
+          "make_examples.");
 ABSL_FLAG(bool, use_direct_phasing, false,
           "Phase 9 / Step 4 — run upstream's DirectPhasing algorithm "
           "(deepvariant/direct_phasing.{h,cc}, Boost-graph max-weight "
@@ -1045,6 +1055,16 @@ int RunMakeExamples(int argc, char** argv) {
   auto thread_small_cvo_path = [&](int t) {
     return n_threads == 1 ? small_cvo_path : ShardName(small_cvo_spec, t);
   };
+  // Phase 9 / Step 3 — gVCF output sharding. Same pattern as small_cvo.
+  const std::string gvcf_path_top = absl::GetFlag(FLAGS_gvcf);
+  std::string gvcf_spec = gvcf_path_top;
+  if (n_threads > 1 && !gvcf_spec.empty() &&
+      gvcf_spec.find('@') == std::string::npos) {
+    gvcf_spec = absl::StrCat(gvcf_path_top, "@", n_threads);
+  }
+  auto thread_gvcf_path_top = [&](int t) {
+    return n_threads == 1 ? gvcf_path_top : ShardName(gvcf_spec, t);
+  };
 
   // ──────────────────────────────────────────────────────────────────
   // Trio worker — mirrors deeptrio/make_examples.py's per-region loop.
@@ -1527,6 +1547,14 @@ int RunMakeExamples(int argc, char** argv) {
       CHECK(small_cvo_writer)
           << "thread " << tid << ": small CVO writer open failed";
     }
+    // Phase 9 / Step 3 — gVCF non-variant TFRecord writer (one per worker
+    // thread, sharded). Postprocess reads via ShardedVariantReader.
+    std::unique_ptr<TFRecordWriter> gvcf_writer;
+    if (!gvcf_path_top.empty()) {
+      gvcf_writer = TFRecordWriter::New(thread_gvcf_path_top(tid));
+      CHECK(gvcf_writer)
+          << "thread " << tid << ": gvcf writer open failed";
+    }
 
     int64_t total_candidates = 0;
     int64_t total_examples = 0;
@@ -1673,6 +1701,21 @@ int RunMakeExamples(int argc, char** argv) {
     AlleleCounter probe(ref_reader.get(), region, {},
                         opts.allele_counter_options());
     for (const auto& r : working_reads) probe.Add(r, sample_name);
+
+    // Phase 9 / Step 3 — gVCF non-variant TFRecord emission. Per-position
+    // reference-confidence rows are written for every region (regardless
+    // of whether candidates exist). Postprocess merges these with the
+    // variant TFRecord via nucleus::MergeAndWriteVariantsAndNonVariants.
+    if (gvcf_writer) {
+      auto summaries = probe.SummaryCounts(0, 0);
+      auto gvcf_rows = MakeGvcfRows(summaries, sample_name);
+      for (const auto& v : gvcf_rows) {
+        std::string serialized;
+        v.SerializeToString(&serialized);
+        gvcf_writer->WriteRecord(serialized);
+      }
+    }
+
     auto probe_candidates = caller.CallsFromAlleleCounter(probe);
     if (probe_candidates.empty()) continue;
 
@@ -1853,6 +1896,7 @@ int RunMakeExamples(int argc, char** argv) {
 
     generator.SignalShardFinished();
     if (small_cvo_writer) small_cvo_writer->Close();
+    if (gvcf_writer) gvcf_writer->Close();
 
     out_stats->total_candidates = total_candidates;
     out_stats->total_examples = total_examples;
