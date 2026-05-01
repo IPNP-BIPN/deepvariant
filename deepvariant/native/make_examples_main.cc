@@ -53,6 +53,14 @@
 #include "third_party/nucleus/util/utils.h"
 #include <cmath>
 
+ABSL_FLAG(std::string, alt_aligned_pileup, "",
+          "Phase 9 / Step 1 — alt-aligned pileup mode for PacBio/ONT "
+          "models. One of: none, base_channels, diff_channels, rows, "
+          "single_row. Default empty = inherit per-model upstream "
+          "default ('diff_channels' for PACBIO/ONT, 'none' for WGS/WES). "
+          "When non-empty, overrides the per-model default. Adds 2 "
+          "channels for diff_channels/base_channels (7 → 9), extra "
+          "rows for rows mode.");
 ABSL_FLAG(int64_t, tta_seed_offset, 0,
           "Phase 8 / Tier 2 — additive offset applied to the three "
           "internal RNG seeds (make_examples opts, variant_caller, "
@@ -354,7 +362,14 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   pic.set_read_overlap_buffer_bp(5);
   pic.set_multi_allelic_mode(PileupImageOptions::ADD_HET_ALT_IMAGES);
   pic.set_random_seed(2101079370 + static_cast<int>(kTtaOff));
-  pic.set_alt_aligned_pileup("none");
+  // Phase 9 / Step 1 — alt-aligned pileup mode. Empty flag value
+  // = inherit upstream per-model default. cli.cc sets the flag from
+  // model_type before invoking make_examples; here we just read it.
+  {
+    std::string aap = absl::GetFlag(FLAGS_alt_aligned_pileup);
+    if (aap.empty()) aap = "none";
+    pic.set_alt_aligned_pileup(aap);
+  }
   pic.set_types_to_alt_align("indels");
   pic.set_min_non_zero_allele_frequency(0.00001f);
   *pic.mutable_read_requirements() = read_reqs;
@@ -635,6 +650,8 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
       s->set_keep_only_window_spanning_reads(true);
       s->set_skip_phasing(true);
       s->set_skip_normalization(true);
+      // Pangenome-aware DV is WGS-only (no PacBio/ONT) → alt_aligned
+      // is always "none" per upstream make_examples_pangenome_aware_dv.py.
       s->set_alt_aligned_pileup("none");
       // Per upstream make_examples_pangenome_aware_dv.py:250-256,
       // pangenome rows zero out 5 channels: HAPLOTYPE_TAG (channel 8),
