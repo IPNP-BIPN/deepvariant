@@ -375,26 +375,10 @@ nucleus::genomics::v1::VcfHeader MakeVcfHeader(
     f->set_description("End position (for symbolic alleles)");
   }
 
-  // FORMAT fields used by gVCF rows (Phase 9 / Step 3). These live in
-  // the per-call info_map (not in INFO at the variant level), so they
-  // need a FORMAT declaration. MIN_DP and MED_DP appear only on
-  // gVCF rows and cost nothing to declare unconditionally.
-  {
-    auto* fi = hdr.add_formats();
-    fi->set_id("MIN_DP");
-    fi->set_number("1");
-    fi->set_type("Integer");
-    fi->set_description("Minimum DP observed within the gVCF block");
-  }
-  {
-    auto* fi = hdr.add_formats();
-    fi->set_id("MED_DP");
-    fi->set_number("1");
-    fi->set_type("Integer");
-    fi->set_description("Median DP observed within the gVCF block");
-  }
-
-  // FORMAT fields.
+  // FORMAT fields. Order determines per-record column order — keep it
+  // matched to upstream's gVCF (GT, GQ, [DP|MIN_DP], AD, VAF, MID, PL).
+  // MIN_DP / MED_DP slot in just after GQ since gVCF reference rows
+  // emit them in place of DP.
   struct Fmt {
     const char* id;
     const char* num;
@@ -402,13 +386,15 @@ nucleus::genomics::v1::VcfHeader MakeVcfHeader(
     const char* desc;
   };
   static constexpr Fmt fmts[] = {
-      {"GT",  "1", "String",  "Genotype"},
-      {"GQ",  "1", "Integer", "Conditional genotype quality"},
-      {"DP",  "1", "Integer", "Read depth"},
-      {"AD",  "R", "Integer", "Allelic depths for ref and alt alleles"},
-      {"VAF", "A", "Float",   "Variant allele fractions"},
-      {"MID", "1", "String",  "Model identifier (small_model | deepvariant)"},
-      {"PL",  "G", "Integer", "Phred-scaled genotype likelihoods"},
+      {"GT",     "1", "String",  "Genotype"},
+      {"GQ",     "1", "Integer", "Conditional genotype quality"},
+      {"MIN_DP", "1", "Integer", "Minimum DP observed within the gVCF block"},
+      {"MED_DP", "1", "Integer", "Median DP observed within the gVCF block"},
+      {"DP",     "1", "Integer", "Read depth"},
+      {"AD",     "R", "Integer", "Allelic depths for ref and alt alleles"},
+      {"VAF",    "A", "Float",   "Variant allele fractions"},
+      {"MID",    "1", "String",  "Model identifier (small_model | deepvariant)"},
+      {"PL",     "G", "Integer", "Phred-scaled genotype likelihoods"},
   };
   for (const auto& f : fmts) {
     auto* fi = hdr.add_formats();
