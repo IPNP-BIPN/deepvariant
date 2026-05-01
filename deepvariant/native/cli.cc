@@ -8,6 +8,8 @@
 
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
+#include "absl/flags/reflection.h"
+#include <sys/sysctl.h>
 #include "absl/log/globals.h"
 #include "absl/log/initialize.h"
 #include "absl/log/log.h"
@@ -135,6 +137,55 @@ int EffectiveNumShards() {
   // 0 (default) and 1 (=no sharding) both fall back to auto-detect.
   if (explicit_n > 1) return explicit_n;
   return AutoNumShards();
+}
+
+// Auto-detect a sensible default for --batch_size based on physical
+// RAM. The MPSGraph Inception-v3 forward pass at FP32 holds peak
+// activations of ~5 MB per example mid-network plus ~100 MB of
+// constant weights. Larger batches amortise the per-batch dispatch
+// overhead (~50 ms) but consume proportionally more unified memory.
+//
+// Tiered conservative table (peak GPU footprint ≤ 50 % of physical
+// RAM, leaving headroom for the OS, htslib mmap, and other tools):
+//
+//   < 16 GB   → batch_size 128   (8 GB Macs)
+//   16-32 GB  → batch_size 512   (16 GB Macs: M1/M2/M3 Pro entry)
+//   32-64 GB  → batch_size 1024  (32 GB Pro/Max, 36 GB M4 Pro)
+//   ≥ 64 GB   → batch_size 2048  (64 GB+ Max/Ultra/M4 Max)
+//
+// User can override with --batch_size=N at any time. The auto-detect
+// only kicks in when the flag is at its default value.
+//
+// We read RAM via sysctl(hw.memsize) which is the physical RAM in
+// bytes — works on every Mac since macOS 10.0, no entitlements.
+int AutoBatchSize() {
+  uint64_t mem_bytes = 0;
+  size_t len = sizeof(mem_bytes);
+  // sysctlbyname is the macOS-portable way; #include <sys/sysctl.h> at
+  // the top of the file (added below).
+  if (sysctlbyname("hw.memsize", &mem_bytes, &len, nullptr, 0) != 0 ||
+      mem_bytes == 0) {
+    return 512;  // safe fallback
+  }
+  const uint64_t mem_gb = mem_bytes >> 30;  // approximate GiB
+  if (mem_gb < 16) return 128;
+  if (mem_gb < 32) return 512;
+  if (mem_gb < 64) return 1024;
+  return 2048;
+}
+
+int EffectiveBatchSize() {
+  // Distinguish "user passed --batch_size on cmdline" from "default
+  // value from the proto" via DefaultValue / CurrentValue string
+  // comparison. (`IsSpecifiedOnCommandLine` is private in this abseil
+  // version.) Edge case: a user passing exactly the default value
+  // (128) gets the auto-detect path. Acceptable since 128 is the
+  // smallest non-trivial value and AutoBatchSize ≥ 128 by design.
+  if (auto* f = absl::FindCommandLineFlag("batch_size");
+      f && f->CurrentValue() != f->DefaultValue()) {
+    return absl::GetFlag(FLAGS_batch_size);
+  }
+  return AutoBatchSize();
 }
 
 std::string ModelPath(const std::string& model_type) {
@@ -298,7 +349,7 @@ int RunAll(int argc, char** argv) {
         absl::StrCat("--examples=", examples_pattern),
         absl::StrCat("--outfile=", cvo_pattern),
         absl::StrCat("--checkpoint=", model_path),
-        absl::StrCat("--batch_size=", absl::GetFlag(FLAGS_batch_size)),
+        absl::StrCat("--batch_size=", EffectiveBatchSize()),
         absl::StrCat("--inference_backend=", inference_backend),
     };
     auto argv_cv = MakeArgv("deepvariant_call_variants", cv_args);
@@ -535,7 +586,7 @@ int RunAllTrio(int argc, char** argv) {
           absl::StrCat("--examples=", p.examples_pattern),
           absl::StrCat("--outfile=", p.cvo_path),
           absl::StrCat("--checkpoint=", p.ckpt_path),
-          absl::StrCat("--batch_size=", absl::GetFlag(FLAGS_batch_size)),
+          absl::StrCat("--batch_size=", EffectiveBatchSize()),
           absl::StrCat("--inference_backend=", inference_backend),
           "--input_height=140",
           "--input_channels=7",
@@ -723,7 +774,7 @@ int RunAllSomatic(int argc, char** argv) {
         absl::StrCat("--examples=", examples_pattern),
         absl::StrCat("--outfile=", cvo_path),
         absl::StrCat("--checkpoint=", ckpt),
-        absl::StrCat("--batch_size=", absl::GetFlag(FLAGS_batch_size)),
+        absl::StrCat("--batch_size=", EffectiveBatchSize()),
         absl::StrCat("--inference_backend=", inference_backend),
         absl::StrCat("--input_height=", tumor_h_default),
         "--input_channels=7",
@@ -900,7 +951,7 @@ int RunAllPangenome(int argc, char** argv) {
         absl::StrCat("--examples=", examples_pattern),
         absl::StrCat("--outfile=", cvo_path),
         absl::StrCat("--checkpoint=", ckpt),
-        absl::StrCat("--batch_size=", absl::GetFlag(FLAGS_batch_size)),
+        absl::StrCat("--batch_size=", EffectiveBatchSize()),
         absl::StrCat("--inference_backend=", inference_backend),
         "--input_height=200",
         "--input_channels=7",
