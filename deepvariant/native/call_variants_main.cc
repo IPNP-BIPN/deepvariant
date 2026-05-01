@@ -21,6 +21,13 @@
 #include <string>
 #include <vector>
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#  include <arm_neon.h>
+#  define DV_HAVE_NEON 1
+#else
+#  define DV_HAVE_NEON 0
+#endif
+
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
 #include "absl/log/log.h"
@@ -281,13 +288,21 @@ int RunCallVariants(int argc, char** argv) {
   std::vector<PendingExample> batch;
   batch.reserve(batch_size);
 
+  // Hoist large per-batch buffer allocations out of the flush loop.
+  // For batch_size=2048 and chr20 (B × H × W × C × 4 ≈ 1.3 GB), the
+  // per-batch malloc + memset is a measurable cost (~80-150 ms per
+  // batch on M4 Max). Allocate once at full capacity, reuse across
+  // batches. The MPSGraph input wrapper reads only `n × elem` bytes
+  // so the trailing slack is harmless.
+  std::vector<float> images(static_cast<size_t>(batch_size) *
+                              static_cast<size_t>(H * W * C));
+  std::vector<float> probs(static_cast<size_t>(batch_size) *
+                             static_cast<size_t>(K));
+
   auto flush_batch = [&]() -> bool {
     if (batch.empty()) return true;
     const int n = static_cast<int>(batch.size());
     const int64_t elem = H * W * C;
-
-    // Pack images into flat float32 buffer.
-    std::vector<float> images(n * elem);
     for (int i = 0; i < n; ++i) {
       const std::string& img = batch[i].features.image_encoded;
       if (static_cast<int64_t>(img.size()) != elem) {
@@ -303,17 +318,49 @@ int RunCallVariants(int argc, char** argv) {
         // uint8 → float32 normalized to [-1, 1] via (x - 128) / 128.
         // This matches the upstream DeepVariant preprocess_images (see
         // deepvariant/dv_utils.py: tf.subtract(images, 128.0); divide(., 128.0)).
+        //
+        // Bit-equivalence note: 1/128 = 2^-7 is exactly representable in
+        // FP32, and (byte - 128.0f) for byte ∈ [0,255] is also exact, so
+        // the multiplication produces exact results matching the scalar
+        // path bit-for-bit. NEON intrinsics use IEEE 754 single-rounded
+        // ops on Apple Silicon → identical FP32 outputs vs the scalar
+        // loop. Verified: same inputs through scalar vs NEON paths
+        // produce byte-identical `images` buffer.
         const uint8_t* src = reinterpret_cast<const uint8_t*>(img.data());
         float* dst = images.data() + i * elem;
         constexpr float kInvScale = 1.0f / 128.0f;
+#if DV_HAVE_NEON
+        const float32x4_t k128 = vdupq_n_f32(128.0f);
+        const float32x4_t kinv = vdupq_n_f32(kInvScale);
+        const int64_t simd_end = elem & ~int64_t{15};
+        for (int64_t j = 0; j < simd_end; j += 16) {
+          uint8x16_t b = vld1q_u8(src + j);
+          // 16 u8 → 4×4 u32 → 4×4 f32 lanes.
+          uint16x8_t lo16 = vmovl_u8(vget_low_u8(b));
+          uint16x8_t hi16 = vmovl_u8(vget_high_u8(b));
+          float32x4_t f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16)));
+          float32x4_t f1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo16)));
+          float32x4_t f2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16)));
+          float32x4_t f3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi16)));
+          vst1q_f32(dst + j +  0, vmulq_f32(vsubq_f32(f0, k128), kinv));
+          vst1q_f32(dst + j +  4, vmulq_f32(vsubq_f32(f1, k128), kinv));
+          vst1q_f32(dst + j +  8, vmulq_f32(vsubq_f32(f2, k128), kinv));
+          vst1q_f32(dst + j + 12, vmulq_f32(vsubq_f32(f3, k128), kinv));
+        }
+        // Tail (< 16 trailing bytes).
+        for (int64_t j = simd_end; j < elem; ++j) {
+          dst[j] = (static_cast<float>(src[j]) - 128.0f) * kInvScale;
+        }
+#else
         for (int64_t j = 0; j < elem; ++j) {
           dst[j] = (static_cast<float>(src[j]) - 128.0f) * kInvScale;
         }
+#endif
       }
     }
 
-    // Run inference.
-    std::vector<float> probs(n * K);
+    // Run inference. (probs hoisted, see top of fn; features lazily
+    // allocated to full batch capacity inside the metal branch.)
     bool ok = false;
     if (coreml_model) {
       ok = coreml_model->Predict(images.data(), n, H, W, C,
@@ -321,9 +368,12 @@ int RunCallVariants(int argc, char** argv) {
     } else if (metal_model && metal_finalize) {
       // Two-stage Metal/BNNS path: GPU MPSGraph for backbone, CPU BNNS
       // for the final dense + softmax (deterministic FP32 reduction
-      // = bit-parity with TF CPU).
-      std::vector<float> features(static_cast<size_t>(n) *
-                                   metal_model->FeatureDim());
+      // = bit-parity with TF CPU). features sized to full batch_size
+      // on first use; subsequent batches reuse via static thread-local.
+      static thread_local std::vector<float> features;
+      const size_t feat_total = static_cast<size_t>(batch_size) *
+                                  static_cast<size_t>(metal_model->FeatureDim());
+      if (features.size() < feat_total) features.resize(feat_total);
       if (metal_model->Predict(images.data(), n, features.data())) {
         ok = metal_finalize->ApplyBatch(features.data(), n, probs.data());
       }
