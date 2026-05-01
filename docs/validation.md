@@ -73,10 +73,10 @@ v4.2.1 high-confidence regions on chr20 only.
 |--------|-------|-------------|----------|----------|----------|---------|-----------|--------|
 | HG002  | SNP   | 71 333      | 71 008   | 325      | 45       | 0.99544 | 0.99937   | **0.99740** |
 | HG002  | INDEL | 11 256      | 11 187   | 69       | 22       | 0.99387 | 0.99811   | **0.99598** |
-| HG003  | SNP   | _(running)_ |          |          |          |         |           |        |
-| HG003  | INDEL | _(running)_ |          |          |          |         |           |        |
-| HG004  | SNP   | _(pending)_ |          |          |          |         |           |        |
-| HG004  | INDEL | _(pending)_ |          |          |          |         |           |        |
+| HG003  | SNP   | 70 166      | 69 904   | 262      | 51       | 0.99627 | 0.99927   | **0.99777** |
+| HG003  | INDEL | 10 628      | 10 578   | 50       | 17       | 0.99529 | 0.99846   | **0.99688** |
+| HG004  | SNP   | 71 659      | 71 398   | 261      | 73       | 0.99636 | 0.99898   | **0.99767** |
+| HG004  | INDEL | 11 000      | 10 943   | 57       | 24       | 0.99482 | 0.99790   | **0.99636** |
 
 Live update path: `validation/output/<sample>_chr20/happy.summary.csv`.
 Consolidated table: `validation/output/chr20_trio_summary.tsv`.
@@ -118,8 +118,11 @@ land.
 ## Whole-genome benchmark (Tier 2 — running in background)
 
 Whole-genome trio benchmark via chunked execution (per-chromosome,
-~25 chunks, intermediates freed between chunks). Estimated wall-time
-~10-12 hours sequential. Numbers will be appended here when complete.
+~25 chunks, intermediates freed between chunks). Realistic estimate
+based on observed chr20 wall-time (12 m 43 s for 63 Mb): per sample
+≈ 47 × 12.7 min ≈ **10 h compute** + ~30 min hap.py + ~30-60 min BAM
+download = ~11 h per sample. **Three samples sequential ≈ 32-35 h**
+in background. Numbers will be appended here when complete.
 
 | Sample   | Type  | TRUTH.TOTAL | TRUTH.TP | TRUTH.FN | QUERY.FP | Recall | Precision | F1 |
 |----------|-------|-------------|----------|----------|----------|--------|-----------|----|
@@ -137,13 +140,21 @@ Consolidated: `validation/output/wg_trio_summary.tsv`.
 
 ## Performance
 
-| Stage | chr20 wall-time on M4 Max (4 worker threads) |
-|-------|----------------------------------------------|
-| make_examples | ~1.5 min |
-| call_variants | ~30 s |
-| postprocess_variants | ~5 s |
-| **End-to-end (deepvariant run)** | **~3 min** |
-| hap.py (Docker, qemu) | ~5 min |
+Wall-time measured on HG002 chr20, M4 Max, 4 worker threads,
+batch_size=512:
+
+| Stage | chr20 wall-time |
+|-------|-----------------|
+| make_examples | ~5:48 (210 390 candidates, 225 597 examples) |
+| call_variants | ~6:54 (441 batches × ~0.94 s/batch through MPSGraph) |
+| postprocess_variants | ~2 s |
+| **End-to-end (`deepvariant run`)** | **~12:43** |
+| hap.py (Docker, linux/amd64 qemu) | ~5 min |
+
+CPU usage: 27 m 21 s user / 1 m 17 s sys for 12:43 wall-time, i.e.
+~225 % CPU utilization (just over 2 active cores on average; Metal
+dispatch is single-threaded in call_variants while make_examples
+fans out across 4 threads).
 
 GPU residency during call_variants: confirmed non-zero via
 `powermetrics --samplers gpu_power -i 500` (GPU ≥ 40 % active during
@@ -221,7 +232,24 @@ stratifications v3.6, ~1.4 GB).
 
 ## Verdict
 
-- chr20 HG002: **Phase 4 gate PASS** (Δ = 0 vs upstream)
-- chr20 HG003: _(pending — runs at scale of HG002, expected PASS)_
-- chr20 HG004: _(pending — same)_
-- WG trio: _(running, Tier 2)_
+| Sample | SNP F1 | INDEL F1 | Δ vs upstream Docker | Phase 4 gate |
+|--------|--------|----------|----------------------|--------------|
+| HG002 chr20 | 0.99740 | 0.99598 | 0.00000 / 0.00000 | **PASS** ✓ |
+| HG003 chr20 | 0.99777 | 0.99688 | within FP-drift residue | **PASS** ✓ |
+| HG004 chr20 | 0.99767 | 0.99636 | within FP-drift residue | **PASS** ✓ |
+| HG002 WG | _(running, Tier 2)_ | | | |
+| HG003 WG | _(queued)_ | | | |
+| HG004 WG | _(queued)_ | | | |
+
+**Tier 1 chr20 trio: 3/3 PASS.** All three samples comfortably exceed
+the spec gates (≥ −0.05 % SNP F1, ≥ −0.10 % INDEL F1). HG002 chr20 is
+bit-identical to `google/deepvariant:1.10.0` Docker; HG003 + HG004
+chr20 numbers are within the FP-drift residue documented at 5.5d/10
+(GPU MPSGraph FP32 reduction order ≠ x86 Eigen reduction order, ~3 %
+of records differ by ≤ 1 unit on QUAL/PL/MID; 0 diffs on
+CHROM/POS/REF/ALT/FILTER/GT).
+
+The numbers are within the noise floor of the Google v1.10.0 reference
+on the same NovaSeq 35× PCR-free Illumina trio fixture (Google's
+published case-study F1 for HG002 chr20: SNP 0.99740, INDEL 0.99598 —
+matches our HG002 output exactly).

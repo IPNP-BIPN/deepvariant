@@ -28,7 +28,7 @@ DATA="${DV_GIAB_DIR:-/tmp/dv_giab}/full"
 CKPT="${DV_CHECKPOINT:-/Users/benjamin/deepvariant/validation/work/wgs.dvw}"
 INFER_BACKEND="${DV_INFERENCE:-metal}"
 KEEP_BAM="${DV_KEEP_BAM:-0}"          # set 1 to retain BAM after sample done
-NUM_SHARDS="${DV_NUM_SHARDS:-4}"
+NUM_SHARDS="${DV_NUM_SHARDS:-14}"   # M4 Max has 14 P-cores; saturate make_examples
 BATCH_SIZE="${DV_BATCH_SIZE:-512}"
 
 if [ ! -f "${DATA}/GRCh38.fa" ]; then
@@ -123,10 +123,11 @@ run_sample() {
   echo "    deepvariant wall-time: ${elapsed} s ($((elapsed / 60)) min)"
 
   # hap.py vs GIAB v4.2.1 truth, whole-genome (no --location).
-  # --platform linux/amd64 forces qemu emulation since hap.py is x86-only.
+  # Note: omit explicit `--platform linux/amd64` — that flag triggers a
+  # Docker Desktop 500 error; default platform selection works.
   if [ ! -f "${out}/happy.summary.csv" ]; then
     echo "    hap.py vs ${truth_vcf} (whole-genome) …"
-    docker run --rm --platform linux/amd64 \
+    docker run --rm \
       -v "${DATA}:/data:ro" \
       -v "$(realpath "${out}"):/work" \
       jmcdani20/hap.py:v0.3.12 \
