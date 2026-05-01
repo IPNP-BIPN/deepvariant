@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "deepvariant/allelecounter.h"
+#include "deepvariant/direct_phasing.h"
 #include "deepvariant/make_examples_native.h"
 #include "deepvariant/native/numpy_mt19937.h"
 #include "deepvariant/native/realigner_native.h"
@@ -354,6 +355,10 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   // Mirror the flag onto MakeExamplesOptions (used by some downstream
   // code paths, e.g. variant emission / VCF formatting).
   opts.set_enable_methylation_calling(kMethylationOn);
+  // Phase 9 / Step 4 — DirectPhasing options. Only used when
+  // --use_direct_phasing is set; the algorithm wraps candidates +
+  // reads to emit per-variant phase info (is_phased + PS).
+  opts.mutable_direct_phasing_options()->set_min_alleles_to_phase(1);
 
   // Variant caller options.
   VariantCallerOptions vc_opts;
@@ -1775,6 +1780,43 @@ int RunMakeExamples(int argc, char** argv) {
     }
 
     if (big_candidates.empty()) continue;
+
+    // Phase 9 / Step 4b — DirectPhasing per-region orchestration.
+    // Wraps candidates + working_reads for upstream's PhaseReads,
+    // then walks GetPhasedVariants() to mark each candidate's
+    // VariantCall.is_phased = true. The phase set ID (PS info field)
+    // is per-region (= block start position); cross-region stitching
+    // is a follow-up that mirrors upstream's stitch_phase_sets.
+    if (absl::GetFlag(FLAGS_use_direct_phasing)) {
+      std::vector<
+          nucleus::ConstProtoPtr<const nucleus::genomics::v1::Read>>
+          dp_read_ptrs;
+      dp_read_ptrs.reserve(working_reads.size());
+      for (auto& r : working_reads) dp_read_ptrs.emplace_back(&r);
+      ::learning::genomics::deepvariant::DirectPhasing dp(
+          opts.direct_phasing_options());
+      auto so = dp.PhaseReads(absl::MakeSpan(big_candidates),
+                               absl::MakeSpan(dp_read_ptrs));
+      if (so.ok()) {
+        const auto phased = dp.GetPhasedVariants();
+        // Walk in order; track current phase set (= start of block).
+        int64_t current_ps = -1;
+        std::map<int64_t, int64_t> position_to_ps;
+        for (const auto& pv : phased) {
+          if (pv.is_first_in_block) current_ps = pv.position;
+          if (current_ps >= 0 && pv.phase_1_bases != pv.phase_2_bases) {
+            position_to_ps[pv.position] = current_ps;
+          }
+        }
+        for (auto& c : big_candidates) {
+          const int64_t pos = c.variant().start();
+          auto it = position_to_ps.find(pos);
+          if (it == position_to_ps.end()) continue;
+          if (c.variant().calls_size() == 0) continue;
+          c.mutable_variant()->mutable_calls(0)->set_is_phased(true);
+        }
+      }
+    }
 
     // Wrap in ConstProtoPtr for ExamplesGenerator API.
     std::vector<nucleus::ConstProtoPtr<DeepVariantCall>> cand_ptrs;
