@@ -40,6 +40,7 @@
 
 #include "deepvariant/native/bnns_finalize.h"
 #include "deepvariant/native/coreml_inference.h"
+#include "deepvariant/native/dv_signpost.h"
 #include "deepvariant/native/metal_inference.h"
 #include "deepvariant/native/tfrecord.h"
 #include "deepvariant/protos/deepvariant.pb.h"
@@ -366,6 +367,8 @@ int RunCallVariants(int argc, char** argv) {
     if (batch.empty()) return true;
     const int n = static_cast<int>(batch.size());
     const int64_t elem = H * W * C;
+    DV_SIGNPOST_INTERVAL_BEGIN(FlushBatch, "");
+    DV_SIGNPOST_INTERVAL_BEGIN(Normalize, "");
     for (int i = 0; i < n; ++i) {
       const std::string& img = batch[i].features.image_encoded;
       if (static_cast<int64_t>(img.size()) != elem) {
@@ -422,9 +425,12 @@ int RunCallVariants(int argc, char** argv) {
       }
     }
 
+    DV_SIGNPOST_INTERVAL_END(Normalize);
+
     // Run inference. (probs hoisted, see top of fn; features lazily
     // allocated to full batch capacity inside the metal branch.)
     bool ok = false;
+    DV_SIGNPOST_INTERVAL_BEGIN(Inference, "");
     if (coreml_model) {
       ok = coreml_model->Predict(images.data(), n, H, W, C,
                                   probs.data(), K);
@@ -437,10 +443,16 @@ int RunCallVariants(int argc, char** argv) {
       const size_t feat_total = static_cast<size_t>(batch_size) *
                                   static_cast<size_t>(metal_model->FeatureDim());
       if (features.size() < feat_total) features.resize(feat_total);
-      if (metal_model->Predict(images.data(), n, features.data())) {
+      DV_SIGNPOST_INTERVAL_BEGIN(MetalGPU, "");
+      bool gpu_ok = metal_model->Predict(images.data(), n, features.data());
+      DV_SIGNPOST_INTERVAL_END(MetalGPU);
+      if (gpu_ok) {
+        DV_SIGNPOST_INTERVAL_BEGIN(BnnsFinalize, "");
         ok = metal_finalize->ApplyBatch(features.data(), n, probs.data());
+        DV_SIGNPOST_INTERVAL_END(BnnsFinalize);
       }
     }
+    DV_SIGNPOST_INTERVAL_END(Inference);
     if (!ok) {
       LOG(ERROR) << "Inference failed on batch " << total_batches;
       return false;
@@ -485,6 +497,7 @@ int RunCallVariants(int argc, char** argv) {
     ++total_batches;
     total_examples += n;
     batch.clear();
+    DV_SIGNPOST_INTERVAL_END(FlushBatch);
     return true;
   };
 
