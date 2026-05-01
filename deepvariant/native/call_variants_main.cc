@@ -15,10 +15,15 @@
 
 #include "deepvariant/native/call_variants.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
@@ -277,6 +282,64 @@ int RunCallVariants(int argc, char** argv) {
     return 1;
   }
 
+  // ── P1: async writer thread ──────────────────────────────────────────────
+  // Move CVO TFRecord writes off the main thread so we can overlap them
+  // with the next batch's GPU compute. Bounded SPSC queue gives back-
+  // pressure when writer falls behind the producer (rare since GPU is
+  // much slower than disk write at our throughput).
+  //
+  // Design:
+  //   main thread: build CVO → SerializeToString → enqueue
+  //   writer thread: dequeue → writer->WriteRecord → loop
+  //   end: main pushes 'done' flag, writer drains queue + exits
+  //
+  // Output bit-equivalence: writer thread is the SOLE consumer of the
+  // writer; serialization order is preserved by the queue's FIFO
+  // discipline. Same TFRecord bytes produced.
+  constexpr size_t kWriteQueueDepth = 32;  // up to 32 CVOs buffered
+  std::deque<std::string> write_queue;
+  std::mutex wq_mu;
+  std::condition_variable wq_nonempty, wq_nonfull;
+  bool writer_done = false;
+  std::atomic<bool> writer_failed{false};
+
+  std::thread writer_thread([&]() {
+    for (;;) {
+      std::string item;
+      {
+        std::unique_lock<std::mutex> lk(wq_mu);
+        wq_nonempty.wait(lk, [&] {
+          return !write_queue.empty() || writer_done;
+        });
+        if (write_queue.empty() && writer_done) return;
+        item = std::move(write_queue.front());
+        write_queue.pop_front();
+        wq_nonfull.notify_one();
+      }
+      if (!writer->WriteRecord(item)) {
+        LOG(ERROR) << "Async writer: WriteRecord failed";
+        writer_failed.store(true);
+        // Drain remaining queue silently to unblock producer.
+        std::lock_guard<std::mutex> lk(wq_mu);
+        write_queue.clear();
+        wq_nonfull.notify_all();
+        return;
+      }
+    }
+  });
+
+  auto enqueue_write = [&](std::string&& payload) -> bool {
+    if (writer_failed.load()) return false;
+    std::unique_lock<std::mutex> lk(wq_mu);
+    wq_nonfull.wait(lk, [&] {
+      return write_queue.size() < kWriteQueueDepth || writer_failed.load();
+    });
+    if (writer_failed.load()) return false;
+    write_queue.push_back(std::move(payload));
+    wq_nonempty.notify_one();
+    return true;
+  };
+
   // Batch inference loop.
   int64_t total_examples = 0;
   int64_t total_batches  = 0;
@@ -411,8 +474,10 @@ int RunCallVariants(int argc, char** argv) {
         LOG(ERROR) << "Failed to serialize CallVariantsOutput";
         return false;
       }
-      if (!writer->WriteRecord(serialized)) {
-        LOG(ERROR) << "Failed to write output record";
+      // P1: async writer thread consumes this. Push std::move so the
+      // writer thread owns the buffer; main thread can recycle storage.
+      if (!enqueue_write(std::move(serialized))) {
+        LOG(ERROR) << "Failed to enqueue output record (writer thread error)";
         return false;
       }
     }
@@ -423,17 +488,98 @@ int RunCallVariants(int argc, char** argv) {
     return true;
   };
 
-  while (reader->GetNext()) {
-    PendingExample pe;
-    pe.raw_payload = reader->record();
-    pe.features    = ParseExample(pe.raw_payload);
-    batch.push_back(std::move(pe));
+  // ── P2: pre-fetch reader thread ──────────────────────────────────────────
+  // Move reader->GetNext() + ParseExample off the main thread so we can
+  // overlap the I/O + protobuf parsing with the previous batch's GPU
+  // dispatch. Bounded SPSC queue (depth = 2 × batch_size = 1024 examples
+  // at default batch=512) gives back-pressure when main thread is the
+  // bottleneck.
+  //
+  // Output bit-equivalence: reader produces same PendingExample objects
+  // in the same order; main thread consumes in same order; flush_batch
+  // sees identical batches as before. No algorithmic change.
+  const size_t kReadQueueDepth = static_cast<size_t>(batch_size) * 2;
+  std::deque<PendingExample> read_queue;
+  std::mutex rq_mu;
+  std::condition_variable rq_nonempty, rq_nonfull;
+  bool reader_eof = false;
+  std::atomic<bool> reader_stop{false};
 
-    if (static_cast<int>(batch.size()) >= batch_size) {
-      if (!flush_batch()) return 1;
+  std::thread reader_thread([&]() {
+    while (!reader_stop.load() && reader->GetNext()) {
+      PendingExample pe;
+      pe.raw_payload = reader->record();
+      pe.features    = ParseExample(pe.raw_payload);
+      std::unique_lock<std::mutex> lk(rq_mu);
+      rq_nonfull.wait(lk, [&] {
+        return read_queue.size() < kReadQueueDepth || reader_stop.load();
+      });
+      if (reader_stop.load()) return;
+      read_queue.push_back(std::move(pe));
+      rq_nonempty.notify_one();
+    }
+    {
+      std::lock_guard<std::mutex> lk(rq_mu);
+      reader_eof = true;
+    }
+    rq_nonempty.notify_all();
+  });
+
+  // RAII guard: ensure reader thread is joined on every exit path.
+  struct ReaderJoiner {
+    std::thread& t;
+    std::atomic<bool>& stop;
+    std::mutex& mu;
+    std::condition_variable& cv_full;
+    std::condition_variable& cv_empty;
+    ~ReaderJoiner() {
+      stop.store(true);
+      { std::lock_guard<std::mutex> lk(mu); }
+      cv_full.notify_all();
+      cv_empty.notify_all();
+      if (t.joinable()) t.join();
+    }
+  } reader_joiner{reader_thread, reader_stop, rq_mu, rq_nonfull, rq_nonempty};
+
+  // Main consumption loop: pop from reader queue, accumulate batch,
+  // flush when full.
+  for (;;) {
+    PendingExample pe;
+    bool got_one = false;
+    {
+      std::unique_lock<std::mutex> lk(rq_mu);
+      rq_nonempty.wait(lk, [&] {
+        return !read_queue.empty() || reader_eof;
+      });
+      if (!read_queue.empty()) {
+        pe = std::move(read_queue.front());
+        read_queue.pop_front();
+        rq_nonfull.notify_one();
+        got_one = true;
+      } else if (reader_eof) {
+        break;
+      }
+    }
+    if (got_one) {
+      batch.push_back(std::move(pe));
+      if (static_cast<int>(batch.size()) >= batch_size) {
+        if (!flush_batch()) return 1;
+      }
     }
   }
   if (!flush_batch()) return 1;
+
+  // Signal writer thread to drain + exit; then close writer ourselves.
+  {
+    std::lock_guard<std::mutex> lk(wq_mu);
+    writer_done = true;
+  }
+  wq_nonempty.notify_all();
+  writer_thread.join();
+  if (writer_failed.load()) {
+    LOG(ERROR) << "Async writer thread failed during run";
+    return 1;
+  }
 
   reader->Close();
   writer->Close();
