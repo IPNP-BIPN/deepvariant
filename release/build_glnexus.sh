@@ -99,6 +99,50 @@ if src2 != src:
     print("patched htslib PATCH_COMMAND (BSD sed + drop march)")
     src = src2
 
+# 2c. htslib: BUILD_COMMAND uses `make -n && make -j$(nproc)`. The
+#     `make -n` (dry-run) exits non-zero on macOS for harmless missing-
+#     rule warnings. Drop the precheck. Also: macOS doesn't have nproc;
+#     use sysctl -n hw.logicalcpu. And inject CPATH + LIBRARY_PATH so
+#     htslib finds brew-installed lzma/zlib/bzip2 headers.
+brew_inc = "/opt/homebrew/include"
+brew_lib = "/opt/homebrew/lib"
+new_htslib_cmd = (
+    'BUILD_COMMAND bash -c "'
+    'export CPATH=' + brew_inc + ':$CPATH && '
+    'export LIBRARY_PATH=' + brew_lib + ':$LIBRARY_PATH && '
+    'make -j$(sysctl -n hw.logicalcpu)"'
+)
+src2 = src.replace(
+    'BUILD_COMMAND bash -c "make -n && make -j$(nproc)"',
+    new_htslib_cmd)
+if src2 != src:
+    print("patched htslib BUILD_COMMAND (drop make -n + add CPATH + sysctl nproc)")
+    src = src2
+
+# 2c1. Replace remaining $(nproc) with $(sysctl -n hw.logicalcpu) globally
+#      (rocksdb, capnp, etc. all use it).
+src2 = src.replace("$(nproc)", "$(sysctl -n hw.logicalcpu)")
+if src2 != src:
+    print("globally replaced $(nproc) with $(sysctl -n hw.logicalcpu)")
+    src = src2
+
+# 2d. yaml-cpp: vendored 0.6.3 has hardcoded -march=ivybridge in the
+#     CONFIGURE_COMMAND. Strip the arm64-incompatible flag.
+src2 = src.replace(
+    "-DCMAKE_CXX_FLAGS=-march=ivybridge ",
+    "")
+if src2 != src:
+    print("patched yaml-cpp CONFIGURE_COMMAND (drop -march=ivybridge)")
+    src = src2
+
+# 2e. yaml-cpp: also disable test build to avoid arm64 test issues.
+src2 = src.replace(
+    "-DYAML_CPP_BUILD_TOOLS=OFF -DYAML_CPP_BUILD_CONTRIB=OFF",
+    "-DYAML_CPP_BUILD_TOOLS=OFF -DYAML_CPP_BUILD_CONTRIB=OFF -DYAML_CPP_BUILD_TESTS=OFF")
+if src2 != src:
+    print("patched yaml-cpp CONFIGURE_COMMAND (disable tests)")
+    src = src2
+
 p.write_text(src)
 PYEOF
 
