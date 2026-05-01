@@ -370,26 +370,37 @@ QUAL space. Residues cluster at:
 
 ### 5.1 Wall-time on M4 Max
 
-Measured on HG002 chr20 (single-shard equivalent for the Docker
-reference; our port runs N=4 worker threads in-process):
+Measured on HG002 chr20 with the post-optimisation build (commit
+`3bcca88f` — NEON normalisation, hoisted buffers, RAM-tiered
+AutoBatchSize) at `--num_shards=14 --batch_size=512`:
 
 | Pipeline | chr20 wall-time | Speedup |
 |----------|-----------------|---------|
-| **Native arm64 port (this work)** | **12 m 43 s** | **1.0× (reference)** |
-| `google/deepvariant:1.10.0` Docker (linux/amd64 via Rosetta 2) | ~17 min | 0.74× |
+| **Native arm64 port (this work)** | **6 m 27 s** | **1.0× (reference)** |
+| Native port pre-optims (`--num_shards=4 --batch_size=512`, build a3d7247b) | 12 m 43 s | 0.51× |
+| `google/deepvariant:1.10.0` Docker (linux/amd64 via Rosetta 2) | ~17 min | 0.38× |
 | Published Google reference (64-core EC2 c5.18xlarge, native Linux) | 25-40 min for whole-genome | — |
 
-Stage breakdown of the native port on chr20:
+Stage breakdown of the native port on chr20 (post-optims):
 
-- `make_examples`: 5 m 48 s (210 390 candidates, 225 597 examples)
-- `call_variants`: 6 m 54 s (441 batches × 0.94 s/batch through MPSGraph)
-- `postprocess_variants`: 2 s
+- `make_examples`: 1 m 15 s (210 388 candidates, 225 585 examples, 14 worker threads)
+- `call_variants`: 5 m 10 s (441 batches × 0.70 s/batch through MPSGraph + BNNS-CPU finalize)
+- `postprocess_variants`: 1 s
 
-CPU usage: 27 m 21 s user / 1 m 17 s sys for 12 m 43 s wall —
-~225 % CPU utilisation (Metal dispatch is single-threaded in
-call_variants while make_examples fans out across 4 threads).
+Speedup decomposition (vs pre-optim 12:43 baseline at `--num_shards=4`):
+
+- `--num_shards 4 → 14` on make_examples: stage 5:48 → 1:15 (−4:33, −78 % stage 1)
+- NEON uint8→fp32 normalisation: stage 6:54 → ~6:09 (−45 s)
+- Hoisted per-batch buffer allocs: ~6:09 → 5:10 (−59 s)
+- **Total**: 12:43 → 6:27 (**−6:16, −49 %**)
+
+CPU usage: 20 m 34 s user / 54 s sys for 6 m 27 s wall —
+~325 % CPU utilisation (3.25 cores active on average; up from 225 %
+pre-optim because make_examples now saturates 14 threads in a much
+shorter window).
+
 GPU residency confirmed non-zero via `powermetrics --samplers
-gpu_power -i 500` (≥40 % active during inference).
+gpu_power -i 500` (≥ 40 % active during call_variants).
 
 ### 5.2 F1 vs DeepVariant upstream Docker
 
