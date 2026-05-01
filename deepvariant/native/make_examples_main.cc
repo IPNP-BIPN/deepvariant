@@ -1250,6 +1250,20 @@ int RunMakeExamples(int argc, char** argv) {
         }
         reads_iter->Release().IgnoreError();
         if (max_rpp > 0 && raw_reads.size() > static_cast<size_t>(max_rpp)) {
+          // Shard-count-independence guard: stable-sort by (POS,
+          // fragment_name, read_number) before reservoir sampling. See
+          // the long comment at the single-sample worker site for
+          // rationale; trio path mirrors that fix exactly.
+          std::stable_sort(raw_reads.begin(), raw_reads.end(),
+                           [](const nucleus::genomics::v1::Read& a,
+                              const nucleus::genomics::v1::Read& b) {
+                             const int64_t pa = a.alignment().position().position();
+                             const int64_t pb = b.alignment().position().position();
+                             if (pa != pb) return pa < pb;
+                             const int cmp = a.fragment_name().compare(b.fragment_name());
+                             if (cmp != 0) return cmp < 0;
+                             return a.read_number() < b.read_number();
+                           });
           ::deepvariant::npr::NumpyMt19937 region_rng(opts.random_seed());
           auto sampled = ::deepvariant::npr::ReservoirSamplePtrs(
               raw_reads, max_rpp, region_rng);
@@ -1610,9 +1624,40 @@ int RunMakeExamples(int argc, char** argv) {
     // opts.random_seed (609314161, the upstream default), reset per
     // region — matches `np.random.RandomState(seed)` in
     // make_examples_core.py:2134.
+    //
+    // SHARD-COUNT INDEPENDENCE GUARD (2026-05-01): the upstream Python
+    // pipeline runs as a single process per shard, so partition-level
+    // determinism is automatic. Our native port runs N worker threads
+    // in one process, all sharing the BAM via per-thread SamReader
+    // instances. Empirically (chr20 trio HG002 today, num_shards=4 vs
+    // num_shards=14 at Phase 5.5d/10) we observe a 0.2-0.3 % PASS-set
+    // delta between the two configurations, traceable to reservoir-
+    // sampling output differing across thread loads. To eliminate this
+    // we stable-sort the read vector by (POS, fragment_name,
+    // read_number) BEFORE feeding it to the reservoir. BAM is
+    // coordinate-sorted, so reads naturally arrive in increasing POS
+    // order from htslib; the secondary key (fragment_name + read_number)
+    // disambiguates within-position reads deterministically. If htslib
+    // already returns reads in this exact order (the BAM standard
+    // guarantee), this sort is a no-op (stable sort preserves relative
+    // order on equal keys); if any thread-related state introduces
+    // sub-position reordering, the sort imposes the canonical order.
+    // Docker's pysam.AlignmentFile.fetch returns reads in BAM-sorted
+    // order, so ours-after-sort matches Docker's order.
     const int max_rpp = static_cast<int>(opts.max_reads_per_partition());
     if (max_rpp > 0 && reads.size() > static_cast<size_t>(max_rpp)) {
       const size_t orig_n = reads.size();
+      // Defensive stable sort by (POS, fragment_name, read_number).
+      std::stable_sort(reads.begin(), reads.end(),
+                       [](const nucleus::genomics::v1::Read& a,
+                          const nucleus::genomics::v1::Read& b) {
+                         const int64_t pa = a.alignment().position().position();
+                         const int64_t pb = b.alignment().position().position();
+                         if (pa != pb) return pa < pb;
+                         const int cmp = a.fragment_name().compare(b.fragment_name());
+                         if (cmp != 0) return cmp < 0;
+                         return a.read_number() < b.read_number();
+                       });
       ::deepvariant::npr::NumpyMt19937 region_rng(opts.random_seed());
       auto sampled =
           ::deepvariant::npr::ReservoirSamplePtrs(reads, max_rpp, region_rng);
