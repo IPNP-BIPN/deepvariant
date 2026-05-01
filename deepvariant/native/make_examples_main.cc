@@ -53,6 +53,15 @@
 #include "third_party/nucleus/util/utils.h"
 #include <cmath>
 
+ABSL_FLAG(int64_t, tta_seed_offset, 0,
+          "Phase 8 / Tier 2 — additive offset applied to the three "
+          "internal RNG seeds (make_examples opts, variant_caller, "
+          "pileup_image). Default 0 = baseline (matches Docker). "
+          "Non-zero: produces a different shuffle pattern in "
+          "DownsampleReadIndices (when coverage > pileup height) "
+          "and reservoir sampling, generating an alternative pileup "
+          "view of the same region. Used by validation/run_tta.sh "
+          "to orchestrate N-pass test-time augmentation.");
 ABSL_FLAG(std::string, reads, "", "BAM/CRAM file with aligned reads.");
 ABSL_FLAG(std::string, ref, "", "Reference FASTA (.fai index required).");
 // `--examples` is the canonical pipeline filespec — defined in call_variants.
@@ -276,7 +285,10 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   opts.set_task_id(task_id);
   opts.set_num_shards(num_shards);
   opts.set_mode(MakeExamplesOptions::CALLING);
-  opts.set_random_seed(609314161);
+  // TTA seed offset (default 0 = baseline, matches Docker bit-for-bit).
+  // Non-zero: shifts the 3 internal RNG seeds for test-time augmentation.
+  const int64_t kTtaOff = absl::GetFlag(FLAGS_tta_seed_offset);
+  opts.set_random_seed(609314161 + static_cast<int>(kTtaOff));
   // Match upstream `make_examples_options.py`: cap reads per
   // partition (default 1500) so high-coverage regions don't blow up
   // and so our per-region read selection matches Docker's. Reservoir
@@ -313,7 +325,7 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   vc_opts.set_gq_resolution(1);
   vc_opts.set_ploidy(2);
   vc_opts.set_fraction_reference_sites_to_emit(0.0);
-  vc_opts.set_random_seed(1260872234);
+  vc_opts.set_random_seed(1260872234 + static_cast<int>(kTtaOff));
   // Required so variant_calling_multisample.cc populates ref_support_ext —
   // without it the small_model sees zero ref-supporting reads on every
   // candidate and predicts hom_ref for everything.
@@ -341,7 +353,7 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   pic.set_width(221);
   pic.set_read_overlap_buffer_bp(5);
   pic.set_multi_allelic_mode(PileupImageOptions::ADD_HET_ALT_IMAGES);
-  pic.set_random_seed(2101079370);
+  pic.set_random_seed(2101079370 + static_cast<int>(kTtaOff));
   pic.set_alt_aligned_pileup("none");
   pic.set_types_to_alt_align("indels");
   pic.set_min_non_zero_allele_frequency(0.00001f);
