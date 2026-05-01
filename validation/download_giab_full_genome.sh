@@ -45,11 +45,12 @@ dl() {
   curl -L --progress-bar -o "${out}" "${url}"
 }
 
-# 1. Full GRCh38 reference FASTA (NCBI).
+# 1. Full GRCh38 reference FASTA from NCBI canonical no_alt_analysis_set.
 echo
 echo "==> Step 1/4: full GRCh38 FASTA (~3.1 GB)"
-GRCh38_URL="https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.29_GRCh38.p13/seqs_for_alignment_pipelines.ucsc_ids/GCA_000001405.29_GRCh38.p13_no_alt_analysis_set.fasta.gz"
-dl "${GRCh38_URL}" "GRCh38.fa.gz"
+GS_BASE="https://storage.googleapis.com/deepvariant/case-study-testdata"
+NCBI_REF="https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.15_GRCh38/seqs_for_alignment_pipelines.ucsc_ids/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz"
+dl "${NCBI_REF}" "GRCh38.fa.gz"
 if [ ! -f "GRCh38.fa" ]; then
   echo "==> Decompressing GRCh38.fa.gz ..."
   gunzip -k "GRCh38.fa.gz"
@@ -59,27 +60,20 @@ if [ ! -f "GRCh38.fa.fai" ]; then
   /opt/homebrew/bin/samtools faidx GRCh38.fa
 fi
 
-# 2. HG002 BAM (already may exist locally; download whole-genome NovaSeq).
+# 2-3. NovaSeq 35× PCR-free WG BAMs (the canonical Google v1.10.0
+# benchmark fixture — same provenance as our chr20 fixture
+# /tmp/giab_chr20_full/HG00*.novaseq.pcr-free.35x.dedup…chr20.bam).
 echo
-echo "==> Step 2/4: HG002 whole-genome BAM (~40 GB)"
-HG002_BAM_URL="${GIAB_FTP}/data/AshkenazimTrio/HG002_NA24385_son/NIST_HiSeq_HG002_Homogeneity-10953946/NHGRI_Illumina300X_AJtrio_novoalign_bams/HG002.GRCh38.300x.bam"
-# Use the 35x novaseq variant if available; the 300x novoalign is one canonical option.
-dl "${HG002_BAM_URL}" "HG002.bam"
-dl "${HG002_BAM_URL}.bai" "HG002.bam.bai"
-
-# 3. HG003 + HG004 BAMs.
-echo
-echo "==> Step 3/4: HG003 + HG004 BAMs (~80 GB)"
-HG003_BAM_URL="${GIAB_FTP}/data/AshkenazimTrio/HG003_NA24149_father/NIST_HiSeq_HG003_Homogeneity-12389378/NHGRI_Illumina300X_AJtrio_novoalign_bams/HG003.GRCh38.300x.bam"
-HG004_BAM_URL="${GIAB_FTP}/data/AshkenazimTrio/HG004_NA24143_mother/NIST_HiSeq_HG004_Homogeneity-14572558/NHGRI_Illumina300X_AJtrio_novoalign_bams/HG004.GRCh38.300x.bam"
-dl "${HG003_BAM_URL}"     "HG003.bam"
-dl "${HG003_BAM_URL}.bai" "HG003.bam.bai"
-dl "${HG004_BAM_URL}"     "HG004.bam"
-dl "${HG004_BAM_URL}.bai" "HG004.bam.bai"
+echo "==> Step 2/4: HG002/HG003/HG004 WG BAMs (~120 GB total)"
+for SAMPLE in HG002 HG003 HG004; do
+  BAM_URL="${GS_BASE}/${SAMPLE}.novaseq.pcr-free.35x.dedup.grch38_no_alt.bam"
+  dl "${BAM_URL}"     "${SAMPLE}.bam"
+  dl "${BAM_URL}.bai" "${SAMPLE}.bam.bai"
+done
 
 # 4. HG003 + HG004 GIAB v4.2.1 truth sets (HG002 is already at /tmp/dv_giab/data/).
 echo
-echo "==> Step 4/4: HG003 + HG004 GIAB v4.2.1 truth sets (~300 MB)"
+echo "==> Step 3/4: HG003 + HG004 GIAB v4.2.1 truth sets (~300 MB)"
 HG003_TRUTH_URL="${GIAB_FTP}/release/AshkenazimTrio/HG003_NA24149_father/NISTv4.2.1/GRCh38/HG003_GRCh38_1_22_v4.2.1_benchmark.vcf.gz"
 HG003_BED_URL="${GIAB_FTP}/release/AshkenazimTrio/HG003_NA24149_father/NISTv4.2.1/GRCh38/HG003_GRCh38_1_22_v4.2.1_benchmark_noinconsistent.bed"
 HG004_TRUTH_URL="${GIAB_FTP}/release/AshkenazimTrio/HG004_NA24143_mother/NISTv4.2.1/GRCh38/HG004_GRCh38_1_22_v4.2.1_benchmark.vcf.gz"
