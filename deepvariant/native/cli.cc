@@ -38,6 +38,11 @@ ABSL_DECLARE_FLAG(int, num_shards);
 ABSL_DECLARE_FLAG(int, batch_size);
 ABSL_DECLARE_FLAG(std::string, inference_backend);
 ABSL_DECLARE_FLAG(std::string, checkpoint);
+// Phase 9 / Step 1 — alt-aligned pileup mode (PacBio/ONT). Defined in
+// make_examples_main.cc; cli.cc reads it to pick a sensible per-model
+// default ("diff_channels" for PACBIO/ONT, "none" for WGS/WES) before
+// passing it down to make_examples.
+ABSL_DECLARE_FLAG(std::string, alt_aligned_pileup);
 
 // DeepTrio (Step 1.5) — trio mode flags. When --reads_parent1 is set,
 // run mode dispatches 3× call_variants with the appropriate child/parent
@@ -249,6 +254,22 @@ int RunAll(int argc, char** argv) {
       me_args.push_back(absl::StrCat("--small_model=", small_model_path));
       me_args.push_back(absl::StrCat("--small_model_cvo_outfile=",
                                       small_cvo_path));
+    }
+    // Phase 9 / Step 1 — alt-aligned pileup default per model_type.
+    // PacBio + ONT use `diff_channels` (7 → 9 channels); WGS/WES `none`.
+    // Empty user flag (default) inherits the per-model default; explicit
+    // user-provided flag overrides.
+    {
+      const std::string user_aap = absl::GetFlag(FLAGS_alt_aligned_pileup);
+      std::string aap = user_aap;
+      if (aap.empty()) {
+        if (model_type == "PACBIO" || model_type == "ONT") {
+          aap = "diff_channels";
+        } else {
+          aap = "none";
+        }
+      }
+      me_args.push_back(absl::StrCat("--alt_aligned_pileup=", aap));
     }
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
