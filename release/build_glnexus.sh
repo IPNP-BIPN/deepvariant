@@ -1,10 +1,25 @@
 #!/usr/bin/env bash
-# Build GLnexus 1.4.1 on Apple Silicon (arm64).
+# Build GLnexus 1.4.1/1.4.5 on Apple Silicon (arm64).
 #
-# Status (2026-05-01): partial build — known issues remaining.
-# Successfully builds (with patches): CTPL, capnp, rocksdb.
-# Still failing: htslib (autoconf path) + yaml-cpp (configure step).
-# Final glnexus_cli link blocked by the two remaining failures.
+# Status (2026-05-01): BLOCKED at upstream level — not solvable in
+# this script alone.
+#
+# Working (7 patches): CTPL, capnp, rocksdb, htslib, yaml-cpp.
+# BROKEN: fcmm dependency at https://github.com/giacomodrago/fcmm —
+#         the upstream GitHub repo has been DELETED (returns 404 as
+#         of 2026-05-01). GLnexus 1.4.1 through 1.4.5 all reference
+#         this URL via ExternalProject_Add(fcmm) and have no fallback.
+#
+# Resolutions (none in-script):
+#   a) Vendor a fcmm fork (single-header ~5 KB) and patch the
+#      ExternalProject_Add to use the local copy. Requires sourcing
+#      and license-checking a trustworthy archive copy.
+#   b) Wait for upstream GLnexus to drop or vendor fcmm.
+#   c) Use Docker linux/amd64 under Rosetta 2 (slower ~3-5× but works).
+#
+# The 7 working patches below reduce the build-failure surface from
+# ~10 issues to 1 unsolvable upstream-deletion issue. They serve as
+# the starting point for option (a) when someone has bandwidth.
 #
 # Patches applied (working):
 #   1. CMake 4.x rejects `cmake_minimum_required(VERSION 3.2)` —
@@ -127,15 +142,17 @@ if src2 != src:
     src = src2
 
 # 2d. yaml-cpp: vendored 0.6.3 has hardcoded -march=ivybridge in the
-#     CONFIGURE_COMMAND. Strip the arm64-incompatible flag.
+#     CONFIGURE_COMMAND. Strip the arm64-incompatible flag, disable
+#     tests, and add CMAKE_POLICY_VERSION_MINIMUM=3.5 (CMake 4.x
+#     rejects the old `cmake_minimum_required(VERSION 3.0)` line in
+#     yaml-cpp 0.6.3).
 src2 = src.replace(
     "-DCMAKE_CXX_FLAGS=-march=ivybridge ",
-    "")
+    "-DCMAKE_POLICY_VERSION_MINIMUM=3.5 ")
 if src2 != src:
-    print("patched yaml-cpp CONFIGURE_COMMAND (drop -march=ivybridge)")
+    print("patched yaml-cpp CONFIGURE_COMMAND (drop -march, add policy)")
     src = src2
 
-# 2e. yaml-cpp: also disable test build to avoid arm64 test issues.
 src2 = src.replace(
     "-DYAML_CPP_BUILD_TOOLS=OFF -DYAML_CPP_BUILD_CONTRIB=OFF",
     "-DYAML_CPP_BUILD_TOOLS=OFF -DYAML_CPP_BUILD_CONTRIB=OFF -DYAML_CPP_BUILD_TESTS=OFF")
