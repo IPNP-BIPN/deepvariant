@@ -47,7 +47,7 @@ run_sample() {
       --inference_backend="${INFER_BACKEND}"
       --model_type=WGS
       --checkpoint="${CKPT}"
-      --num_shards=4
+      --num_shards=14
       --batch_size=512
     )
     [ -n "${SMALL}" ] && DV_ARGS+=(--small_model_path="${SMALL}")
@@ -67,10 +67,12 @@ run_sample() {
   fi
 
   # Stage 2: hap.py vs GIAB v4.2.1 truth (chr20 subset via --location).
-  # --platform linux/amd64 forces qemu emulation since hap.py is x86-only.
+  # Note: explicit `--platform linux/amd64` triggers a Docker Desktop 500
+  # error on this machine; omitting the flag lets Docker pick the image
+  # platform (linux/amd64 by default) and emulate via Rosetta 2 / qemu.
   if [ ! -f "${out}/happy.summary.csv" ]; then
     echo "==> ${sample}: hap.py vs ${truth_vcf}"
-    docker run --rm --platform linux/amd64 \
+    docker run --rm \
       -v "${DATA}:/data:ro" \
       -v "$(realpath "${out}"):/work" \
       jmcdani20/hap.py:v0.3.12 \
