@@ -280,6 +280,7 @@ target_link_libraries(dv_make_examples_lib PUBLIC
   dv_allelecounter
   dv_tfrecord
   dv_small_model
+  dv_direct_phasing       # Phase 9 / Step 4 — per-region read phasing
   realigner
   proto_dv
   proto_nucleus
