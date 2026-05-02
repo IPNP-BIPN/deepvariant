@@ -39,6 +39,8 @@ ABSL_DECLARE_FLAG(std::string, regions);
 ABSL_DECLARE_FLAG(int, num_shards);
 ABSL_DECLARE_FLAG(int, batch_size);
 ABSL_DECLARE_FLAG(std::string, inference_backend);
+ABSL_DECLARE_FLAG(std::string, ane_speculate_metal_checkpoint);
+ABSL_DECLARE_FLAG(double, ane_speculate_confidence);
 ABSL_DECLARE_FLAG(std::string, checkpoint);
 // Phase 9 / Step 1 — alt-aligned pileup mode (PacBio/ONT). Defined in
 // make_examples_main.cc; cli.cc reads it to pick a sensible per-model
@@ -352,6 +354,18 @@ int RunAll(int argc, char** argv) {
         absl::StrCat("--batch_size=", EffectiveBatchSize()),
         absl::StrCat("--inference_backend=", inference_backend),
     };
+    // ane_speculate: thread the GPU rerun .dvw + the borderline threshold.
+    if (inference_backend == "ane_speculate") {
+      const std::string ane_metal_ckpt =
+          absl::GetFlag(FLAGS_ane_speculate_metal_checkpoint);
+      if (!ane_metal_ckpt.empty()) {
+        cv_args.push_back(absl::StrCat(
+            "--ane_speculate_metal_checkpoint=", ane_metal_ckpt));
+      }
+      cv_args.push_back(absl::StrCat(
+          "--ane_speculate_confidence=",
+          absl::GetFlag(FLAGS_ane_speculate_confidence)));
+    }
     auto argv_cv = MakeArgv("deepvariant_call_variants", cv_args);
     int n = static_cast<int>(argv_cv.size()) - 1;
     if (int rc = RunCallVariants(n, argv_cv.data()); rc != 0) {

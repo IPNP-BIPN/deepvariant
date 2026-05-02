@@ -65,9 +65,18 @@ ABSL_FLAG(int, input_channels, 7,
           "Pileup-image channels for the Metal backend. WGS/Trio=7, "
           "pangenome=9.");
 ABSL_FLAG(std::string, inference_backend, "metal",
-          "Inference backend: metal (Phase 5.5 default, MPSGraph + BNNS "
-          ".dvw — GPU on Apple Silicon) or coreml (Phase 2 fallback, "
-          "Core ML .mlpackage). The shipped Homebrew binary uses metal.");
+          "Inference backend: metal (default, MPSGraph + BNNS-CPU .dvw — "
+          "GPU FP32 on Apple Silicon), coreml (Core ML .mlpackage — ANE "
+          "or GPU per --compute_units), or ane_speculate (ANE FP16 first, "
+          "GPU FP32 rerun for borderline-confidence sites — Scenario 3 "
+          "from the master plan).");
+ABSL_FLAG(std::string, ane_speculate_metal_checkpoint, "",
+          "When --inference_backend=ane_speculate, the .dvw bundle for "
+          "the GPU FP32 rerun on borderline-confidence sites. Required.");
+ABSL_FLAG(double, ane_speculate_confidence, 0.99,
+          "Borderline threshold for ane_speculate. If max(softmax_ane) < "
+          "this value, the example is reclassified on GPU FP32. Lower "
+          "→ more GPU reruns, more wall-time, fewer FP-drift artefacts.");
 
 namespace deepvariant {
 
@@ -263,9 +272,45 @@ int RunCallVariants(int argc, char** argv) {
       LOG(ERROR) << "Failed to load Metal/BNNS model: " << checkpoint_path;
       return 1;
     }
+  } else if (backend == "ane_speculate") {
+    // Scenario 3: ANE FP16 forward pass on every example; for examples
+    // where max(softmax_ane) < threshold (= --ane_speculate_confidence,
+    // default 0.99), rerun on GPU MPSGraph FP32 + BNNS-CPU finalize so
+    // borderline GQ=20 sites stay on the deterministic FP32 path.
+    const std::string metal_ckpt =
+        absl::GetFlag(FLAGS_ane_speculate_metal_checkpoint);
+    if (metal_ckpt.empty()) {
+      LOG(ERROR) << "ane_speculate requires --ane_speculate_metal_checkpoint=<.dvw>";
+      return 2;
+    }
+    LOG(INFO) << "Loading ane_speculate ANE model:   " << checkpoint_path;
+    coreml_model = CoreMLModel::Load(checkpoint_path, compute_units);
+    if (!coreml_model) {
+      LOG(ERROR) << "Failed to load Core ML .mlpackage: " << checkpoint_path;
+      return 1;
+    }
+    LOG(INFO) << "Loading ane_speculate GPU rerun:   " << metal_ckpt;
+    H = absl::GetFlag(FLAGS_input_height);
+    W = 221;
+    C = absl::GetFlag(FLAGS_input_channels);
+    K = 3;
+    metal_model = MetalInception::Create(metal_ckpt, H, C);
+    metal_finalize = BnnsFinalize::Create(metal_ckpt);
+    if (!metal_model || !metal_finalize) {
+      LOG(ERROR) << "Failed to load .dvw fallback bundle: " << metal_ckpt;
+      return 1;
+    }
+    // Sanity: ANE model and Metal model must agree on input shape.
+    if (coreml_model->InputHeight() != H || coreml_model->InputChannels() != C) {
+      LOG(ERROR) << "ane_speculate: shape mismatch — ANE expects ("
+                 << coreml_model->InputHeight() << "x" << coreml_model->InputWidth()
+                 << "x" << coreml_model->InputChannels()
+                 << ") but Metal model wants (" << H << "x" << W << "x" << C << ")";
+      return 1;
+    }
   } else {
     LOG(ERROR) << "Unknown --inference_backend=" << backend
-               << " (expected 'coreml' or 'metal')";
+               << " (expected 'coreml', 'metal' or 'ane_speculate')";
     return 2;
   }
   LOG(INFO) << "Model input (" << H << "," << W << "," << C
@@ -431,7 +476,69 @@ int RunCallVariants(int argc, char** argv) {
     // allocated to full batch capacity inside the metal branch.)
     bool ok = false;
     DV_SIGNPOST_INTERVAL_BEGIN(Inference, "");
-    if (coreml_model) {
+    const bool ane_speculate_mode =
+        (coreml_model && metal_model && metal_finalize);
+    if (ane_speculate_mode) {
+      // Scenario 3: ANE FP16 forward on the full batch; rerun
+      // borderline-confidence examples on GPU MPSGraph FP32 +
+      // BNNS-CPU finalize so threshold sites stay on the
+      // deterministic FP32 path.
+      DV_SIGNPOST_INTERVAL_BEGIN(AneFp16, "");
+      ok = coreml_model->Predict(images.data(), n, H, W, C,
+                                  probs.data(), K);
+      DV_SIGNPOST_INTERVAL_END(AneFp16);
+      if (ok) {
+        // Identify borderline examples (max softmax < threshold).
+        const float conf_threshold = static_cast<float>(
+            absl::GetFlag(FLAGS_ane_speculate_confidence));
+        static thread_local std::vector<int> borderline_idx;
+        borderline_idx.clear();
+        borderline_idx.reserve(n);
+        for (int i = 0; i < n; ++i) {
+          float m = probs[i * K];
+          for (int j = 1; j < K; ++j) {
+            if (probs[i * K + j] > m) m = probs[i * K + j];
+          }
+          if (m < conf_threshold) borderline_idx.push_back(i);
+        }
+        if (!borderline_idx.empty()) {
+          DV_SIGNPOST_INTERVAL_BEGIN(AneRerunGpu, "");
+          const int nb = static_cast<int>(borderline_idx.size());
+          const size_t img_per = static_cast<size_t>(H) * W * C;
+          static thread_local std::vector<float> bl_images, bl_features,
+              bl_probs;
+          bl_images.resize(static_cast<size_t>(nb) * img_per);
+          bl_features.resize(static_cast<size_t>(nb) *
+                             metal_model->FeatureDim());
+          bl_probs.resize(static_cast<size_t>(nb) * K);
+          for (int b = 0; b < nb; ++b) {
+            const int src = borderline_idx[b];
+            std::memcpy(bl_images.data() + static_cast<size_t>(b) * img_per,
+                        images.data() + static_cast<size_t>(src) * img_per,
+                        img_per * sizeof(float));
+          }
+          bool gpu_ok = metal_model->Predict(bl_images.data(), nb,
+                                              bl_features.data());
+          if (gpu_ok) {
+            gpu_ok = metal_finalize->ApplyBatch(bl_features.data(), nb,
+                                                bl_probs.data());
+          }
+          if (gpu_ok) {
+            for (int b = 0; b < nb; ++b) {
+              const int dst = borderline_idx[b];
+              std::memcpy(probs.data() + static_cast<size_t>(dst) * K,
+                          bl_probs.data() + static_cast<size_t>(b) * K,
+                          K * sizeof(float));
+            }
+          } else {
+            ok = false;
+            LOG(ERROR) << "ane_speculate: GPU rerun failed on "
+                       << nb << " borderline examples";
+          }
+          DV_SIGNPOST_INTERVAL_END(AneRerunGpu);
+        }
+      }
+    } else if (coreml_model) {
       ok = coreml_model->Predict(images.data(), n, H, W, C,
                                   probs.data(), K);
     } else if (metal_model && metal_model->IsGpuFinalize()) {
