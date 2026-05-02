@@ -300,11 +300,14 @@ static void ApplyModelFlags(const std::string& model_type,
     me_args.push_back("--max_reads_per_partition=0");
     me_args.push_back("--partition_size=10000");
   } else {
-    // WGS / WES: restore upstream default realigner=true (matches upstream's
-    // make_examples_options.py --realign_reads default=True). Without this,
-    // indel candidates in realigner windows are missed and FILTER parity
-    // with Docker is broken.
+    // WGS / WES defaults.
     me_args.push_back("--realigner_enabled=true");
+    // vaf_context_window=51: matches WGS/WES example_info.json.
+    // Required so AlleleCounter fills all 51 VAF context positions in the
+    // DeepVariantCall proto. Without this, EncodeSmallModelFeatures() reads
+    // 0 for 46 of 51 positions → small model gets wrong features → GQ=20
+    // borderline sites mispredicted → PASS↔NoCall FM at WG scale.
+    me_args.push_back("--small_model_vaf_context_window_size=51");
   }
 }
 
