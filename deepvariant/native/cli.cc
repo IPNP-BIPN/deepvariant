@@ -300,8 +300,11 @@ static void ApplyModelFlags(const std::string& model_type,
     me_args.push_back("--max_reads_per_partition=0");
     me_args.push_back("--partition_size=10000");
   } else {
-    // WGS / WES (default): VAF context window for small model.
-    me_args.push_back("--small_model_vaf_context_window_size=51");
+    // WGS / WES: restore upstream default realigner=true (matches upstream's
+    // make_examples_options.py --realign_reads default=True). Without this,
+    // indel candidates in realigner windows are missed and FILTER parity
+    // with Docker is broken.
+    me_args.push_back("--realigner_enabled=true");
   }
 }
 
