@@ -351,6 +351,20 @@ target_include_directories(microtest_neon_base_color PRIVATE
 )
 
 # ---------------------------------------------------------------------------
+# microtest_neon_cigar_classify — A2.2 verification that the NEON
+# M-block byte classifier (use_base, is_low_quality, is_ref, canonical)
+# produces output byte-identical to the scalar reference across all
+# (read,ref) byte pairs, all qual boundary values, both legacy and
+# non-legacy CanBasesBeUsed semantics, and all length tails 0..1024.
+# ---------------------------------------------------------------------------
+add_executable(microtest_neon_cigar_classify
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_neon_cigar_classify.cc"
+)
+target_include_directories(microtest_neon_cigar_classify PRIVATE
+  "${CMAKE_SOURCE_DIR}"
+)
+
+# ---------------------------------------------------------------------------
 # microtest_conv_serial — Phase 5.5c hand-verifiable test for the
 # deterministic Conv2D kernel. Compares GPU dispatch output against a
 # scalar (kh,kw,c_in)-order CPU reference using std::fma — bit-exact
