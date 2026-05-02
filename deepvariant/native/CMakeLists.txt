@@ -365,6 +365,21 @@ target_include_directories(microtest_neon_cigar_classify PRIVATE
 )
 
 # ---------------------------------------------------------------------------
+# microtest_bnns_stem — Option-2 PoC: scalar BNNS-CPU stem_s1a vs TF
+# Docker AVX-512 reference. Decides whether to invest in a full
+# BNNS-CPU Inception-v3 forward pass for borderline-only re-evaluation.
+# ---------------------------------------------------------------------------
+add_executable(microtest_bnns_stem
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_bnns_stem.cc"
+)
+target_include_directories(microtest_bnns_stem PRIVATE
+  "${CMAKE_SOURCE_DIR}"
+)
+target_link_libraries(microtest_bnns_stem PRIVATE
+  dv_weights
+)
+
+# ---------------------------------------------------------------------------
 # microtest_conv_serial — Phase 5.5c hand-verifiable test for the
 # deterministic Conv2D kernel. Compares GPU dispatch output against a
 # scalar (kh,kw,c_in)-order CPU reference using std::fma — bit-exact
