@@ -504,18 +504,41 @@ int RunCallVariants(int argc, char** argv) {
                                   probs.data(), K);
       DV_SIGNPOST_INTERVAL_END(AneFp16);
       if (ok) {
-        // Identify borderline examples (max softmax < threshold).
+        // Identify borderline examples. Two triggers — either qualifies
+        // as borderline and forces a GPU FP32 rerun:
+        //
+        //   (1) max(softmax) < conf_threshold
+        //       → top-class confidence is below the gate. This catches
+        //         GQ ≈ 20 boundary flips where ANE FP16's drift on the
+        //         winning class could change the FILTER classification.
+        //
+        //   (2) min(softmax) < min_floor (default 1e-4)
+        //       → at least one of the {homref, het, homvar} probabilities
+        //         is small enough that FP16's ~10⁻⁴ relative precision
+        //         leaks into the floor()-rounded PL byte:
+        //           PL_i = floor(-10*log10(p_i / max_p))
+        //         A 10⁻⁴ relative change in p_i at p_i ~ 10⁻⁴ produces
+        //         a 1-PL-unit difference vs FP32. (2) catches that
+        //         purely-textual drift without changing FILTER (FP16
+        //         argmax remains stable when max_p ≫ 0.9999).
         const float conf_threshold = static_cast<float>(
             absl::GetFlag(FLAGS_ane_speculate_confidence));
+        // Static for now: 1e-4 is the FP16 noise-floor at small p
+        // values. Could be exposed as a flag if users want to tune.
+        const float min_floor = 1e-4f;
         static thread_local std::vector<int> borderline_idx;
         borderline_idx.clear();
         borderline_idx.reserve(n);
         for (int i = 0; i < n; ++i) {
-          float m = probs[i * K];
+          float m = probs[i * K], mn = probs[i * K];
           for (int j = 1; j < K; ++j) {
-            if (probs[i * K + j] > m) m = probs[i * K + j];
+            const float p = probs[i * K + j];
+            if (p > m)  m  = p;
+            if (p < mn) mn = p;
           }
-          if (m < conf_threshold) borderline_idx.push_back(i);
+          if (m < conf_threshold || mn < min_floor) {
+            borderline_idx.push_back(i);
+          }
         }
         if (!borderline_idx.empty()) {
           DV_SIGNPOST_INTERVAL_BEGIN(AneRerunGpu, "");
