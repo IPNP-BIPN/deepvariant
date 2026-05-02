@@ -1255,3 +1255,63 @@ function calls with a 16-wide NEON pre-classification eliminates
 ~80 % of that cost — projected stage-1 saving ≈ 20 %, end-to-end
 WG saving ≈ 17 % (3 h 16 min → ~2 h 45 min). Real number lands when
 A2.1 + A2.2 are wired into production together.
+
+---
+
+## 2026-05-02 — ane_speculate cross-mode validation + trio mlpackage shape fix
+
+The Scenario-3 ANE FP16 + GPU FP32 rerun infrastructure (cli.cc plumbing
+in commit 40c5266e) was validated end-to-end on three of four target
+modes. A pre-existing extraction bug in `deeptrio.wgs_*.mlpackage`
+(input height baked at 100 instead of trio's required 140) was found
+and fixed by re-running `convert_via_docker.sh` after writing
+`model.example_info.json` with shape `[140, 221, 7]` into the trio
+SavedModel directories.
+
+### Per-mode validation results (chr20:10M-10.1M, threshold 0.995)
+
+| Mode | shared sites | only_speculate | only_baseline | FM | record diffs |
+|---|---|---|---|---|---|
+| WGS (HG002) | 313 | 0 | 0 | **0** | 0 (byte-identical) |
+| DeepSomatic WGS (HG002 tumor + HG004 normal) | 693 | 0 | 0 | **0** | 7 / 693 (1.0 %) |
+| DeepTrio child (HG002) | 372 | 0 | 0 | **0** | 28 / 372 (7.5 %) |
+| DeepTrio parent1 (HG003) | 368 | 0 | 0 | **0** | 6 / 368 (1.6 %) |
+| DeepTrio parent2 (HG004) | 339 | 0 | 0 | **0** | 6 / 339 (1.8 %) |
+
+All 3 trio samples + WGS + DeepSomatic at 0 FILTER mismatches vs the
+deterministic MPSGraph FP32 + BNNS-CPU baseline. Pangenome
+deferred: pangenome SavedModel not local; needs fetch from gs://.
+
+### Trio shape bug
+
+`tools/conversion/models/deeptrio.wgs_{child,parent}.mlpackage` were
+extracted with input shape (1, 100, 221, 7) because their
+SavedModel directories had no `model.example_info.json` — and
+`convert_via_docker.sh` falls back to `100,221,7` when that file is
+absent. The buggy mlpackages would fail at runtime:
+
+  Batch prediction failed: Size (140) of dimension (1) is not in
+  allowed range (100..100)
+
+Fix: write the correct shape to
+`tools/conversion/models/deeptrio.wgs_{child,parent}/model.example_info.json`,
+re-run convert. The script auto-detects the corrected shape.
+
+Backup copies of the buggy h=100 mlpackages preserved at
+`*.mlpackage.h100.bak` for rollback comparison.
+
+### Record-diff breakdown
+
+The 28 record diffs on HG002 child (highest residue) trace back to
+sub-PHRED FP-drift in QUAL/PL: ANE FP16 internally quantises Inception
+weights and intermediate activations, producing softmax outputs
+that differ from MPSGraph FP32 by ~10⁻⁵ (≈ 0.04 PHRED units). For
+the 7.5 % of records where the borderline check (max softmax >
+0.995) didn't trigger a GPU rerun, the FP-drift produces a 1-PL
+difference. **None of those flip a FILTER class** — the residue is
+strictly quality-numeric, not categorical.
+
+Net effect for cohort production: the user-visible variant set,
+GT calls, and FILTER classifications are bit-identical between
+ane_speculate and metal baseline; only the quality-score column
+shows sub-PHRED noise that does not change clinical interpretation.
