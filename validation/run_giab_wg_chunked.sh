@@ -80,8 +80,8 @@ run_chunk() {
     --checkpoint="${CKPT}" \
     --num_shards="${NUM_SHARDS}" \
     --batch_size="${BATCH_SIZE}" \
-    "${sm_args[@]}" \
-    "${ane_args[@]}" \
+    "${sm_args[@]+"${sm_args[@]}"}" \
+    "${ane_args[@]+"${ane_args[@]}"}" \
     > "${inter_dir}/run.log" 2>&1
 
   # Free disk: drop intermediate examples.tfrecord (the 50 GB beast)
