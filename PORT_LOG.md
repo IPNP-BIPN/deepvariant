@@ -1207,3 +1207,51 @@ hits this path) become a single NEON `memcpy`-like fill. Per-pileup
 saving ≈ 220 ns × 16 channels ≈ 3.5 µs vs ~50 µs scalar; on 7.7 M
 pileups ≈ 27 s saved end-to-end on WG. Marginal at the WG scale.
 A2.2 (CIGAR walk) is the bigger ROI in stage 1.
+
+---
+
+## 2026-05-02 — A2.2 NEON CIGAR-walk M-block classifier (locked plan, infra-only)
+
+NEON 16-byte chunk classifier for the per-base inner loop of
+`AlleleCounter::Add` M-cases (`ALIGNMENT_MATCH`, `SEQUENCE_MATCH`,
+`SEQUENCE_MISMATCH`). Computes four uint8 bitmask arrays:
+
+| Output | Meaning |
+|--------|---------|
+| `canonical[i]` | 1 if `read[i]` ∈ {A,C,G,T} (matches `nucleus::IsCanonicalBase` ACGT default) |
+| `use_base[i]`  | legacy: canonical && `qual[i] >= min`; non-legacy: canonical |
+| `is_low_quality[i]` | non-legacy: 1 if canonical && `qual[i] < min` (mirrors upstream's `is_low_quality` flag) |
+| `is_ref[i]`    | 1 if `ref[i] == read[i]` && canonical (so non-canonical → 0) |
+
+Built as standalone reusable infrastructure in
+`deepvariant/native/neon_cigar_classify.h`; production wire-up
+remains deferred per the plan's "smallest blast radius" rule (lands
+jointly with A2.1 in a single upstream-divergence diff).
+
+Microtest (`microtest_neon_cigar_classify`) gates byte-equivalence:
+
+| Test | Result |
+|------|--------|
+| All (read, ref) byte pairs × both modes (qual=20, min_q=10) | 131 072 / 131 072 PASS |
+| Quality boundary values (qual ∈ {0,1,19,20,21,100,254,255}) × both modes | 16 / 16 PASS |
+| Random reads (ACGTNacgt0123) × lengths 0..1024 × both modes | 2 050 / 2 050 PASS |
+| Throughput on 150-base Illumina reads, 1 M iter | scalar 84 ns, NEON 9.9 ns → **8.50× speed-up** |
+
+Production wiring sketch (deferred):
+- `allelecounter.cc::Add` — replace per-base `IsValidRefOffset &&
+  CanBasesBeUsed(len=1) && (ref == read)` with one
+  `ClassifyMBlockNeon` call producing 4 contiguous masks for the
+  M-block; outer loop iterates non-zero `use_base` indices and emits
+  `ReadAllele` with the pre-computed `is_ref`/`is_low_quality`.
+- Methylation/`IsMethylated` paths stay scalar (per-base bookkeeping).
+- Bit-equivalence held by construction: scalar reference inside
+  `ClassifyMBlockScalar` is the same `if (canonical) ...` cascade as
+  upstream's `CanBasesBeUsed`.
+
+End-to-end stage-1 perf estimate (when integrated): the M-block
+inner loop accounts for ~25 % of make_examples wall-time (per
+profiling notes, dominant after BAM I/O). Replacing per-base
+function calls with a 16-wide NEON pre-classification eliminates
+~80 % of that cost — projected stage-1 saving ≈ 20 %, end-to-end
+WG saving ≈ 17 % (3 h 16 min → ~2 h 45 min). Real number lands when
+A2.1 + A2.2 are wired into production together.
