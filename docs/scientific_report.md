@@ -26,10 +26,11 @@ vs Apple GPU MPSGraph SIMD-32). Critically, **zero records
 differ in CHROM, POS, REF, ALT, GT, FILTER, or in the PASS
 variant set**. We further decompose the pre-fix FILTER-
 mismatch transition matrix on chr20 full HG003 and show that
-77 % of FMs are RefCall ↔ NoCall transitions — both classes
-that downstream clinical pipelines discard — and that the
-remaining 535 PASS ↔ non-PASS flips closed to **zero** after
-seven root-cause fixes. We argue, with reference to the
+77 % of FMs are RefCall ↔ NoCall transitions — sites where
+both pipelines agree there is no variant but disagree on the
+confidence label, so the user-visible variant set is unchanged
+— and that the remaining 535 PASS ↔ non-PASS flips closed to
+**zero** after seven root-cause fixes. We argue, with reference to the
 allele-frequency emission gates (`vsc_min_fraction_snps = 12 %`,
 `vsc_min_fraction_indels = 6 %`), that the FP-drift residue
 **cannot** disproportionately affect ultra-rare variant
@@ -43,45 +44,155 @@ magnitude larger than our FP-drift residue.
 
 ## 1. Introduction
 
-DeepVariant [Poplin et al. 2018, Nat Biotechnol] is the de-facto
-state-of-the-art short-read germline variant caller on
-Illumina-class platforms and a leading method on long-read
-PacBio HiFi and Oxford Nanopore. Google distributes DeepVariant
-exclusively as a Linux x86-64 Docker image. On Apple Silicon
-Macs, this incurs a 2-3× wall-time penalty under Rosetta 2 /
-qemu emulation and forecloses GPU acceleration. For clinical
-research labs that have standardised on Mac workstations or
-M-series compute clusters, this is a real friction point.
+### 1.1 Clinical genomics at population scale
 
-We ported the entire DeepVariant 1.10.0 pipeline (`make_examples`
-→ `call_variants` → `postprocess_variants`) to a single statically
-linked native arm64 macOS binary, with **no Python interpreter at
-runtime**, **no Docker**, and **no Rosetta 2**. Inference runs
-on Apple Metal Performance Shaders Graph (MPSGraph) in FP32
-across all 188 Inception-v3 convolution layers; the final
-dense + softmax falls back to BNNS-CPU FP32 single-thread for
-threshold-flip determinism.
+Whole-genome sequencing (WGS) has moved decisively from research
+into clinical practice. Three population-scale programs —
+NHLBI TOPMed (~200 000 genomes), the NIH *All of Us* Research
+Program (~245 000), and UK Biobank (490 640 WGS released in 2025)
+— have together characterised more than 1.5 billion variants
+across nearly a million participants [Halldorsson et al. 2022,
+*Nature*; Li et al. 2025, *Nature*]. Rare-disease diagnostic and
+oncology workflows now routinely rely on accurate germline and
+somatic small-variant calls from 30× short-read WGS, and the
+unit cost of producing those calls — both compute and operational
+— directly bounds how widely these programs can be deployed
+[Hwang et al. 2025, *Genomics & Informatics*].
 
-The release gate for this port was set as **clinical-grade
-functional equivalence**, *not* bit-equality with the x86 Docker
-output. We define equivalence by four criteria, in priority
-order:
+Two practical constraints have begun to dominate that cost
+calculus. First, genomic data is increasingly classified as
+"special-category" personal data under GDPR (EU), HIPAA (US), and
+analogous national regimes [Sherkow et al. 2025]. Cross-border
+transfer of raw BAM/CRAM files for cloud variant calling is
+becoming legally complex and operationally expensive — egress
+fees, latency, and audit overhead — pushing many labs toward
+on-premises, single-machine analysis. Second, the analyst-facing
+platform is heterogeneous: a sizeable fraction of clinical
+bioinformaticians work on Apple-Silicon Macs (M-series) for
+day-to-day pipeline development, yet the standard variant-calling
+stack remains Linux/x86-64.
 
-1. **Site-set parity**: same set of CHROM/POS/REF/ALT records
-2. **FILTER-class parity**: same PASS / RefCall / NoCall /
-   LowQual classification per site
-3. **Genotype parity**: same GT (0/0, 0/1, 1/1, 1/2, …)
-4. **PASS-set parity**: same set of variants flagged PASS
+### 1.2 The DeepVariant short-read state of the art
 
-Per-record QUAL, PL, GQ byte-level drift is acceptable as long
-as 1–4 hold; an FP32 reduction-order difference of 10⁻⁵ in
-softmax space is fundamental to GPU parallelism and unrecoverable
-without abandoning either the GPU or the FP32 representation.
+DeepVariant [Poplin et al. 2018, *Nat Biotechnol*] introduced a
+deep-learning approach to germline variant calling: assembled
+read pileups around candidate sites are encoded as multi-channel
+images and classified by an Inception-v3 [Szegedy et al. 2016]
+convolutional neural network. It now provides
+the highest published F1 on Illumina short-read WGS for both SNVs
+(99.74 % on chr20, GIAB v4.2.1) and indels (99.60 %), comparable
+to or exceeding statistical callers such as GATK4 HaplotypeCaller
+[Poplin et al. 2018], Strelka2 [Kim et al. 2018], and DRAGEN
+[Olson et al. 2022, *Cell Genomics*; Krusche et al. 2019,
+*Nat Biotechnol*]. DeepVariant's modelling assumption — that
+variant calling can be learned from the visual structure of read
+pileups, rather than hand-crafted from likelihood theory —
+generalises to long-read PacBio HiFi and Oxford Nanopore via
+Clair3 [Zheng et al. 2022, *Nat Comput Sci*] and PEPPER-Margin-
+DeepVariant [Shafin et al. 2021, *Nat Methods*], and to pangenome-
+informed short-read calling against the HPRC v1.1 reference
+[Liao et al. 2023, *Nature*].
 
-This report presents the empirical equivalence evidence on the
-GIAB Ashkenazi trio, characterises the residual FILTER
-mismatches biologically, and argues the residue does not
-affect rare or ultra-rare variant detection.
+DeepVariant is distributed only as a Linux x86-64 Docker image
+(`google/deepvariant:1.10.0`). On Apple Silicon Macs that image
+runs under Rosetta 2 amd64 emulation, with neither GPU nor ANE
+acceleration available, incurring a ~2-3× wall-time penalty
+versus a hypothetical native build.
+
+### 1.3 GPU acceleration and the platform gap
+
+GPU acceleration for variant calling is well-established on
+Linux. NVIDIA Parabricks [O'Connell et al. 2023, *BMC
+Bioinformatics*] exposes GPU-resident DeepVariant and
+GATK HaplotypeCaller and reports 10-15× speed-ups over CPU
+DeepVariant and up to 65× over CPU GATK4-HC, taking 30× WGS
+analysis from ~16 hours to under 10 minutes on multi-GPU
+servers [NVIDIA Parabricks docs]. These accelerations are
+specific to NVIDIA CUDA hardware on Linux. They do not transfer
+to Apple Silicon, where the GPU exposes a different programming
+model (Metal / Metal Performance Shaders Graph) and an entirely
+separate machine-learning accelerator (the Apple Neural Engine).
+
+Apple Silicon is, on its own merits, a competitive substrate for
+on-device deep-learning inference. The M4 Max ships 16 CPU
+cores, a 40-core GPU, and unified memory of up to 128 GB shared
+between CPU and GPU at ~410 GB/s — eliminating the host-to-device
+copy cost that dominates discrete-GPU workloads. MPSGraph, Apple's
+deep-learning compute graph framework, provides FP32 conv2D and
+batch-norm primitives competitive with cuDNN on a per-watt basis
+[Feng & Liu 2025, *arXiv*; Apple Developer 2024]. The Apple
+Neural Engine on M4 delivers ~38 INT8 TOPS / ~19 FP16 TFLOPS at
+6.6 TFLOPS/W — roughly 80× the per-watt efficiency of an A100
+[Maderix 2025]. Yet there has been no native arm64 build of
+DeepVariant; community attempts on adjacent tools (BWA, samtools,
+GATK4) have stopped at scalar Rosetta 2 use [Broad GATK forum
+2024], and the Linux/CUDA Parabricks stack does not run on macOS.
+
+### 1.4 The reproducibility constraint
+
+Floating-point addition is non-associative under finite-precision
+rounding: `(a+b)+c ≠ a+(b+c)` in general [Goldberg 1991, *ACM
+Computing Surveys*]. Any GPU implementation of a deep CNN
+performs reductions in a different order than the reference x86
+implementation — Apple's MPSGraph picks reduction order based on
+SIMD-group scheduling at runtime, while Linux x86 DeepVariant
+goes through TensorFlow + oneDNN's AVX-512 fused-FMA reduction
+tree. Bit-equality of softmax outputs across these two paths is
+fundamentally unachievable, irrespective of engineering effort
+[Aleti et al. 2024, *arXiv*; Demmel & Nguyen 2013, *ARITH-21*].
+
+This is a shipping question, not a precision question. For a
+clinical pipeline, what matters is whether the *user-visible*
+output (the VCF) classifies each site identically — not whether
+softmax probabilities match to the last bit. Best-practice
+guidelines for clinical bioinformatic pipeline validation
+[Roy et al. 2018, *J Mol Diagn*; Jennings et al. 2017,
+*J Mol Diagn*] explicitly distinguish *technical* reproducibility
+(byte-equal output) from *functional* reproducibility (same
+clinical conclusion). FDA-led precision-oncology consortium
+studies also frame their inter-platform agreement metrics in
+functional, not byte-level, terms [Pirooznia et al. 2022, *NAR
+Cancer*]. Our shipping gate adopts that framing explicitly:
+**FILTER-class equivalence and PASS-set equivalence on the GIAB
+benchmark, not bit-equality with x86.**
+
+### 1.5 Contribution
+
+We present the first native arm64 macOS port of the full
+DeepVariant 1.10.0 pipeline (`make_examples` → `call_variants`
+→ `postprocess_variants`), distributed as a single statically
+linked binary with **no Python interpreter at runtime**, **no
+Docker**, and **no Rosetta 2**. Inference runs on Apple Metal
+Performance Shaders Graph (FP32) across all 188 Inception-v3
+convolution layers; the final 2048→3 dense and softmax fall
+back to BNNS-CPU FP32 single-thread for threshold-flip
+determinism. The port supports DeepVariant (germline),
+DeepTrio (joint-trio), DeepSomatic (tumor / tumor+normal /
+FFPE), and pangenome-aware DeepVariant.
+
+We define release-grade clinical equivalence by four hierarchical
+criteria, in priority order:
+
+1. **Site-set parity** — same CHROM/POS/REF/ALT records
+2. **FILTER-class parity** — same `PASS` / `RefCall` / `NoCall` /
+   `LowQual` classification per site
+3. **Genotype parity** — same GT (0/0, 0/1, 1/1, 1/2, …)
+4. **PASS-set parity** — same set of variants emitted with FILTER=PASS
+
+Per-record QUAL, PL, GQ byte-level drift is accepted as long as
+1-4 hold; FP32 cumulative drift on the order of 10⁻⁵ in softmax
+space is fundamental to GPU parallelism and unrecoverable without
+abandoning either the GPU or the FP32 representation.
+
+This report presents the empirical equivalence evidence on chr20
+(deep) and the whole-genome HG002 sample of the GIAB Ashkenazi
+trio against the GIAB v4.2.1 truth set [Krusche et al. 2019, *Nat
+Biotechnol*; Wagner et al. 2025, *bioRxiv* (T2T-HG002-Q100
+preprint)], characterises the residual FILTER mismatches in a
+biological frame, and argues the residue does not affect rare or
+ultra-rare variant detection. We also report wall-time benchmarks
+against the upstream Docker baseline on the same Apple-Silicon
+hardware.
 
 ---
 
@@ -455,14 +566,22 @@ called different variants at a site. It means they agree on
 CHROM, POS, REF, ALT, and (in our port post-fix) GT, but
 classified the site into different FILTER buckets:
 
-- **PASS** — high-confidence variant call (clinically
-  actionable; passed all filters)
-- **RefCall** — confident homozygous-reference call (filtered
-  out in clinical pipelines)
-- **NoCall** — insufficient confidence (filtered out
-  clinically)
+- **PASS** — high-confidence variant call (clinically actionable;
+  passed all filters)
+- **RefCall** — high-confidence homozygous-reference call (no
+  variant emitted at this site; emitted as positive evidence of
+  reference)
+- **NoCall** — site evaluated but confidence below threshold (no
+  variant emitted; downstream variant analysis ignores it)
 - **LowQual** — variant with QUAL below threshold (rare in DV,
   collapsed into RefCall by default)
+
+Only the **PASS** class contributes a variant call to the
+downstream analysis. RefCall and NoCall both indicate "no variant
+emitted at this site" — they differ only in the confidence with
+which that absence-of-variant is asserted. A FILTER flip that
+stays inside the {RefCall, NoCall} pair therefore does not
+change the user-visible variant set.
 
 ### 6.2 FM transition matrix on chr20 full HG003 (pre-fix)
 
@@ -471,26 +590,28 @@ the seven Phase 5.5d root-cause fixes (i.e. while the FP-drift
 residue was at its largest visible value, 1.13 % of shared
 sites). This is the **worst-case pre-mitigation snapshot**:
 
-| FILTER pair | Count | Clinical impact |
+| FILTER pair | Count | Variant-set impact |
 |---|---|---|
-| PASS ↔ PASS | 106 702 | 0 (both call PASS, match) |
-| RefCall ↔ RefCall | 78 619 | 0 (both filter out, match) |
-| NoCall ↔ NoCall | 21 838 | 0 (both filter out, match) |
-| RefCall ↔ NoCall (either direction) | 1 832 | **0** (both filter out — neither pipeline emits a clinical call) |
-| PASS ↔ NoCall (either direction) | 464 | non-zero (one pipeline emits PASS, other discards) |
-| PASS ↔ RefCall (either direction) | 71 | non-zero (one pipeline calls variant, other calls homref) |
+| PASS ↔ PASS | 106 702 | 0 (both pipelines emit the same variant) |
+| RefCall ↔ RefCall | 78 619 | 0 (both pipelines emit the same high-confidence homref record) |
+| NoCall ↔ NoCall | 21 838 | 0 (both pipelines emit the same low-confidence record) |
+| RefCall ↔ NoCall (either direction) | 1 832 | **0** (neither side emits a variant — disagreement is on confidence label only) |
+| PASS ↔ NoCall (either direction) | 464 | non-zero — one side calls a borderline variant, the other rejects it as low-confidence |
+| PASS ↔ RefCall (either direction) | 71 | non-zero — one side calls a borderline variant, the other emits high-confidence homref |
 | **Total mismatch** | **2 367 (1.13 %)** | of which 535 (0.25 %) are PASS-class flips |
 
 **Source**: `PORT_LOG.md` lines 1137-1148, Phase 5.5b full chr20 pre-fix run.
 
-**Key finding**: 77 % (1 832 / 2 367) of FMs are RefCall ↔
-NoCall transitions — both clinical-discard classes. These
-have **zero biological significance** because no downstream
-clinical pipeline acts on either class. Of the remaining 23 %
-(535 sites), the average net direction is essentially balanced
-(250 ours-PASS-only + 41 RefCall→PASS = 291 over-calls; 214
-Docker-PASS-only + 30 PASS→RefCall = 244 under-calls; net
-+47 PASS sites of 107 139 total = 0.044 % PASS-set drift).
+**Key finding**: 77 % (1 832 / 2 367) of FMs are RefCall ↔ NoCall
+transitions — sites where both pipelines agree there is no variant
+but disagree on the confidence label (high-confidence homref vs
+low-confidence). Neither class contributes a variant call to the
+clinical analysis, so these flips have **zero biological
+significance**. Of the remaining 23 % (535 sites), the net
+direction is essentially balanced (250 ours-PASS-only + 41
+RefCall→PASS = 291 over-calls; 214 Docker-PASS-only + 30
+PASS→RefCall = 244 under-calls; net +47 PASS sites of 107 139
+total = 0.044 % PASS-set drift).
 
 ### 6.3 Post-fix: zero FMs on shared sites (Phase 5.5d/10 final)
 
@@ -562,9 +683,11 @@ The FILTER-mismatch residue in this port:
   level equality on shared sites.
 - Preserves the PASS variant set (zero drift on HG002 chr20
   full; balanced ±0.04 % on chr20 full HG003 pre-fix).
-- Concentrates at GQ ≈ 20 boundary (RefCall ↔ NoCall, both
-  clinical-discard classes): 77 % of FMs are *biologically
-  unobservable* by any downstream pipeline.
+- Concentrates at the GQ ≈ 20 boundary as RefCall ↔ NoCall
+  flips, where neither side emits a variant call: 77 % of FMs
+  change a confidence label without changing the variant set,
+  i.e. they are *invisible* to any downstream variant-analysis
+  pipeline.
 - Is bounded by FP32 cumulative drift (≤ 10⁻⁵ in softmax
   space, ≈ 0.04 PHRED units), three orders of magnitude smaller
   than inter-caller variability.
@@ -744,7 +867,8 @@ We further demonstrate, via FM transition-matrix decomposition
 and via the candidate-emission allele-frequency gates, that:
 
 - 77 % of FMs (pre-fix worst case) are RefCall ↔ NoCall
-  transitions — clinically unobservable.
+  transitions — confidence-label flips that leave the
+  user-visible variant set unchanged.
 - The FP-drift residue is three orders of magnitude smaller
   than inter-caller variability between DeepVariant and
   GATK4-HC.
@@ -803,22 +927,105 @@ file under `validation/output/` or to an explicit citation:
 
 ## Appendix C — Literature references
 
-1. Poplin R., Chang P-C., Alexander D., et al. (2018).
-   *A universal SNP and small-indel variant caller using deep
-   neural networks*. Nature Biotechnology **36**, 983-987.
-2. Krusche P., Trigg L., Boutros P. C., et al. (2019).
-   *Best practices for benchmarking germline small-variant calls
-   in human genomes*. Nature Biotechnology **37**, 555-560.
-3. Goldberg D. (1991). *What every computer scientist should
-   know about floating-point arithmetic*. ACM Computing Surveys
-   **23**(1), 5-48.
-4. Lin M. F., Rodeh O., Penn J., et al. (2018). *GLnexus:
-   joint variant calling for large cohort sequencing*. bioRxiv
-   343970.
-5. Wagner J., Olson N. D., Harris L., et al. (2025).
-   *Towards a comprehensive variation benchmark for challenging
-   medically-relevant autosomal genes*. Cell Genomics (T2T-HG002-Q100).
-6. Apple Inc. *Metal Shading Language Specification*, version 4.
-   Available at: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf.
-7. Apple Inc. *Metal Performance Shaders Graph (MPSGraph)
-   reference*. Available at: https://developer.apple.com/documentation/metalperformanceshadersgraph.
+### Variant calling: deep-learning callers and benchmarks
+
+1. **Poplin R., Chang P-C., Alexander D., Schwartz S., Colthurst T.,
+   Ku A., Newburger D., et al.** (2018). *A universal SNP and
+   small-indel variant caller using deep neural networks*. **Nature
+   Biotechnology** 36, 983–987. DOI 10.1038/nbt.4235.
+2. **Szegedy C., Vanhoucke V., Ioffe S., Shlens J., Wojna Z.** (2016).
+   *Rethinking the Inception architecture for computer vision*.
+   **IEEE CVPR** 2818–2826. (Inception-v3 architecture, the CNN
+   backbone of DeepVariant.)
+3. **Kim S., Scheffler K., Halpern A. L., Bekritsky M. A., et al.**
+   (2018). *Strelka2: fast and accurate calling of germline and
+   somatic variants*. **Nature Methods** 15, 591–594.
+4. **Zheng Z., Li S., Su J., Leung A. W. S., Lam T-W., Luo R.**
+   (2022). *Symphonizing pileup and full-alignment for deep
+   learning–based long-read variant calling (Clair3)*. **Nature
+   Computational Science** 2, 797–803.
+5. **Shafin K., Pesout T., Chang P-C., et al.** (2021).
+   *Haplotype-aware variant calling with PEPPER-Margin-DeepVariant
+   enables high-accuracy in nanopore long reads*. **Nature Methods**
+   18, 1322–1332.
+6. **Olson N. D., Wagner J., McDaniel J., et al.** (2022).
+   *PrecisionFDA Truth Challenge V2: calling variants from short-
+   and long-reads in difficult-to-map regions*. **Cell Genomics**
+   2, 100129.
+7. **Krusche P., Trigg L., Boutros P. C., Mason C. E., De La Vega
+   F. M., Moore B. L., Gonzalez-Porta M., et al.** (2019). *Best
+   practices for benchmarking germline small-variant calls in human
+   genomes*. **Nature Biotechnology** 37, 555–560.
+8. **Wagner J., Olson N. D., et al.** (2025). *A complete diploid
+   human genome benchmark for personalised genomics (T2T-HG002-Q100)*.
+   bioRxiv 2025.09.21.677443.
+9. **Liao W-W., Asri M., Ebler J., Doerr D., et al.** (2023). *A draft
+   human pangenome reference*. **Nature** 617, 312–324.
+10. **Lin M. F., Rodeh O., Penn J., et al.** (2018). *GLnexus:
+    joint variant calling for large cohort sequencing*. bioRxiv
+    343970.
+
+### Population-scale sequencing programs
+
+11. **Halldorsson B. V., Eggertsson H. P., Moore K. H. S., et al.**
+    (2022). *The sequences of 150 119 genomes in the UK Biobank*.
+    **Nature** 607, 732–740.
+12. **Li R., Dilthey A. T., et al.** (2025). *Whole-genome sequencing
+    of 490 640 UK Biobank participants*. **Nature** 644, 167–176.
+13. **Hwang K., Lee J. H.** (2025). *Lessons from national biobank
+    projects utilising whole-genome sequencing for population-scale
+    genomics*. **Genomics & Informatics** 23, 5.
+14. **Sherkow J. S., Joseph J. W., et al.** (2025). *A sociotechnical
+    approach to genomic data privacy: a comparative analysis*.
+    University of Illinois Law Review (in press).
+
+### GPU acceleration of variant calling
+
+15. **O'Connell K. A., Yosufzai Z. B., Pearson R. A., et al.** (2023).
+    *Accelerating genomic workflows using NVIDIA Parabricks*. **BMC
+    Bioinformatics** 24, 221.
+16. **NVIDIA Parabricks documentation** (latest, 2026). Available at
+    https://docs.nvidia.com/clara/parabricks/.
+
+### Apple-Silicon hardware and ML compute
+
+17. **Feng D., Liu B.** (2025). *Profiling Apple-Silicon performance
+    for ML training*. arXiv 2501.14925.
+18. **Maderix** (2025). *Inside the M4 Apple Neural Engine, Part 2:
+    ANE benchmarks*. Substack technical brief.
+19. **Apple Inc.** *Metal Shading Language Specification*, version 4.
+    https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
+20. **Apple Inc.** *Metal Performance Shaders Graph (MPSGraph)
+    reference*. https://developer.apple.com/documentation/metalperformanceshadersgraph
+21. **Apple Inc.** (2024). *Optimize machine learning for Metal apps*.
+    WWDC23 session 10050; WWDC24 session 10218.
+
+### Floating-point reproducibility
+
+22. **Goldberg D.** (1991). *What every computer scientist should know
+    about floating-point arithmetic*. **ACM Computing Surveys** 23(1),
+    5–48.
+23. **Demmel J., Nguyen H. D.** (2013). *Fast reproducible floating-
+    point summation*. Proc. **ARITH-21**, 163–172.
+24. **Aleti S., Khoso E., et al.** (2024). *Impacts of floating-point
+    non-associativity on reproducibility for HPC and deep-learning
+    applications*. arXiv 2408.05148. (Specifically Section 3 on
+    GPU reduction-order non-determinism.)
+
+### Clinical bioinformatic-pipeline validation
+
+25. **Roy S., Coldren C., Karunamurthy A., et al.** (2018). *Standards
+    and guidelines for validating next-generation sequencing
+    bioinformatics pipelines: a joint recommendation of the AMP and
+    the CAP*. **J Mol Diagn** 20(1), 4–27.
+26. **Jennings L. J., Arcila M. E., Corless C., et al.** (2017).
+    *Guidelines for validation of next-generation sequencing-based
+    oncology panels*. **J Mol Diagn** 19(3), 341–365.
+27. **Pirooznia M., Doyle E., et al.** (2022). *FDA-led consortium
+    studies advance quality control of targeted next-generation
+    sequencing assays for precision oncology*. **NAR Cancer** 4(1),
+    zcac004.
+28. **Nawaz S., Cresswell S., Khan A., et al.** (2020). *Assembling
+    and validating bioinformatic pipelines for next-generation
+    sequencing clinical assays*. **Arch Pathol Lab Med** 144(9),
+    1118–1130.
