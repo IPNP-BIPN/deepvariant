@@ -625,6 +625,15 @@ struct MetalInception::Impl {
   MPSGraph* graph = nil;
   MPSGraphTensor* input = nil;
   MPSGraphTensor* output = nil;
+  // ── DV_METAL_GPU_FINALIZE=1 (default off) ─────────────────────────────
+  // When set, append the (2048→3) dense + softmax to the graph so
+  // Predict() returns probabilities (B,3) instead of features (B,2048).
+  // Bypasses the BnnsFinalize CPU step. Outputs are GPU softmax via
+  // MPSGraph's parallel reduction (different rounding from BNNS-CPU
+  // sequential), so a per-chip drift on the order of ~1 ULP at the
+  // softmax may differ from the BNNS-CPU baseline.
+  bool gpu_finalize = false;
+  int output_dim = 2048;  // 2048 by default; 3 with gpu_finalize=true
   // Named taps for debugging — keyed by stage name. Populated as the
   // graph is built, so PredictAtTap() can request a specific stage's
   // output.
@@ -664,7 +673,16 @@ MetalInception::MetalInception() : impl_(std::make_unique<Impl>()) {}
 MetalInception::~MetalInception() = default;
 
 int MetalInception::FeatureDim() const {
-  return impl_ ? impl_->feature_dim : 0;
+  // Returns the per-example output dimension Predict() writes:
+  //   - default path: feature_dim (2048 for standard Inception-v3, det
+  //     chain may override via Mixed_7c output channel count)
+  //   - DV_METAL_GPU_FINALIZE=1: 3 (post-softmax probabilities)
+  if (!impl_) return 0;
+  return impl_->gpu_finalize ? impl_->output_dim : impl_->feature_dim;
+}
+
+bool MetalInception::IsGpuFinalize() const {
+  return impl_ && impl_->gpu_finalize;
 }
 
 std::unique_ptr<MetalInception> MetalInception::Create(
@@ -785,6 +803,55 @@ std::unique_ptr<MetalInception> MetalInception::Create(
   I.taps[@"gap"] = x;
 
   I.output = x;
+  I.output_dim = 2048;
+
+  // ── DV_METAL_GPU_FINALIZE=1: append dense (2048→3) + softmax ──────────
+  // The terminal classifier head moves from BnnsFinalize (sequential
+  // FP32 on CPU) to MPSGraph (parallel reduction on GPU). One less
+  // host-device sync per batch; functional equivalence on chr20 to be
+  // verified by FILTER-class diff vs the BNNS-CPU baseline.
+  {
+    const char* gf_env = std::getenv("DV_METAL_GPU_FINALIZE");
+    if (gf_env && *gf_env && std::string(gf_env) != "0") {
+      const auto* k = I.weights->Get(
+          "layer_with_weights-188/kernel/.ATTRIBUTES/VARIABLE_VALUE");
+      const auto* b = I.weights->Get(
+          "layer_with_weights-188/bias/.ATTRIBUTES/VARIABLE_VALUE");
+      if (!k || !b || k->shape.size() != 2u || b->shape.size() != 1u ||
+          k->shape[0] != 2048u || k->shape[1] != 3u || b->shape[0] != 3u) {
+        LOG(ERROR) << "MetalInception::Create: DV_METAL_GPU_FINALIZE=1 set "
+                      "but layer-188 weights are missing or wrong shape "
+                   << "(expected kernel (2048,3) + bias (3,))";
+        return nullptr;
+      }
+      MPSGraphTensor* W = ConstFloat32(I.graph, k->data,
+                                       @[@2048, @3], @"finalize_w");
+      MPSGraphTensor* B = ConstFloat32(I.graph, b->data,
+                                       @[@3], @"finalize_b");
+      // logits = features (N,2048) · W (2048,3) → (N,3)
+      MPSGraphTensor* logits =
+          [I.graph matrixMultiplicationWithPrimaryTensor:x
+                                          secondaryTensor:W
+                                                    name:@"finalize_matmul"];
+      // bias broadcast (3,) → (1,3)
+      MPSGraphTensor* B_r = [I.graph reshapeTensor:B
+                                          withShape:@[@1, @3]
+                                               name:@"finalize_b_r"];
+      logits = [I.graph additionWithPrimaryTensor:logits
+                                  secondaryTensor:B_r
+                                             name:@"finalize_logits"];
+      // softmax along channel axis (axis 1 in (N,3))
+      MPSGraphTensor* probs = [I.graph softMaxWithTensor:logits
+                                                    axis:1
+                                                    name:@"finalize_softmax"];
+      I.taps[@"probs"] = probs;
+      I.output = probs;
+      I.output_dim = 3;
+      I.gpu_finalize = true;
+      LOG(INFO) << "MetalInception: DV_METAL_GPU_FINALIZE=1 — "
+                << "graph outputs (N,3) probs (BnnsFinalize bypassed)";
+    }
+  }
 
   // ── Phase 5.5c: optional deterministic kernel for stem_s1a ─────────
   // DV_METAL_DET_LAYERS=stem_s1a triggers a parallel inference path
@@ -1089,7 +1156,11 @@ bool MetalInception::Predict(const float* input, int batch_size,
   // Fast path: no deterministic layers, run the full MPSGraph.
   if (I.det_layers.empty()) {
     int unused = 0;
-    return PredictAtTap("gap", input, batch_size, output, &unused);
+    // DV_METAL_GPU_FINALIZE=1: route through "probs" tap (post dense +
+    // softmax) so caller gets (B,3) probabilities directly. Default
+    // path keeps "gap" which yields (B,2048) features for BnnsFinalize.
+    const char* tap = I.gpu_finalize ? "probs" : "gap";
+    return PredictAtTap(tap, input, batch_size, output, &unused);
   }
 
   // Det path: dispatch deterministic kernels in chain, then run the

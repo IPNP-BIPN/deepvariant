@@ -434,6 +434,13 @@ int RunCallVariants(int argc, char** argv) {
     if (coreml_model) {
       ok = coreml_model->Predict(images.data(), n, H, W, C,
                                   probs.data(), K);
+    } else if (metal_model && metal_model->IsGpuFinalize()) {
+      // Single-stage GPU path (DV_METAL_GPU_FINALIZE=1): the dense +
+      // softmax run inside MPSGraph, so Predict() writes (n, 3)
+      // probabilities directly. metal_finalize is unused in this mode.
+      DV_SIGNPOST_INTERVAL_BEGIN(MetalGPU, "");
+      ok = metal_model->Predict(images.data(), n, probs.data());
+      DV_SIGNPOST_INTERVAL_END(MetalGPU);
     } else if (metal_model && metal_finalize) {
       // Two-stage Metal/BNNS path: GPU MPSGraph for backbone, CPU BNNS
       // for the final dense + softmax (deterministic FP32 reduction

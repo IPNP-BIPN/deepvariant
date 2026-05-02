@@ -76,9 +76,16 @@ class MetalInception {
                     const float* input, int batch_size,
                     float* output, int* out_total_elems_per_image);
 
-  // Number of feature dimensions in Predict() output (= 2048 for
-  // standard WGS Inception-v3).
+  // Number of per-example floats Predict() writes:
+  //   - default: 2048 (post-GAP feature vector, BnnsFinalize follows)
+  //   - DV_METAL_GPU_FINALIZE=1: 3 (post-softmax probabilities; bypass
+  //     BnnsFinalize)
   int FeatureDim() const;
+
+  // True if DV_METAL_GPU_FINALIZE=1 selected at Create() — Predict()
+  // emits softmax probabilities directly. Callers should skip
+  // BnnsFinalize::ApplyBatch when this returns true.
+  bool IsGpuFinalize() const;
 
   MetalInception(const MetalInception&) = delete;
   MetalInception& operator=(const MetalInception&) = delete;
