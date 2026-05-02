@@ -233,6 +233,90 @@ int RunAllTrio(int argc, char** argv);
 int RunAllSomatic(int argc, char** argv);
 int RunAllPangenome(int argc, char** argv);
 
+// ApplyModelFlags — appends make_examples flags from model example_info.json.
+// Values mirror tools/conversion/models/<name>/model.example_info.json exactly.
+static void ApplyModelFlags(const std::string& model_type,
+                             std::vector<std::string>& me_args) {
+  std::string mt = model_type;
+  for (char& c : mt) c = static_cast<char>(std::toupper(c));
+
+  if (mt == "PACBIO") {
+    me_args.push_back("--pileup_image_width=147");
+    me_args.push_back("--channel_list_preset=LONG_READ_PACBIO");
+    me_args.push_back("--min_mapping_quality=1");
+    me_args.push_back("--min_base_quality=1");
+    me_args.push_back("--max_reads_per_partition=1500");
+    me_args.push_back("--partition_size=25000");
+    me_args.push_back("--sort_by_haplotypes=true");
+    me_args.push_back("--trim_reads_for_pileup=true");
+    me_args.push_back("--phase_reads=true");
+    me_args.push_back("--parse_sam_aux_fields=true");
+    me_args.push_back("--keep_supplementary_alignments=true");
+    me_args.push_back("--realigner_enabled=false");
+    me_args.push_back("--small_model_snp_gq_threshold=19");
+    me_args.push_back("--small_model_indel_gq_threshold=22");
+    me_args.push_back("--small_model_vaf_context_window_size=51");
+    me_args.push_back("--vsc_min_fraction_indels=0.12");
+    me_args.push_back("--vsc_min_indel_fraction_for_small_indels=0.12");
+    me_args.push_back("--vsc_min_indel_fraction_for_large_indels=0.05");
+    me_args.push_back("--vsc_small_indel_threshold=1");
+  } else if (mt == "ONT") {
+    me_args.push_back("--pileup_image_width=199");
+    me_args.push_back("--channel_list_preset=LONG_READ_ONT");
+    me_args.push_back("--min_mapping_quality=1");
+    me_args.push_back("--min_base_quality=1");
+    me_args.push_back("--max_reads_per_partition=1500");
+    me_args.push_back("--partition_size=25000");
+    me_args.push_back("--sort_by_haplotypes=true");
+    me_args.push_back("--trim_reads_for_pileup=true");
+    me_args.push_back("--phase_reads=true");
+    me_args.push_back("--parse_sam_aux_fields=true");
+    me_args.push_back("--realigner_enabled=false");
+    me_args.push_back("--small_model_snp_gq_threshold=9");
+    me_args.push_back("--small_model_indel_gq_threshold=17");
+    me_args.push_back("--small_model_vaf_context_window_size=51");
+    me_args.push_back("--vsc_min_fraction_snps=0.1");
+    me_args.push_back("--vsc_min_fraction_indels=0.1");
+  } else if (mt == "HYBRID_PACBIO_ILLUMINA" || mt == "HYBRID") {
+    me_args.push_back("--channel_list_preset=BASE_CHANNELS");
+    me_args.push_back("--trim_reads_for_pileup=true");
+  } else if (mt == "MASSEQ") {
+    me_args.push_back("--pileup_image_width=199");
+    me_args.push_back("--channel_list_preset=MASSEQ");
+    me_args.push_back("--min_mapping_quality=1");
+    me_args.push_back("--max_reads_per_partition=0");
+    me_args.push_back("--max_reads_for_dynamic_bases_per_region=1500");
+    me_args.push_back("--partition_size=25000");
+    me_args.push_back("--sort_by_haplotypes=true");
+    me_args.push_back("--trim_reads_for_pileup=true");
+    me_args.push_back("--phase_reads=true");
+    me_args.push_back("--parse_sam_aux_fields=true");
+    me_args.push_back("--realigner_enabled=false");
+    me_args.push_back("--vsc_min_fraction_indels=0.12");
+  } else if (mt == "RNASEQ") {
+    me_args.push_back("--channel_list_preset=BASE_CHANNELS");
+    me_args.push_back("--split_skip_reads=true");
+    me_args.push_back("--min_mapping_quality=40");
+    me_args.push_back("--max_reads_per_partition=0");
+    me_args.push_back("--partition_size=10000");
+  } else {
+    // WGS / WES (default): VAF context window for small model.
+    me_args.push_back("--small_model_vaf_context_window_size=51");
+  }
+}
+
+// PostprocessModelFlags — returns postprocess --flag=value args for model_type.
+static std::vector<std::string> PostprocessModelFlags(
+    const std::string& model_type) {
+  std::vector<std::string> pp;
+  std::string mt = model_type;
+  for (char& c : mt) c = static_cast<char>(std::toupper(c));
+  // WES uses min-probability fusion for multi-allelic sites
+  // (upstream example_info.json flags_for_postprocessing.multiallelic_mode=min).
+  if (mt == "WES") pp.push_back("--multiallelic_mode=min");
+  return pp;
+}
+
 int RunAll(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
 
@@ -326,11 +410,8 @@ int RunAll(int argc, char** argv) {
         absl::StrCat("--ref=", ref_flag),
         absl::StrCat("--examples=", examples_pattern),
         absl::StrCat("--threads=", n_threads),
-        // task_id=0/num_shards=1 => the single in-process call owns the
-        // whole region set; the worker pool partitions it via atomic.
         "--task_id=0",
         "--num_shards=1",
-        "--realigner_enabled=true",
     };
     if (!regions_flag.empty()) {
       me_args.push_back(absl::StrCat("--regions=", regions_flag));
@@ -343,15 +424,20 @@ int RunAll(int argc, char** argv) {
     if (!gvcf_outfile.empty()) {
       me_args.push_back(absl::StrCat("--gvcf=", gvcf_tfrecord_path));
     }
-    // Phase 9 / Step 1 — alt-aligned pileup default per model_type.
-    // PacBio + ONT use `diff_channels` (7 → 9 channels); WGS/WES `none`.
-    // Empty user flag (default) inherits the per-model default; explicit
-    // user-provided flag overrides.
+    // Per-model flags from example_info.json (pileup width, channels,
+    // thresholds, realigner, sort_by_haplotypes, etc.).
+    ApplyModelFlags(model_type, me_args);
+    // Alt-aligned pileup: user override or per-model default.
     {
       const std::string user_aap = absl::GetFlag(FLAGS_alt_aligned_pileup);
       std::string aap = user_aap;
       if (aap.empty()) {
-        if (model_type == "PACBIO" || model_type == "ONT") {
+        const std::string mt_up = [&] {
+          std::string s = model_type;
+          for (char& c : s) c = static_cast<char>(std::toupper(c));
+          return s;
+        }();
+        if (mt_up == "PACBIO" || mt_up == "ONT" || mt_up == "MASSEQ") {
           aap = "diff_channels";
         } else {
           aap = "none";
@@ -442,6 +528,8 @@ int RunAll(int argc, char** argv) {
       pp_args.push_back(absl::StrCat("--nonvariant_site_tfrecord_path=",
                                       gvcf_tfrecord_path));
     }
+    // Per-model postprocess flags (e.g. WES multiallelic_mode=min).
+    for (const auto& f : PostprocessModelFlags(model_type)) pp_args.push_back(f);
     auto argv_pp = MakeArgv("deepvariant_postprocess", pp_args);
     int n = static_cast<int>(argv_pp.size()) - 1;
     if (int rc = RunPostprocessVariants(n, argv_pp.data()); rc != 0) {
