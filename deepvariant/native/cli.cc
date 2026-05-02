@@ -311,10 +311,84 @@ static std::vector<std::string> PostprocessModelFlags(
   std::vector<std::string> pp;
   std::string mt = model_type;
   for (char& c : mt) c = static_cast<char>(std::toupper(c));
-  // WES uses min-probability fusion for multi-allelic sites
-  // (upstream example_info.json flags_for_postprocessing.multiallelic_mode=min).
   if (mt == "WES") pp.push_back("--multiallelic_mode=min");
   return pp;
+}
+
+// TrioInputDims — call_variants input shape from DeepTrio example_info.json.
+struct TrioDims { int child_h; int parent_h; int channels; int width; };
+static TrioDims TrioInputDims(const std::string& model_type) {
+  std::string mt = model_type;
+  for (char& c : mt) c = static_cast<char>(std::toupper(c));
+  if (mt == "PACBIO") return {140, 140, 9, 199};
+  if (mt == "ONT")    return {300, 300, 9, 199};
+  if (mt == "WES")    return {300, 300, 7, 221};
+  return                     {140, 140, 7, 221};  // WGS default
+}
+
+// SomaticInputDims — {h_tumor_normal, h_tumor_only, channels, width}.
+struct SomaticDims { int h_tn; int h_to; int channels; int width; };
+static SomaticDims SomaticInputDims(const std::string& model_type) {
+  std::string mt = model_type;
+  for (char& c : mt) c = static_cast<char>(std::toupper(c));
+  if (mt == "PACBIO") return {200, 100, 9, 147};
+  if (mt == "ONT")    return {200, 100, 9,  99};
+  return                     {200, 100, 7, 221};
+}
+
+// ApplySomaticModelFlags — somatic make_examples flags from
+// deepsomatic.<model>/model.example_info.json flags_for_calling.
+static void ApplySomaticModelFlags(const std::string& model_type,
+                                    std::vector<std::string>& me_args) {
+  std::string mt = model_type;
+  for (char& c : mt) c = static_cast<char>(std::toupper(c));
+  if (mt == "PACBIO") {
+    me_args.push_back("--pileup_image_width=147");
+    me_args.push_back("--channel_list_preset=MASSEQ");
+    me_args.push_back("--alt_aligned_pileup=diff_channels");
+    me_args.push_back("--sort_by_haplotypes=true");
+    me_args.push_back("--phase_reads=true");
+    me_args.push_back("--parse_sam_aux_fields=true");
+    me_args.push_back("--trim_reads_for_pileup=true");
+    me_args.push_back("--realigner_enabled=false");
+    me_args.push_back("--min_mapping_quality=5");
+    me_args.push_back("--partition_size=25000");
+    me_args.push_back("--vsc_min_fraction_snps=0.02");
+    me_args.push_back("--vsc_min_fraction_indels=0.1");
+    me_args.push_back("--vsc_min_count_snps=1");
+    me_args.push_back("--small_model_snp_gq_threshold=60");
+    me_args.push_back("--small_model_indel_gq_threshold=57");
+    me_args.push_back("--small_model_vaf_context_window_size=51");
+  } else if (mt == "ONT") {
+    me_args.push_back("--pileup_image_width=99");
+    me_args.push_back("--channel_list_preset=MASSEQ");
+    me_args.push_back("--alt_aligned_pileup=diff_channels");
+    me_args.push_back("--sort_by_haplotypes=true");
+    me_args.push_back("--phase_reads=true");
+    me_args.push_back("--parse_sam_aux_fields=true");
+    me_args.push_back("--trim_reads_for_pileup=true");
+    me_args.push_back("--realigner_enabled=false");
+    me_args.push_back("--min_mapping_quality=5");
+    me_args.push_back("--partition_size=25000");
+    me_args.push_back("--vsc_min_fraction_snps=0.05");
+    me_args.push_back("--vsc_min_fraction_indels=0.1");
+    me_args.push_back("--small_model_snp_gq_threshold=51");
+    me_args.push_back("--small_model_indel_gq_threshold=56");
+    me_args.push_back("--small_model_vaf_context_window_size=51");
+  } else if (mt == "FFPE_WGS" || mt == "FFPE_WES") {
+    me_args.push_back("--vsc_min_fraction_snps=0.029");
+    me_args.push_back("--vsc_min_fraction_indels=0.05");
+    me_args.push_back("--small_model_snp_gq_threshold=53");
+    me_args.push_back("--small_model_indel_gq_threshold=36");
+    me_args.push_back("--small_model_vaf_context_window_size=51");
+  } else {
+    // WGS / WES default somatic.
+    me_args.push_back("--vsc_min_fraction_snps=0.029");
+    me_args.push_back("--vsc_min_fraction_indels=0.05");
+    me_args.push_back("--small_model_snp_gq_threshold=31");
+    me_args.push_back("--small_model_indel_gq_threshold=29");
+    me_args.push_back("--small_model_vaf_context_window_size=51");
+  }
 }
 
 int RunAll(int argc, char** argv) {
@@ -549,7 +623,11 @@ int RunAll(int argc, char** argv) {
 // run_deeptrio.py command sequence at deeptrio-quick-start.md.
 // ──────────────────────────────────────────────────────────────────────
 int RunAllTrio(int argc, char** argv) {
-  // ParseCommandLine is already called by RunAll before dispatch here.
+  absl::ParseCommandLine(argc, argv);
+  const std::string model_type = absl::GetFlag(FLAGS_model_type);
+  // Ensure intermediate_results_dir exists (may not be pre-created by caller).
+  { std::system(absl::StrCat("mkdir -p '",
+      absl::GetFlag(FLAGS_intermediate_results_dir), "'").c_str()); }
   const std::string ref_flag = absl::GetFlag(FLAGS_ref);
   const std::string regions_flag = absl::GetFlag(FLAGS_regions);
   const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
@@ -685,11 +763,21 @@ int RunAllTrio(int argc, char** argv) {
       me_args.push_back(absl::StrCat("--small_model_cvo_outfile_parent2=",
                                       P[2].small_cvo_pattern));
     }
-    // DeepTrio WGS default thresholds (upstream scripts/run_deeptrio.py):
-    //   --small_model_snp_gq_threshold 15 (vs WGS default 20)
-    //   --small_model_indel_gq_threshold 29 (vs WGS default 28)
-    me_args.push_back("--small_model_snp_gq_threshold=15");
-    me_args.push_back("--small_model_indel_gq_threshold=29");
+    // Per-model pileup/read flags from example_info.json.
+    ApplyModelFlags(model_type, me_args);
+    // DeepTrio threshold overrides (upstream scripts/run_deeptrio.py).
+    // WGS trio uses SNP_GQ=15 / INDEL_GQ=29; long-read models use
+    // the thresholds from ApplyModelFlags() already.
+    {
+      std::string mt = model_type;
+      for (char& c : mt) c = static_cast<char>(std::toupper(c));
+      if (mt == "WGS" || mt == "WES") {
+        me_args.push_back("--small_model_snp_gq_threshold=15");
+        me_args.push_back("--small_model_indel_gq_threshold=29");
+        // WGS trio uses realigner (different from single-sample WGS default).
+        me_args.push_back("--realigner_enabled=true");
+      }
+    }
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
@@ -703,19 +791,17 @@ int RunAllTrio(int argc, char** argv) {
     auto& p = P[pi];
     LOG(INFO) << "Trio Stage 2 (" << p.role << "): call_variants";
     {
-      // Trio WGS pileup is 140×221×7 (child 60 + 2×parent 40).
-      // The make_examples worker rendered with these heights; pass
-      // through to call_variants so it builds the right Metal input.
-      // TODO(step-1-bis): add --model_type WGS/PACBIO/ONT dispatch
-      // to pick 140 vs other shapes per upstream's per-mode defaults.
+      // Per-mode pileup shape from DeepTrio example_info.json.
+      const TrioDims tdims = TrioInputDims(model_type);
+      const int input_h = (p.role == "child") ? tdims.child_h : tdims.parent_h;
       std::vector<std::string> cv_args = {
           absl::StrCat("--examples=", p.examples_pattern),
           absl::StrCat("--outfile=", p.cvo_path),
           absl::StrCat("--checkpoint=", p.ckpt_path),
           absl::StrCat("--batch_size=", EffectiveBatchSize()),
           absl::StrCat("--inference_backend=", inference_backend),
-          "--input_height=140",
-          "--input_channels=7",
+          absl::StrCat("--input_height=", input_h),
+          absl::StrCat("--input_channels=", tdims.channels),
       };
       AppendAneSpeculateArgs(cv_args, inference_backend, ane_dvw[pi]);
       auto argv_cv = MakeArgv("deepvariant_call_variants", cv_args);
@@ -794,6 +880,10 @@ int RunAllTrio(int argc, char** argv) {
 // command sequence.
 // ──────────────────────────────────────────────────────────────────────
 int RunAllSomatic(int argc, char** argv) {
+  absl::ParseCommandLine(argc, argv);
+  const std::string model_type = absl::GetFlag(FLAGS_model_type);
+  { std::system(absl::StrCat("mkdir -p '",
+      absl::GetFlag(FLAGS_intermediate_results_dir), "'").c_str()); }
   const std::string ref_flag = absl::GetFlag(FLAGS_ref);
   const std::string regions_flag = absl::GetFlag(FLAGS_regions);
   const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
@@ -873,16 +963,8 @@ int RunAllSomatic(int argc, char** argv) {
       me_args.push_back(absl::StrCat("--small_model_cvo_outfile_tumor=",
                                       small_cvo_pattern));
     }
-    // DeepSomatic-WGS thresholds from /opt/models/deepsomatic/wgs/
-    // model.example_info.json:flags_for_calling. Upstream's
-    // make_examples_core.py:apply_flags_for_calling reads this file and
-    // overrides flag defaults; we hard-code the WGS values here. (Future:
-    // read a sibling .example_info.json file alongside the .dvw to handle
-    // FFPE/ONT/PacBio model variants automatically.)
-    me_args.push_back("--vsc_min_fraction_snps=0.029");
-    me_args.push_back("--vsc_min_fraction_indels=0.05");
-    me_args.push_back("--small_model_snp_gq_threshold=31");
-    me_args.push_back("--small_model_indel_gq_threshold=29");
+    // Per-model flags from deepsomatic.<model>/model.example_info.json.
+    ApplySomaticModelFlags(model_type, me_args);
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
@@ -894,17 +976,17 @@ int RunAllSomatic(int argc, char** argv) {
   // ── Stage 2: call_variants on the tumor model. ────────────
   LOG(INFO) << "Somatic Stage 2: call_variants";
   {
-    // Somatic WGS pileup is 200×221×7 (tumor 100 + normal 100). For
-    // tumor_only the height is 100. Pass via --input_height.
-    const int tumor_h_default = has_normal ? 200 : 100;
+    // Per-model input shape from deepsomatic example_info.json.
+    const SomaticDims sdims = SomaticInputDims(model_type);
+    const int tumor_h = has_normal ? sdims.h_tn : sdims.h_to;
     std::vector<std::string> cv_args = {
         absl::StrCat("--examples=", examples_pattern),
         absl::StrCat("--outfile=", cvo_path),
         absl::StrCat("--checkpoint=", ckpt),
         absl::StrCat("--batch_size=", EffectiveBatchSize()),
         absl::StrCat("--inference_backend=", inference_backend),
-        absl::StrCat("--input_height=", tumor_h_default),
-        "--input_channels=7",
+        absl::StrCat("--input_height=", tumor_h),
+        absl::StrCat("--input_channels=", sdims.channels),
     };
     AppendAneSpeculateArgs(cv_args, inference_backend,
                            absl::GetFlag(FLAGS_ane_speculate_metal_checkpoint_somatic));
@@ -966,6 +1048,9 @@ int RunAllSomatic(int argc, char** argv) {
 // run_pangenome_aware_deepvariant.py command sequence.
 // ──────────────────────────────────────────────────────────────────────
 int RunAllPangenome(int argc, char** argv) {
+  absl::ParseCommandLine(argc, argv);
+  { std::system(absl::StrCat("mkdir -p '",
+      absl::GetFlag(FLAGS_intermediate_results_dir), "'").c_str()); }
   const std::string ref_flag = absl::GetFlag(FLAGS_ref);
   const std::string regions_flag = absl::GetFlag(FLAGS_regions);
   const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
@@ -1163,8 +1248,16 @@ int main(int argc, char** argv) {
     return deepvariant::RunPostprocessVariants(new_argc, new_argv);
   } else if (sub == "run") {
     return deepvariant::RunAll(new_argc, new_argv);
+  } else if (sub == "trio") {
+    return deepvariant::RunAllTrio(new_argc, new_argv);
+  } else if (sub == "somatic") {
+    return deepvariant::RunAllSomatic(new_argc, new_argv);
+  } else if (sub == "pangenome") {
+    return deepvariant::RunAllPangenome(new_argc, new_argv);
   } else {
-    LOG(ERROR) << "Unknown subcommand: " << sub;
+    LOG(ERROR) << "Unknown subcommand: " << sub
+               << "\nAvailable: run, trio, somatic, pangenome, make_examples, "
+                  "call_variants, postprocess_variants";
     return 1;
   }
 }
