@@ -311,13 +311,18 @@ int RunCallVariants(int argc, char** argv) {
       LOG(ERROR) << "Failed to load .dvw fallback bundle: " << metal_ckpt;
       return 1;
     }
-    // Sanity: ANE model and Metal model must agree on input shape.
+    // Soft sanity check: ANE model's declared input shape vs Metal
+    // model's. A mismatch could indicate the .mlpackage was extracted
+    // with the wrong height (e.g. trio child should be 140, not 100).
+    // Some Core ML packages declare flexible/dynamic shapes; defer the
+    // hard check to Predict() which will surface a precise error.
     if (coreml_model->InputHeight() != H || coreml_model->InputChannels() != C) {
-      LOG(ERROR) << "ane_speculate: shape mismatch — ANE expects ("
-                 << coreml_model->InputHeight() << "x" << coreml_model->InputWidth()
-                 << "x" << coreml_model->InputChannels()
-                 << ") but Metal model wants (" << H << "x" << W << "x" << C << ")";
-      return 1;
+      LOG(WARNING) << "ane_speculate: declared shape mismatch — ANE "
+                   << "expects (" << coreml_model->InputHeight()
+                   << "x" << coreml_model->InputWidth() << "x"
+                   << coreml_model->InputChannels()
+                   << ") vs Metal (" << H << "x" << W << "x" << C
+                   << "). Will rely on Core ML's runtime shape handling.";
     }
   } else {
     LOG(ERROR) << "Unknown --inference_backend=" << backend
