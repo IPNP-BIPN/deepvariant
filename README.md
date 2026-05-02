@@ -12,20 +12,23 @@ Performance Shaders Graph (MPSGraph) in FP32 across all 188
 Inception-v3 conv layers; the final dense + softmax falls back to
 BNNS-CPU FP32 single-thread for threshold-flip determinism.
 
-> **Status (2026-05-01)**: Phase 4 spec gates met on chr20 trio
-> (HG002/HG003/HG004 all PASS). Tier 2 whole-genome benchmark in
-> background (~30 h sequential). Phase 5 packaging + Phase 6
-> Homebrew tap pending.
+> **Status (2026-05-02)**: Phase 4 spec gates met on chr20 trio
+> (HG002/HG003/HG004 all PASS, all bit-identical SNP F1 to upstream
+> Docker). HG002 whole-genome benchmark complete: F1 SNP/INDEL
+> **bit-identical to Docker** at 6 decimal places (SNP 0.996440,
+> INDEL 0.995766); 99.9935 % PASS-set agreement; 0.003 % GT-disagreement
+> on PASS-PASS sites; 1.84× wall-time vs Docker on the same M4 Max.
+> Phase 5 packaging + Phase 6 Homebrew tap pending.
 
 ## Why this port
 
-| Metric | Linux x86 Docker (Rosetta 2) | This port (native arm64) |
-|--------|------------------------------|---------------------------|
-| chr20 wall-time on M4 Max | ~17 min | **~12:43** |
-| GPU residency | 0 (CPU-only emulation) | ≥ 40 % during inference |
-| Speedup | 1.0× (reference) | **~5.7×** |
-| Python interpreter | required | **none at runtime** |
-| Docker daemon | required | **none** |
+| Metric | Linux x86 Docker (Rosetta 2) | This port (native arm64) | Speedup |
+|--------|------------------------------|---------------------------|---------|
+| chr20 wall-time on M4 Max | ~17 min | **6 m 27 s** | **2.6×** |
+| HG002 WG (whole genome) on M4 Max | ~6 h | **3 h 16 min** | **1.84×** |
+| GPU residency | 0 (CPU-only emulation) | ≥ 40 % during inference | — |
+| Python interpreter | required | **none at runtime** | — |
+| Docker daemon | required | **none** | — |
 
 Equivalence with upstream `google/deepvariant:1.10.0` Docker is
 **clinical-grade** (not bit-exact — fundamentally unachievable on
@@ -53,9 +56,16 @@ FILTER mismatches, and rare-variant impact assessment.
 | HG004  | INDEL | 0.99636 | within FP-drift residue | **PASS** ✓ |
 
 NovaSeq 35× PCR-free Illumina chr20, evaluated against GIAB v4.2.1
-high-confidence regions. Whole-genome trio Tier 2 numbers will be
-appended to [`docs/validation.md`](docs/validation.md) when Tier 2
-finishes.
+high-confidence regions.
+
+### HG002 whole-genome (vs GIAB v4.2.1)
+
+| Type  | F1      | Δ vs Docker           | PASS-set Δ              | GT-disagree (PASS-PASS) |
+|-------|---------|-----------------------|-------------------------|-------------------------|
+| SNP   | 0.99644 | **0** (bit-identical) | 317 / 4.84 M (0.007 %) | 136 / 4.84 M (0.003 %) |
+| INDEL | 0.99577 | **0** (bit-identical) | —                       | —                       |
+
+Full benchmark: [`validation/output/HG002_wg_benchmark.md`](validation/output/HG002_wg_benchmark.md)
 
 ## Quick start
 
