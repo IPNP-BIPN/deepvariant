@@ -73,6 +73,17 @@ ABSL_FLAG(std::string, inference_backend, "metal",
 ABSL_FLAG(std::string, ane_speculate_metal_checkpoint, "",
           "When --inference_backend=ane_speculate, the .dvw bundle for "
           "the GPU FP32 rerun on borderline-confidence sites. Required.");
+// Per-role variants of the .dvw bundle path so cli.cc can thread the
+// right rerun model into each sub-call (trio child/parent, somatic
+// tumor model, pangenome 9-channel model).
+ABSL_FLAG(std::string, ane_speculate_metal_checkpoint_child, "",
+          "ane_speculate .dvw bundle for the trio child sample.");
+ABSL_FLAG(std::string, ane_speculate_metal_checkpoint_parent, "",
+          "ane_speculate .dvw bundle for the trio parent samples.");
+ABSL_FLAG(std::string, ane_speculate_metal_checkpoint_somatic, "",
+          "ane_speculate .dvw bundle for the DeepSomatic tumor model.");
+ABSL_FLAG(std::string, ane_speculate_metal_checkpoint_pangenome, "",
+          "ane_speculate .dvw bundle for the pangenome 9-channel model.");
 ABSL_FLAG(double, ane_speculate_confidence, 0.99,
           "Borderline threshold for ane_speculate. If max(softmax_ane) < "
           "this value, the example is reclassified on GPU FP32. Lower "

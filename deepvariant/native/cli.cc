@@ -40,7 +40,30 @@ ABSL_DECLARE_FLAG(int, num_shards);
 ABSL_DECLARE_FLAG(int, batch_size);
 ABSL_DECLARE_FLAG(std::string, inference_backend);
 ABSL_DECLARE_FLAG(std::string, ane_speculate_metal_checkpoint);
+ABSL_DECLARE_FLAG(std::string, ane_speculate_metal_checkpoint_child);
+ABSL_DECLARE_FLAG(std::string, ane_speculate_metal_checkpoint_parent);
+ABSL_DECLARE_FLAG(std::string, ane_speculate_metal_checkpoint_somatic);
+ABSL_DECLARE_FLAG(std::string, ane_speculate_metal_checkpoint_pangenome);
 ABSL_DECLARE_FLAG(double, ane_speculate_confidence);
+
+// Helper: append --ane_speculate_metal_checkpoint=... + threshold to the
+// argv vector being passed to a sub-process call_variants invocation.
+// `metal_ckpt` is the role-specific .dvw bundle for the GPU FP32 rerun
+// (empty → call_variants will error out if backend == ane_speculate).
+namespace {
+inline void AppendAneSpeculateArgs(std::vector<std::string>& cv_args,
+                                    const std::string& inference_backend,
+                                    const std::string& metal_ckpt) {
+  if (inference_backend != "ane_speculate") return;
+  if (!metal_ckpt.empty()) {
+    cv_args.push_back(absl::StrCat(
+        "--ane_speculate_metal_checkpoint=", metal_ckpt));
+  }
+  cv_args.push_back(absl::StrCat(
+      "--ane_speculate_confidence=",
+      absl::GetFlag(FLAGS_ane_speculate_confidence)));
+}
+}  // namespace
 ABSL_DECLARE_FLAG(std::string, checkpoint);
 // Phase 9 / Step 1 — alt-aligned pileup mode (PacBio/ONT). Defined in
 // make_examples_main.cc; cli.cc reads it to pick a sensible per-model
@@ -354,18 +377,8 @@ int RunAll(int argc, char** argv) {
         absl::StrCat("--batch_size=", EffectiveBatchSize()),
         absl::StrCat("--inference_backend=", inference_backend),
     };
-    // ane_speculate: thread the GPU rerun .dvw + the borderline threshold.
-    if (inference_backend == "ane_speculate") {
-      const std::string ane_metal_ckpt =
-          absl::GetFlag(FLAGS_ane_speculate_metal_checkpoint);
-      if (!ane_metal_ckpt.empty()) {
-        cv_args.push_back(absl::StrCat(
-            "--ane_speculate_metal_checkpoint=", ane_metal_ckpt));
-      }
-      cv_args.push_back(absl::StrCat(
-          "--ane_speculate_confidence=",
-          absl::GetFlag(FLAGS_ane_speculate_confidence)));
-    }
+    AppendAneSpeculateArgs(cv_args, inference_backend,
+                           absl::GetFlag(FLAGS_ane_speculate_metal_checkpoint));
     auto argv_cv = MakeArgv("deepvariant_call_variants", cv_args);
     int n = static_cast<int>(argv_cv.size()) - 1;
     if (int rc = RunCallVariants(n, argv_cv.data()); rc != 0) {
@@ -502,6 +515,13 @@ int RunAllTrio(int argc, char** argv) {
     std::string output_vcf;
     std::string output_gvcf;
   };
+  // Per-role .dvw rerun bundle for ane_speculate. Child uses its own
+  // model; both parents share the parent .dvw.
+  const std::string ane_dvw_child =
+      absl::GetFlag(FLAGS_ane_speculate_metal_checkpoint_child);
+  const std::string ane_dvw_parent =
+      absl::GetFlag(FLAGS_ane_speculate_metal_checkpoint_parent);
+
   std::array<PerSamplePaths, 3> P;
   P[0].role = "child";
   P[1].role = "parent1";
@@ -525,6 +545,9 @@ int RunAllTrio(int argc, char** argv) {
   P[0].sm_path = sm_child;   P[0].ckpt_path = ckpt_child;
   P[1].sm_path = sm_parent;  P[1].ckpt_path = ckpt_parent;
   P[2].sm_path = sm_parent;  P[2].ckpt_path = ckpt_parent;
+  // Per-role ane_speculate GPU rerun bundle.
+  std::array<std::string, 3> ane_dvw{ane_dvw_child, ane_dvw_parent,
+                                     ane_dvw_parent};
   P[0].output_vcf = out_child;   P[0].output_gvcf = absl::GetFlag(FLAGS_output_gvcf_child);
   P[1].output_vcf = out_parent1; P[1].output_gvcf = absl::GetFlag(FLAGS_output_gvcf_parent1);
   P[2].output_vcf = out_parent2; P[2].output_gvcf = absl::GetFlag(FLAGS_output_gvcf_parent2);
@@ -588,7 +611,8 @@ int RunAllTrio(int argc, char** argv) {
   }
 
   // ── Stage 2-3 per sample: call_variants → merge → postprocess.
-  for (auto& p : P) {
+  for (size_t pi = 0; pi < P.size(); ++pi) {
+    auto& p = P[pi];
     LOG(INFO) << "Trio Stage 2 (" << p.role << "): call_variants";
     {
       // Trio WGS pileup is 140×221×7 (child 60 + 2×parent 40).
@@ -605,6 +629,7 @@ int RunAllTrio(int argc, char** argv) {
           "--input_height=140",
           "--input_channels=7",
       };
+      AppendAneSpeculateArgs(cv_args, inference_backend, ane_dvw[pi]);
       auto argv_cv = MakeArgv("deepvariant_call_variants", cv_args);
       int n = static_cast<int>(argv_cv.size()) - 1;
       if (int rc = RunCallVariants(n, argv_cv.data()); rc != 0) {
@@ -793,6 +818,8 @@ int RunAllSomatic(int argc, char** argv) {
         absl::StrCat("--input_height=", tumor_h_default),
         "--input_channels=7",
     };
+    AppendAneSpeculateArgs(cv_args, inference_backend,
+                           absl::GetFlag(FLAGS_ane_speculate_metal_checkpoint_somatic));
     auto argv_cv = MakeArgv("deepvariant_call_variants", cv_args);
     int n = static_cast<int>(argv_cv.size()) - 1;
     if (int rc = RunCallVariants(n, argv_cv.data()); rc != 0) {
@@ -970,6 +997,8 @@ int RunAllPangenome(int argc, char** argv) {
         "--input_height=200",
         "--input_channels=7",
     };
+    AppendAneSpeculateArgs(cv_args, inference_backend,
+                           absl::GetFlag(FLAGS_ane_speculate_metal_checkpoint_pangenome));
     auto argv_cv = MakeArgv("deepvariant_call_variants", cv_args);
     int n = static_cast<int>(argv_cv.size()) - 1;
     if (int rc = RunCallVariants(n, argv_cv.data()); rc != 0) {
