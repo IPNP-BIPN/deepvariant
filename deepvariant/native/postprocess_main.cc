@@ -84,6 +84,13 @@ ABSL_FLAG(bool, process_somatic, false,
           "Enable DeepSomatic-style postprocess: heterozygous (0/1) calls "
           "are reclassified as GERMLINE 0/0 (mirrors third_party/nucleus/"
           "io/vcf_writer.cc::WriteSomatic logic).");
+// multiallelic_mode: CVO probability fusion for sites with >1 ALT.
+// Mirrors upstream postprocess_variants.py FLAGS.multiallelic_mode from
+// model example_info.json flags_for_postprocessing.
+//   "product" (default/WGS): multiply probabilities across CVOs.
+//   "min" (WES):             take minimum probability across kept CVOs.
+ABSL_FLAG(std::string, multiallelic_mode, "product",
+          "Multi-allelic CVO fusion: product (WGS default) or min (WES).");
 
 namespace deepvariant {
 
@@ -301,19 +308,33 @@ std::vector<double> CombineLikelihoods(
   }
 
   // For every diploid genotype, fuse probabilities across kept CVOs.
+  const bool use_min_mode = (absl::GetFlag(FLAGS_multiallelic_mode) == "min");
   for (int k = 0; k <= n_alts; ++k) {
     for (int j = 0; j <= k; ++j) {
       const std::string a1 = (j == 0) ? "" : alts[j - 1];  // "" = REF
       const std::string a2 = (k == 0) ? "" : alts[k - 1];
-      double fused = 1.0;
+      // Collect per-CVO probability for this genotype.
+      std::vector<double> cvo_probs;
       for (size_t ci = 0; ci < cvos.size(); ++ci) {
         if (!per_cvo_kept[ci]) continue;
         const auto& probs = cvos[ci]->genotype_probabilities();
         if (probs.size() < 3) continue;
         const int overlap = (a1.empty() ? 0 : per_cvo_alts[ci].count(a1)) +
                             (a2.empty() ? 0 : per_cvo_alts[ci].count(a2));
-        // overlap ∈ {0, 1, 2} maps directly to the 3-class softmax index.
-        fused *= probs[overlap];
+        cvo_probs.push_back(probs[overlap]);
+      }
+      double fused = 1.0;
+      if (!cvo_probs.empty()) {
+        if (use_min_mode) {
+          // WES: min-probability fusion (upstream multiallelic_mode='min').
+          // For each genotype, take the minimum probability across kept CVOs
+          // (mirrors postprocess_variants.py::min_alt_filter).
+          fused = *std::min_element(cvo_probs.begin(), cvo_probs.end());
+        } else {
+          // WGS default: product fusion.
+          fused = 1.0;
+          for (double p : cvo_probs) fused *= p;
+        }
       }
       like[pl_idx(j, k)] = fused;
     }

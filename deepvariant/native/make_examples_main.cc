@@ -171,6 +171,44 @@ ABSL_FLAG(int, aln_gap_extend, 2, "Realigner SSW aligner gap-extend penalty.");
 // haplotype paths that would otherwise be pruned for low edge weight.
 ABSL_FLAG(bool, dbg_disable_graph_pruning, false,
           "If true, skip de-Bruijn graph pruning in the realigner.");
+// Per-model pileup + read-filter flags (set by cli.cc ApplyModelFlags()).
+// Defaults = WGS. All values mirror upstream make_examples_options.py exactly.
+ABSL_FLAG(int, pileup_image_width, 221,
+          "Pileup image width. WGS/WES=221, PacBio=147, ONT/MaSeq=199.");
+// Named channel preset — selects which channels are added beyond the 6 base
+// channels (read_base…base_differs_from_ref):
+//   WGS(default) : + insert_size(19)               → 7 ch
+//   LONG_READ_PACBIO: + haplotype(7) + suppl(26)   → 8 ch (alt adds 2 → 10)
+//   LONG_READ_ONT   : + haplotype(7) + fuzzy(25)   → 8 ch (alt adds 2 → 10)
+//   MASSEQ          : + haplotype(7)               → 7 ch (alt adds 2 → 9)
+//   BASE_CHANNELS   : no extras                    → 6 ch
+ABSL_FLAG(std::string, channel_list_preset, "",
+          "Channel preset: WGS, LONG_READ_PACBIO, LONG_READ_ONT, MASSEQ, "
+          "BASE_CHANNELS. Empty = WGS.");
+ABSL_FLAG(bool, sort_by_haplotypes, false,
+          "Sort reads by HP tag in pileup (long-read models).");
+ABSL_FLAG(bool, trim_reads_for_pileup, false,
+          "Trim reads to pileup window before encoding.");
+ABSL_FLAG(bool, phase_reads, false,
+          "Phase reads using HP SAM tag.");
+ABSL_FLAG(bool, parse_sam_aux_fields, false,
+          "Parse auxiliary SAM fields (MM/ML for methylation, HP for phasing).");
+ABSL_FLAG(bool, keep_supplementary_alignments, false,
+          "Keep supplementary alignments.");
+ABSL_FLAG(int, max_reads_per_partition, 1500,
+          "Cap reads per partition (0 = unlimited).");
+ABSL_FLAG(int, max_reads_for_dynamic_bases_per_region, -1,
+          "Max reads for dynamic bases (<0 = disabled, MaSeq only).");
+ABSL_FLAG(int, small_model_vaf_context_window_size, 5,
+          "VAF context window for small model.");
+ABSL_FLAG(double, vsc_min_indel_fraction_for_small_indels, -1.0,
+          "Min allele fraction short INDELs (<0 = vsc_min_fraction_indels).");
+ABSL_FLAG(double, vsc_min_indel_fraction_for_large_indels, -1.0,
+          "Min allele fraction long INDELs (<0 = vsc_min_fraction_indels).");
+ABSL_FLAG(int, vsc_small_indel_threshold, -1,
+          "INDEL length threshold small vs large (<0 = disabled).");
+ABSL_FLAG(bool, split_skip_reads, false,
+          "Split reads on N CIGAR ops (RNA-seq).");
 ABSL_FLAG(int, threads, 1,
           "Worker threads inside this process. >1 enables true intra-process "
           "parallelism (one process showing N×100 % CPU). Each worker opens "
@@ -341,12 +379,21 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   // Non-zero: shifts the 3 internal RNG seeds for test-time augmentation.
   const int64_t kTtaOff = absl::GetFlag(FLAGS_tta_seed_offset);
   opts.set_random_seed(609314161 + static_cast<int>(kTtaOff));
-  // Match upstream `make_examples_options.py`: cap reads per
-  // partition (default 1500) so high-coverage regions don't blow up
-  // and so our per-region read selection matches Docker's. Reservoir
-  // sampling is applied inside the per-region worker loop with a
-  // NumPy-compatible RNG (numpy_mt19937.h).
-  opts.set_max_reads_per_partition(1500);
+  // Reads-per-partition cap — mirrors upstream default 1500. Long-read models
+  // may set to 0 (unlimited) via --max_reads_per_partition.
+  opts.set_max_reads_per_partition(absl::GetFlag(FLAGS_max_reads_per_partition));
+  {
+    const int mrd = absl::GetFlag(FLAGS_max_reads_for_dynamic_bases_per_region);
+    if (mrd >= 0) opts.set_max_reads_for_dynamic_bases_per_region(mrd);
+  }
+  // Long-read behavioral flags.
+  opts.set_phase_reads(absl::GetFlag(FLAGS_phase_reads));
+  opts.set_parse_sam_aux_fields(absl::GetFlag(FLAGS_parse_sam_aux_fields));
+  opts.set_trim_reads_for_pileup(absl::GetFlag(FLAGS_trim_reads_for_pileup));
+  {
+    const bool split = absl::GetFlag(FLAGS_split_skip_reads);
+    if (split) opts.mutable_realigner_options()->set_split_skip_reads(true);
+  }
 
   // Read requirements.
   nucleus::genomics::v1::ReadRequirements read_reqs;
@@ -354,6 +401,8 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   read_reqs.set_min_base_quality(absl::GetFlag(FLAGS_min_base_quality));
   read_reqs.set_min_base_quality_mode(
       nucleus::genomics::v1::ReadRequirements::ENFORCED_BY_CLIENT);
+  read_reqs.set_keep_supplementary_alignments(
+      absl::GetFlag(FLAGS_keep_supplementary_alignments));
 
   // Allele counter options.
   AlleleCounterOptions ac_opts;
@@ -388,6 +437,21 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   vc_opts.set_min_fraction_snps(absl::GetFlag(FLAGS_vsc_min_fraction_snps));
   vc_opts.set_min_fraction_indels(
       absl::GetFlag(FLAGS_vsc_min_fraction_indels));
+  // PacBio-style size-stratified INDEL fractions (disabled by default).
+  {
+    const double small_f = absl::GetFlag(FLAGS_vsc_min_indel_fraction_for_small_indels);
+    const double large_f = absl::GetFlag(FLAGS_vsc_min_indel_fraction_for_large_indels);
+    const int    thr     = absl::GetFlag(FLAGS_vsc_small_indel_threshold);
+    if (small_f >= 0.0) vc_opts.set_vsc_min_indel_fraction_for_small_indels(static_cast<float>(small_f));
+    if (large_f >= 0.0) vc_opts.set_vsc_min_indel_fraction_for_large_indels(static_cast<float>(large_f));
+    if (thr     >= 0)   vc_opts.set_vsc_small_indel_threshold(thr);
+  }
+  // VAF context window for small model — on VariantCallerOptions (not
+  // SampleOptions) so variant_calling_multisample.cc uses the right window.
+  {
+    const int vaf_win = absl::GetFlag(FLAGS_small_model_vaf_context_window_size);
+    if (vaf_win > 0) vc_opts.set_small_model_vaf_context_window_size(vaf_win);
+  }
   vc_opts.set_p_error(0.001);
   vc_opts.set_max_gq(50);
   vc_opts.set_gq_resolution(1);
@@ -418,7 +482,7 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   pic.set_base_quality_cap(40);
   pic.set_mapping_quality_cap(60);
   pic.set_height(100);
-  pic.set_width(221);
+  pic.set_width(absl::GetFlag(FLAGS_pileup_image_width));
   pic.set_read_overlap_buffer_bp(5);
   pic.set_multi_allelic_mode(PileupImageOptions::ADD_HET_ALT_IMAGES);
   pic.set_random_seed(2101079370 + static_cast<int>(kTtaOff));
@@ -433,22 +497,47 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   pic.set_types_to_alt_align("indels");
   pic.set_min_non_zero_allele_frequency(0.00001f);
   *pic.mutable_read_requirements() = read_reqs;
-  // Default channels for WGS: 6 base + insert_size = 7 (matches model input).
+  // Channel configuration. The 6 base channels are always present.
+  // Additional channels depend on --channel_list_preset (set by cli.cc
+  // ApplyModelFlags() from the model's example_info.json).
   pic.add_channels("read_base");
   pic.add_channels("base_quality");
   pic.add_channels("mapping_quality");
   pic.add_channels("strand");
   pic.add_channels("read_supports_variant");
   pic.add_channels("base_differs_from_ref");
-  pic.add_channels("insert_size");
-  // Phase 9 / Step 2 — append base_methylation channel when
-  // --enable_methylation_calling is on. pileup_image_native.cc reads
-  // AlleleCount.methylation_level (populated by the AlleleCounter
-  // when MM/ML SAM tags are present) and writes it to the channel.
+  {
+    const std::string preset = absl::GetFlag(FLAGS_channel_list_preset);
+    if (preset == "LONG_READ_PACBIO") {
+      // PacBio: haplotype(CH=7) + supplementary_alignment(CH=26)
+      // alt_aligned_pileup=diff_channels adds 2 more → 10 total.
+      pic.add_channels("haplotype");
+      pic.add_channels("supplementary_alignment");
+    } else if (preset == "LONG_READ_ONT") {
+      // ONT: haplotype(7) + read_supports_variant_fuzzy(25)
+      // alt_aligned_pileup=diff_channels adds 2 more → 10 total.
+      pic.add_channels("haplotype");
+      pic.add_channels("read_supports_variant_fuzzy");
+    } else if (preset == "MASSEQ") {
+      // MaSeq: haplotype(7); alt_aligned_pileup adds 2 more → 9 total.
+      pic.add_channels("haplotype");
+    } else if (preset == "BASE_CHANNELS") {
+      // HYBRID / RNASeq: 6 channels only (no extras).
+    } else {
+      // WGS / WES (default): add insert_size → 7 channels.
+      pic.add_channels("insert_size");
+    }
+  }
+  // Methylation channel (opt-in via --enable_methylation_calling).
   if (kMethylationOn) {
     pic.add_channels("base_methylation");
   }
-  pic.set_num_channels(7);
+  // sort_by_haplotypes: long-read models sort pileup rows by HP tag.
+  pic.set_sort_by_haplotypes(absl::GetFlag(FLAGS_sort_by_haplotypes));
+  // num_channels is derived from the channels() list above; set it
+  // explicitly so downstream code (e.g. MetalInception::Create) can
+  // read the declared channel count without counting the repeated field.
+  pic.set_num_channels(static_cast<int>(pic.channels_size()));
   *opts.mutable_pic_options() = pic;
 
   // Sample options. Trio mode (--reads_parent1 set) populates 3 samples
@@ -758,8 +847,9 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   }
 
   opts.set_variant_caller(MakeExamplesOptions::VERY_SENSITIVE_CALLER);
-  opts.set_realigner_enabled(false);
-  opts.set_phase_reads(false);
+  // realigner_enabled and phase_reads are now driven by flags.
+  opts.set_realigner_enabled(absl::GetFlag(FLAGS_realigner_enabled));
+  opts.set_phase_reads(absl::GetFlag(FLAGS_phase_reads));
   opts.set_stream_examples(false);
 
   return opts;

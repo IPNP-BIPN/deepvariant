@@ -28,6 +28,10 @@ DATA="${DV_GIAB_DIR:-/tmp/dv_giab}/full"
 CKPT="${DV_CHECKPOINT:-/Users/benjamin/deepvariant/validation/work/wgs.dvw}"
 SMALL="${DV_SMALL:-/Users/benjamin/deepvariant/validation/work/wgs_small_weights}"
 INFER_BACKEND="${DV_INFERENCE:-metal}"
+# When INFER_BACKEND=ane_speculate, --checkpoint must be the .mlpackage and
+# --ane_speculate_metal_checkpoint must be the .dvw rerun bundle.
+ANE_DVW="${DV_ANE_DVW:-/Users/benjamin/deepvariant/validation/work/wgs.dvw}"
+ANE_CONF="${DV_ANE_CONF:-0.99}"
 KEEP_BAM="${DV_KEEP_BAM:-0}"          # set 1 to retain BAM after sample done
 NUM_SHARDS="${DV_NUM_SHARDS:-14}"   # M4 Max has 14 P-cores; saturate make_examples
 BATCH_SIZE="${DV_BATCH_SIZE:-512}"
@@ -60,6 +64,11 @@ run_chunk() {
   echo "    ${sample}/${chrom}: deepvariant run …"
   local sm_args=()
   [ -n "${SMALL}" ] && [ -d "${SMALL}" ] && sm_args+=(--small_model_path="${SMALL}")
+  local ane_args=()
+  if [ "${INFER_BACKEND}" = "ane_speculate" ]; then
+    ane_args+=(--ane_speculate_metal_checkpoint="${ANE_DVW}")
+    ane_args+=(--ane_speculate_confidence="${ANE_CONF}")
+  fi
   /usr/bin/time -p ./build-macos/bin/deepvariant run \
     --reads="${DATA}/${sample}.bam" \
     --ref="${DATA}/GRCh38.fa" \
@@ -72,6 +81,7 @@ run_chunk() {
     --num_shards="${NUM_SHARDS}" \
     --batch_size="${BATCH_SIZE}" \
     "${sm_args[@]}" \
+    "${ane_args[@]}" \
     > "${inter_dir}/run.log" 2>&1
 
   # Free disk: drop intermediate examples.tfrecord (the 50 GB beast)
@@ -85,7 +95,7 @@ run_chunk() {
 
 run_sample() {
   local sample="$1" truth_vcf="$2" truth_bed="$3"
-  local out="validation/output/${sample}_wg"
+  local out="validation/output/${sample}_wg${DV_OUT_SUFFIX:-}"
   mkdir -p "${out}/chunks"
 
   echo
