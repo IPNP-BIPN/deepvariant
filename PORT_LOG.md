@@ -1315,3 +1315,35 @@ Net effect for cohort production: the user-visible variant set,
 GT calls, and FILTER classifications are bit-identical between
 ane_speculate and metal baseline; only the quality-score column
 shows sub-PHRED noise that does not change clinical interpretation.
+
+### 2026-05-02 follow-up — pangenome closes the 4th mode
+
+Fetched pangenome WGS SavedModel from the
+`google/deepvariant:pangenome_aware_deepvariant-1.10.0` Docker image
+(NOT in the standard image, NOT at the gs:// path the script
+guesses). Path inside Docker: `/opt/models/pangenome_aware_deepvariant/wgs/`.
+Declared shape: `[200, 221, 7]`. Conversion via existing
+`convert_via_docker.sh` produced `pangenome.wgs.mlpackage`.
+
+End-to-end test with pangenome BAM at
+`/tmp/pangenome_data/pangenome.chr20_10M_10p1M.v2.bam` (8722 reads,
+extracted from HPRC GBZ in prior session per CLAUDE.md Step 3) +
+HG002 reads BAM, on chr20:10M-10.1M:
+
+  Pangenome ane_speculate vs metal: 0 FM, 0 byte diffs (307/307 sites)
+
+Final cross-mode summary (all at threshold 0.995):
+
+| Mode             | shared | FM | record_diffs |
+|------------------|-------:|---:|-------------:|
+| WGS              | 313    | 0  | 0            |
+| DeepSomatic WGS  | 693    | 0  | 7            |
+| DeepTrio child   | 372    | 0  | 28           |
+| DeepTrio parent1 | 368    | 0  | 6            |
+| DeepTrio parent2 | 339    | 0  | 6            |
+| Pangenome WGS    | 307    | 0  | 0            |
+
+**4/4 modes (6/6 sample variants) at 0 FILTER mismatches** vs the
+deterministic MPSGraph FP32 + BNNS-CPU baseline. ANE FP16 + GPU FP32
+rerun is shippable as opt-in across the entire DeepVariant family
+(germline, trio, somatic, pangenome) on Apple Silicon.
