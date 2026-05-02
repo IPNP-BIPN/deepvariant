@@ -26,6 +26,7 @@ cd "$(dirname "$0")/.."
 
 DATA="${DV_GIAB_DIR:-/tmp/dv_giab}/full"
 CKPT="${DV_CHECKPOINT:-/Users/benjamin/deepvariant/validation/work/wgs.dvw}"
+SMALL="${DV_SMALL:-/Users/benjamin/deepvariant/validation/work/wgs_small_weights}"
 INFER_BACKEND="${DV_INFERENCE:-metal}"
 KEEP_BAM="${DV_KEEP_BAM:-0}"          # set 1 to retain BAM after sample done
 NUM_SHARDS="${DV_NUM_SHARDS:-14}"   # M4 Max has 14 P-cores; saturate make_examples
@@ -57,6 +58,8 @@ run_chunk() {
   mkdir -p "$(dirname "${chunk_vcf}")" "${inter_dir}"
 
   echo "    ${sample}/${chrom}: deepvariant run …"
+  local sm_args=()
+  [ -n "${SMALL}" ] && [ -d "${SMALL}" ] && sm_args+=(--small_model_path="${SMALL}")
   /usr/bin/time -p ./build-macos/bin/deepvariant run \
     --reads="${DATA}/${sample}.bam" \
     --ref="${DATA}/GRCh38.fa" \
@@ -68,6 +71,7 @@ run_chunk() {
     --checkpoint="${CKPT}" \
     --num_shards="${NUM_SHARDS}" \
     --batch_size="${BATCH_SIZE}" \
+    "${sm_args[@]}" \
     > "${inter_dir}/run.log" 2>&1
 
   # Free disk: drop intermediate examples.tfrecord (the 50 GB beast)
