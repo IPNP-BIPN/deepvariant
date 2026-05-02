@@ -1165,3 +1165,45 @@ For strict 100 % FILTER parity (the release gate), the 535 PASS-class
 flips need closing. Options: BNNS-CPU final dense (already partially
 done; covers softmax determinism), or a deterministic-reduction conv
 kernel for the 5-15 layers where drift is most amplified.
+
+---
+
+## 2026-05-02 — A2.1 NEON pileup base-color kernel (locked plan, infra-only)
+
+NEON 16-byte chunk fill via `vqtbl4q_u8` for the per-base color lookup.
+Built as standalone reusable infrastructure in
+`deepvariant/native/neon_base_color.h`; production integration deferred
+to a future session jointly with A2.2 (so a single upstream-divergence
+diff lands instead of two).
+
+Microtest (`microtest_neon_base_color`) gates byte-equivalence:
+
+| Test | Result |
+|------|--------|
+| LUT byte-match vs upstream `BaseColor()` switch (all 256 bytes) | 256/256 PASS |
+| NEON vs scalar on ACGT/N strings, lengths 0..1024 (no overshoot) | 1025/1025 PASS |
+| NEON vs scalar on adversarial all-byte block | 256/256 PASS |
+| Alt ColorParams (stride=1, offsets=10/20), lengths 0..256 | 257/257 PASS |
+| Throughput on 221-byte rows, 1 M iter | scalar 53 ns, NEON 5.3 ns → **10.07× speed-up** |
+
+Algorithmic guarantee: every byte stream produces output byte-identical
+to upstream's switch. The NEON path uses `vqtbl4q_u8` against a 64-byte
+window of the LUT (`table[0x40..0x7F]`); any byte outside this window
+maps to 0 by construction of `vqtbl4q_u8` semantics, matching upstream's
+`default: return 0;` arm.
+
+Wire-up sketch (deferred to next session):
+- `pileup_channel_lib.h` — add `BaseColorTable256` member to `Channels`.
+- `pileup_channel_lib.cc::Channels` ctor — call `BuildBaseColorTable256`.
+- `read_base_channel.cc::FillRefBase` — bulk-fill via
+  `FillBaseColorNeon(ref_data.data(), ref_bases.data(), ref_bases.size(), table)`.
+- For `FillReadBase` (per-position virtual call from a CIGAR walk), the
+  per-byte LUT replacement of the switch is sufficient (eliminates the
+  branch); no NEON applies because the data flow is scalar.
+
+Stage-1 perf impact estimate (when integrated): the 16 reference rows
+of a pileup (one per channel, but `read_base` is the only one that
+hits this path) become a single NEON `memcpy`-like fill. Per-pileup
+saving ≈ 220 ns × 16 channels ≈ 3.5 µs vs ~50 µs scalar; on 7.7 M
+pileups ≈ 27 s saved end-to-end on WG. Marginal at the WG scale.
+A2.2 (CIGAR walk) is the bigger ROI in stage 1.

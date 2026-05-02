@@ -338,6 +338,19 @@ target_include_directories(microtest_numpy_rng PRIVATE
 )
 
 # ---------------------------------------------------------------------------
+# microtest_neon_base_color — A2.1 verification that the NEON 16-byte
+# table-lookup path produces output byte-identical to the scalar path
+# and to upstream's BaseColor switch (across all 256 byte values, all
+# lengths in [0..1024], and adversarial alignments).
+# ---------------------------------------------------------------------------
+add_executable(microtest_neon_base_color
+  "${CMAKE_CURRENT_SOURCE_DIR}/microtest_neon_base_color.cc"
+)
+target_include_directories(microtest_neon_base_color PRIVATE
+  "${CMAKE_SOURCE_DIR}"
+)
+
+# ---------------------------------------------------------------------------
 # microtest_conv_serial — Phase 5.5c hand-verifiable test for the
 # deterministic Conv2D kernel. Compares GPU dispatch output against a
 # scalar (kh,kw,c_in)-order CPU reference using std::fma — bit-exact
