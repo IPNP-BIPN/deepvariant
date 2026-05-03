@@ -1,8 +1,8 @@
 # Validation — Native arm64 DeepVariant vs GIAB v4.2.1 Truth
 
 **Branch**: `feature/apple-silicon-native-v2`
-**Build commit**: `a3d7247b` (Phase 9 / Step 3 v2 — gVCF Docker parity)
-**Run date**: 2026-05-01
+**Build commit**: `413b3a3b` (fix: small_model_vaf_context_window_size=51 — PASS↔FM bug closed)
+**Run date**: 2026-05-03
 **Hardware**: Apple M4 Max, 16 cores, 128 GB unified memory, macOS 26.4.1
 
 ---
@@ -42,7 +42,10 @@ same input under linux/amd64 emulation.
    chained with N=4 worker threads inside one process.
 2. **Inference backend**: Apple Metal MPSGraph FP32 (Inception-v3
    big-model, 188 conv layers) + BNNS-CPU FP32 single-thread (small-
-   model + final dense + softmax for threshold determinism).
+   model + final dense + softmax for threshold determinism). Optional
+   `--inference_backend=ane_speculate` runs ANE FP16 first pass with
+   MPSGraph FP32 borderline rerun for improved throughput on borderline
+   candidates. `coreml` backend available for debug only (not shipped).
 3. Output VCF: bgzip-compressed + tabix-indexed.
 
 ### Evaluation
@@ -56,7 +59,7 @@ genotype-aware comparison.
 
 | Tool | Version |
 |------|---------|
-| Apple clang | 21.0.0 (`clang-2100.0.123.102`) |
+| Apple clang | 21.0.0 |
 | CMake | 4.3.2 |
 | macOS | 26.4.1 (build 25E253) |
 | Docker (validation only) | 29.2.1 (Docker Desktop 4.63.0) |
@@ -80,6 +83,27 @@ v4.2.1 high-confidence regions on chr20 only.
 
 Live update path: `validation/output/<sample>_chr20/happy.summary.csv`.
 Consolidated table: `validation/output/chr20_trio_summary.tsv`.
+
+---
+
+## Docker FILTER parity — all 4 modes (chr20:10M-10.1M)
+
+100 % FILTER-class parity confirmed against the matching Docker image for
+each mode. Measurement: `bcftools isec` site-set comparison + per-site
+FILTER-class diff on shared sites.
+
+| Tool                                      | Docker image                              | Shared sites | FM | PASS identical        | Gate       |
+| ----------------------------------------- | ----------------------------------------- | ------------ | -- | --------------------- | ---------- |
+| WGS (HG002)                               | `google/deepvariant:1.10.0`               | 313/313      | 0  | 261/261               | **PASS** ✓ |
+| DeepTrio child (HG002)                    | `google/deeptrio:1.10.0`                  | 262/262      | 0  | 262/262               | **PASS** ✓ |
+| DeepTrio parent1 (HG003)                  | `google/deeptrio:1.10.0`                  | 265/265      | 0  | 265/265               | **PASS** ✓ |
+| DeepTrio parent2 (HG004)                  | `google/deeptrio:1.10.0`                  | 222/222      | 0  | 222/222               | **PASS** ✓ |
+| DeepSomatic (HG002 tumor + HG003 normal)  | `google/deepsomatic:1.10.0`               | 693/693      | 0  | 34 PASS + 92 GERMLINE | **PASS** ✓ |
+| Pangenome-aware (HG002 + GBZ BAM)         | `google/deepvariant:1.10.0` (pangenome)   | 322/322      | 0  | 247/247               | **PASS** ✓ |
+
+FM = FILTER-class mismatches (sites where our FILTER ≠ Docker FILTER on
+shared sites). Zero CHROM/POS/REF/ALT/GT diffs on any shared site across
+all modes.
 
 ---
 
