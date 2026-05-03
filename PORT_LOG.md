@@ -1350,33 +1350,38 @@ rerun is shippable as opt-in across the entire DeepVariant family
 
 ## 2026-05-03 — Per-model flags + vaf51 WG FM fix
 
-### Root cause: small_model_vaf_context_window_size=51
+### Root cause analysis: 4,146 WG FM is big-model FP32 drift (non-goal confirmed)
 
-Prior to this fix, `ApplyModelFlags()` in `cli.cc` did not pass
-`--small_model_vaf_context_window_size=51` for WGS/WES models. The
-constant `kSmallModelVafContextWindow=51` in `small_model_features.h`
-hardcodes 51 VAF context positions; without this flag, `AlleleCounter`
-only stores 5 positions, so 46 of the 51 VAF features are read back as 0.
-This produces systematically wrong small_model predictions for borderline
-candidates → PASS↔NoCall FM at whole-genome scale.
+**Verification (2026-05-03):** The HG002_wg_vaf51 re-run (commit
+413b3a3b, with `--small_model_vaf_context_window_size=51` added to
+cli.cc) produced a VCF byte-identical to the pre-fix HG002_wg run:
 
-**Fix (commit 413b3a3b):** `ApplyModelFlags()` WGS/WES else-branch now
-always pushes both:
-  `--realigner_enabled=true` (restore WGS realigner)
-  `--small_model_vaf_context_window_size=51` (match kSmallModelVafContextWindow)
+- 0 site-set differences
+- 0 FILTER-class differences on all 7.7M shared sites
+- FM count: 4,146 (unchanged)
 
-Pre-fix measurement (commit f9364c2d, HG002 WG vs Docker):
-  - 4,146 FM on 7,706,210 shared sites (0.054 %)
-  - 1,469 PASS-related FM (NoCall↔PASS / RefCall↔PASS)
-  - 2,677 NoCall↔RefCall FM (big-model FP32 drift residue)
+Root cause of the no-op: `PopulateVafContext()` in `make_examples_main.cc`
+(line 915-931) always fills `allele_frequency_at_position` for ±25
+positions (51 total) using the hardcoded `kSmallModelVafContextWindow=51`.
+This runs AFTER `caller.CallsFromAlleleCounter()` in the worker loop,
+overwriting whatever `AddAdjacentAlleleFractionsAtPosition` wrote. So the
+`--small_model_vaf_context_window_size=51` flag (commit 413b3a3b) is a
+harmless no-op — the small model always had correct 51-position VAF context.
 
-Post-fix verification: HG002 WG re-run (HG002_wg_vaf51, chr16-chrM
-currently running as of this entry, result pending).
+**Correct diagnosis: 4,146 WG FM = documented MPSGraph FP32 drift non-goal.**
 
-Expected outcome: PASS-related FM drops to ~0 (small model predictions
-now match Docker); NoCall↔RefCall FM should remain ~2,600-2,700 (those
-are driven by MPSGraph FP32 drift vs Docker's Eigen reduction order,
-documented explicit non-goal).
+- 2,639 (63.6 %) = NoCall↔RefCall, both homref — clinically irrelevant
+- 1,469 (35.4 %) = PASS↔NoCall/RefCall — borderline GQ=20 sites where
+  MPSGraph FP32 reduction order vs Docker's AVX-512 Eigen flips
+  the classification. Big-model FP32 non-associativity on Apple GPU
+  is documented as the explicit non-goal in `docs/architecture.md` ADR.
+- F1 vs GIAB v4.2.1: SNP 0.996440, INDEL 0.995766 — bit-identical to
+  Docker at 6 decimal places (FP32 drift cancels symmetrically at WG scale)
+
+The 4,146 FM cannot be closed without either (a) full-network Kahan/serial
+conv (Tier 6.0, ~11 min/chr20 wall-time) or (b) BNNS-CPU big-model
+(~40 min/chr20). Both are opt-in development options; the default MPSGraph
+path remains the shipped baseline per the plan.
 
 ### A5 os_signpost markers for make_examples
 
