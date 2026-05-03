@@ -33,6 +33,7 @@
 #include "deepvariant/native/regions.h"
 #include "deepvariant/native/small_model_features.h"
 #include "deepvariant/native/small_model_inference.h"
+#include "deepvariant/native/dv_signpost.h"
 #include "deepvariant/native/tfrecord.h"
 #include "deepvariant/protos/deepvariant.pb.h"
 #include "deepvariant/protos/realigner.pb.h"
@@ -1682,8 +1683,13 @@ int RunMakeExamples(int argc, char** argv) {
       const auto& region = shard_regions[i];
     LOG(INFO) << "Region: " << region.reference_name() << ":"
               << region.start() << "-" << region.end();
+    const std::string region_str =
+        absl::StrCat(region.reference_name(), ":", region.start(),
+                     "-", region.end());
+    DV_SIGNPOST_INTERVAL_BEGIN(RegionTotal, region_str.c_str());
 
     // Query reads.
+    DV_SIGNPOST_INTERVAL_BEGIN(BamQuery, region_str.c_str());
     auto reads_or = sam_reader->Query(region);
     if (!reads_or.ok()) {
       LOG(WARNING) << "Query failed for " << region.reference_name() << ":"
@@ -1702,6 +1708,7 @@ int RunMakeExamples(int argc, char** argv) {
       reads.push_back(tmp_read);
     }
     reads_iter->Release().IgnoreError();
+    DV_SIGNPOST_INTERVAL_END(BamQuery);
 
     // Match upstream make_examples_core.py:partition_reads_etc, which
     // applies Algorithm-R reservoir sampling to cap reads per partition
@@ -1765,6 +1772,7 @@ int RunMakeExamples(int argc, char** argv) {
     // ── Optional: realign reads through assembled haplotypes ─────────────
     // Done before any AlleleCounter pass so candidate sweep + ref read
     // tracking see the realigned reads (matches upstream's flow).
+    DV_SIGNPOST_INTERVAL_BEGIN(Realigner, region_str.c_str());
     std::vector<nucleus::genomics::v1::Read> working_reads;
     if (absl::GetFlag(FLAGS_realigner_enabled)) {
       // Pre-scan AlleleCounter for the WindowSelector. Upstream
@@ -1842,11 +1850,14 @@ int RunMakeExamples(int argc, char** argv) {
     } else {
       working_reads = reads;
     }
+    DV_SIGNPOST_INTERVAL_END(Realigner);
 
     // First pass: find candidate positions (no ref-read tracking yet).
+    DV_SIGNPOST_INTERVAL_BEGIN(AlleleCounterProbe, region_str.c_str());
     AlleleCounter probe(ref_reader.get(), region, {},
                         opts.allele_counter_options());
     for (const auto& r : working_reads) probe.Add(r, sample_name);
+    DV_SIGNPOST_INTERVAL_END(AlleleCounterProbe);
 
     // Phase 9 / Step 3 — gVCF non-variant TFRecord emission. Per-position
     // reference-confidence rows are written for every region (regardless
@@ -1885,9 +1896,11 @@ int RunMakeExamples(int argc, char** argv) {
         std::unique(candidate_positions.begin(), candidate_positions.end()),
         candidate_positions.end());
 
+    DV_SIGNPOST_INTERVAL_BEGIN(AlleleCounterMain, region_str.c_str());
     AlleleCounter counter(ref_reader.get(), region, candidate_positions,
                           opts.allele_counter_options());
     for (const auto& r : working_reads) counter.Add(r, sample_name);
+    DV_SIGNPOST_INTERVAL_END(AlleleCounterMain);
 
     std::vector<DeepVariantCall> candidates =
         caller.CallsFromAlleleCounter(counter);
@@ -1906,6 +1919,7 @@ int RunMakeExamples(int argc, char** argv) {
     //     append to candidate.make_examples_alt_allele_indices so big_model
     //     generates an example for that specific alt-set only. Multiple
     //     pairs from the same candidate can split between small/big.
+    DV_SIGNPOST_INTERVAL_BEGIN(SmallModel, region_str.c_str());
     std::vector<DeepVariantCall> big_candidates;
     if (small_model) {
       // Populate VAF context for every candidate (the small model's 51
@@ -1973,6 +1987,7 @@ int RunMakeExamples(int argc, char** argv) {
       total_big_dispatched += candidates.size();
     }
 
+    DV_SIGNPOST_INTERVAL_END(SmallModel);
     if (big_candidates.empty()) continue;
 
     // Phase 9 / Step 4b — DirectPhasing per-region orchestration.
@@ -2036,13 +2051,16 @@ int RunMakeExamples(int argc, char** argv) {
     LOG(INFO) << "  candidates=" << candidates.size()
               << " reads=" << reads.size();
 
+    DV_SIGNPOST_INTERVAL_BEGIN(PileupEncode, region_str.c_str());
     auto stats = generator.WriteExamplesInRegion(
         absl::MakeSpan(cand_ptrs), absl::MakeSpan(reads_per_sample),
         absl::MakeSpan(sample_order), "sample",
         absl::MakeSpan(mean_coverage), &image_shape);
+    DV_SIGNPOST_INTERVAL_END(PileupEncode);
 
     auto n_it = stats.find("n_examples");
     if (n_it != stats.end()) total_examples += n_it->second;
+    DV_SIGNPOST_INTERVAL_END(RegionTotal);
     }  // end while next_region
 
     generator.SignalShardFinished();
