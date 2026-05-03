@@ -1347,3 +1347,68 @@ Final cross-mode summary (all at threshold 0.995):
 deterministic MPSGraph FP32 + BNNS-CPU baseline. ANE FP16 + GPU FP32
 rerun is shippable as opt-in across the entire DeepVariant family
 (germline, trio, somatic, pangenome) on Apple Silicon.
+
+## 2026-05-03 — Per-model flags + vaf51 WG FM fix
+
+### Root cause: small_model_vaf_context_window_size=51
+
+Prior to this fix, `ApplyModelFlags()` in `cli.cc` did not pass
+`--small_model_vaf_context_window_size=51` for WGS/WES models. The
+constant `kSmallModelVafContextWindow=51` in `small_model_features.h`
+hardcodes 51 VAF context positions; without this flag, `AlleleCounter`
+only stores 5 positions, so 46 of the 51 VAF features are read back as 0.
+This produces systematically wrong small_model predictions for borderline
+candidates → PASS↔NoCall FM at whole-genome scale.
+
+**Fix (commit 413b3a3b):** `ApplyModelFlags()` WGS/WES else-branch now
+always pushes both:
+  `--realigner_enabled=true` (restore WGS realigner)
+  `--small_model_vaf_context_window_size=51` (match kSmallModelVafContextWindow)
+
+Pre-fix measurement (commit f9364c2d, HG002 WG vs Docker):
+  - 4,146 FM on 7,706,210 shared sites (0.054 %)
+  - 1,469 PASS-related FM (NoCall↔PASS / RefCall↔PASS)
+  - 2,677 NoCall↔RefCall FM (big-model FP32 drift residue)
+
+Post-fix verification: HG002 WG re-run (HG002_wg_vaf51, chr16-chrM
+currently running as of this entry, result pending).
+
+Expected outcome: PASS-related FM drops to ~0 (small model predictions
+now match Docker); NoCall↔RefCall FM should remain ~2,600-2,700 (those
+are driven by MPSGraph FP32 drift vs Docker's Eigen reduction order,
+documented explicit non-goal).
+
+### A5 os_signpost markers for make_examples
+
+Added `DV_SIGNPOST_INTERVAL_BEGIN/END` markers (commit b0117f3a) around
+the key phases of the make_examples worker loop per region:
+`RegionTotal`, `BamQuery`, `Realigner`, `AlleleCounterProbe`,
+`AlleleCounterMain`, `SmallModel`, `PileupEncode`.
+
+Enables profiling in Instruments with:
+  xctrace record --template 'Points of Interest' \
+    --launch -- ./build-macos/bin/deepvariant run [args...]
+
+No behavior change. Prerequisite for A2.1/A2.2 NEON optimization work
+(need profiling data to prioritize hot spots before implementing NEON
+paths).
+
+### Per-model flag dispatch (commits 1b79c31f, eef07de8, 18e12096, 413b3a3b)
+
+All 7 DeepVariant model types (WGS, WES, PacBio, ONT, Hybrid/MaSeq,
+RNASeq) now have correct per-model flags automatically applied from
+`ApplyModelFlags()` in `cli.cc`, matching `example_info.json` defaults:
+
+| Model     | channels | width | alt_aligned_pileup | realigner | vaf_ctx |
+|-----------|:--------:|:-----:|:------------------:|:---------:|:-------:|
+| WGS       | 7        | 221   | none               | true      | 51      |
+| WES       | 7        | 221   | none               | true      | 51      |
+| PacBio    | 9        | 199   | diff_channels      | false     | 51      |
+| ONT       | 9        | 199   | diff_channels      | false     | 51      |
+| Hybrid    | 9        | 199   | diff_channels      | false     | 51      |
+| MaSeq     | 9        | 221   | diff_channels      | false     | 51      |
+| RNASeq    | 7        | 221   | none               | false (split_skip_reads=true) | 51 |
+
+Multi-mode dispatch (`deepvariant trio/somatic/pangenome`) verified
+at 0 FM vs Docker on chr20:10M-10.1M for all 4 modes.
+
