@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "deepvariant/protos/deepvariant.pb.h"
@@ -37,12 +38,26 @@ constexpr int kSmallModelNumFeatures = 70;
 constexpr int kSmallModelVafContextWindow = 51;
 // Number of base features per sample (used for multi-sample feature dim).
 constexpr int kSmallModelBaseFeaturesPerSample = 12;
+// Haplotype-expanded models (PacBio/ONT germline): 3 HP groups × 12 = 36 extra.
+// Total features with haplotypes = 70 + 36 = 106.
+constexpr int kSmallModelNumHaplotypeFeatures = 36;
+constexpr int kSmallModelNumFeaturesHaplotype =
+    kSmallModelNumFeatures + kSmallModelNumHaplotypeFeatures;
 
 // Build the 70-feature vector for a candidate, against a chosen subset of
 // alt_allele_indices. Single-sample interface (WGS path).
 std::vector<float> EncodeSmallModelFeatures(
     const learning::genomics::deepvariant::DeepVariantCall& candidate,
     const std::vector<int>& alt_allele_indices);
+
+// Build the 106-feature vector for haplotype-expanded models (PacBio/ONT).
+// Appends 36 extra features after the standard 70: for each of HP 0, 1, 2,
+// compute 12 BaseFeatures filtering allele_support reads by their HP tag.
+// `read_hp_tags` maps (fragment_name + "/" + read_number) → HP value (0/1/2).
+std::vector<float> EncodeSmallModelFeaturesHaplotype(
+    const learning::genomics::deepvariant::DeepVariantCall& candidate,
+    const std::vector<int>& alt_allele_indices,
+    const std::unordered_map<std::string, int8_t>& read_hp_tags);
 
 // Build the (70 + 12*N)-feature vector for trio / somatic, where N is
 // `sample_names.size()`. `sample_order` is a permutation of indices

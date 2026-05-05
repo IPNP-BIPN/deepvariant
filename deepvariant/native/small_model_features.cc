@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "deepvariant/protos/deepvariant.pb.h"
@@ -280,6 +281,133 @@ std::vector<float> EncodeSmallModelFeaturesMultiSample(
     const int64_t pos = v.start() + o;
     auto it = vaf_at_pos.find(static_cast<int>(pos));
     features.push_back(it != vaf_at_pos.end() ? it->second : 0);
+  }
+
+  return features;
+}
+
+// ── Haplotype-expanded feature encoder (PacBio/ONT germline, 106 features) ──
+//
+// Mirrors Python's SmallModelExamplesEncoder with expand_by_haplotype=True.
+// After the standard 70 features, appends 36 more: for each HP in {0,1,2},
+// compute 12 BaseFeatures filtering reads to those whose read_name appears in
+// `read_hp_tags` with that HP value.  Reads absent from `read_hp_tags` count
+// as HP=0 (unphased).
+//
+// `read_hp_tags` maps fragment_name+"/"+read_number → HP tag (0, 1, 2).
+// Build it from the BAM reads using read.info()["HP"].
+
+namespace {
+
+// Compute 12 BaseFeatures for reads filtered to `hp_value`.
+// `read_hp_tags` maps read_name → hp (0/1/2); absent ⟹ treated as 0.
+void AppendBaseFeaturesForHP(
+    const DeepVariantCall& candidate,
+    const std::vector<int>& alt_allele_indices,
+    int8_t hp_value,
+    const std::unordered_map<std::string, int8_t>& read_hp_tags,
+    std::vector<float>* features) {
+  // Helper: get HP for a read name (default 0 if absent).
+  auto hp_of = [&](const std::string& name) -> int8_t {
+    auto it = read_hp_tags.find(name);
+    return (it == read_hp_tags.end()) ? 0 : it->second;
+  };
+
+  // Alt reads for this HP group.
+  std::vector<const DeepVariantCall_ReadSupport*> alt_reads;
+  for (int idx : alt_allele_indices) {
+    if (idx < 0 || idx >= candidate.variant().alternate_bases_size()) continue;
+    const auto& alt_bases = candidate.variant().alternate_bases(idx);
+    auto it = candidate.allele_support_ext().find(alt_bases);
+    if (it == candidate.allele_support_ext().end()) continue;
+    for (const auto& r : it->second.read_infos()) {
+      if (hp_of(r.read_name()) == hp_value) alt_reads.push_back(&r);
+    }
+  }
+
+  // Ref reads for this HP group.
+  std::vector<const DeepVariantCall_ReadSupport*> ref_reads;
+  for (const auto& r : candidate.ref_support_ext().read_infos()) {
+    if (hp_of(r.read_name()) == hp_value) ref_reads.push_back(&r);
+  }
+
+  // Total depth: ALWAYS unfiltered (same invariant as AppendBaseFeatures).
+  int total_depth = candidate.ref_support_ext().read_infos_size();
+  for (const auto& [_, support] : candidate.allele_support_ext()) {
+    total_depth += support.read_infos_size();
+  }
+
+  const int n_ref = static_cast<int>(ref_reads.size());
+  const int n_alt = static_cast<int>(alt_reads.size());
+  const int alt_depth = n_ref + n_alt;
+  features->push_back(n_ref);
+  features->push_back(n_alt);
+  features->push_back(alt_depth);
+  features->push_back(total_depth);
+  features->push_back(total_depth > 0 ? (100 * n_alt / total_depth) : 0);
+  features->push_back(alt_depth > 0 ? (100 * n_alt / alt_depth) : 0);
+  features->push_back(MeanInt(ref_reads, GetMQ));
+  features->push_back(MeanInt(alt_reads, GetMQ));
+  features->push_back(MeanInt(ref_reads, GetBQ));
+  features->push_back(MeanInt(alt_reads, GetBQ));
+  features->push_back(MeanInt(ref_reads, GetReverseStrand100));
+  features->push_back(MeanInt(alt_reads, GetReverseStrand100));
+}
+
+}  // namespace (anonymous)
+
+std::vector<float> EncodeSmallModelFeaturesHaplotype(
+    const DeepVariantCall& candidate,
+    const std::vector<int>& alt_allele_indices,
+    const std::unordered_map<std::string, int8_t>& read_hp_tags) {
+  std::vector<float> features;
+  features.reserve(kSmallModelNumFeaturesHaplotype);
+
+  // ── Standard 70 features (same as EncodeSmallModelFeatures) ──────────────
+  std::set<std::string> exclude;
+  {
+    std::set<int> idx_set(alt_allele_indices.begin(), alt_allele_indices.end());
+    for (int i = 0; i < candidate.variant().alternate_bases_size(); ++i) {
+      if (!idx_set.count(i))
+        exclude.insert(candidate.variant().alternate_bases(i));
+    }
+  }
+  AppendBaseFeatures(candidate, alt_allele_indices, /*sample_filter=*/"",
+                      &features);
+  const auto& v = candidate.variant();
+  features.push_back(IsSnp(v, exclude) ? 1 : 0);
+  features.push_back(IsInsertion(v, exclude) ? 1 : 0);
+  features.push_back(IsDeletion(v, exclude) ? 1 : 0);
+  int ins_len = 0, del_len = 0;
+  for (int idx : alt_allele_indices) {
+    if (idx < 0 || idx >= v.alternate_bases_size()) continue;
+    ins_len = std::max(ins_len, static_cast<int>(v.alternate_bases(idx).size()) -
+                                    static_cast<int>(v.reference_bases().size()));
+    del_len = std::max(del_len, static_cast<int>(v.reference_bases().size()) -
+                                    static_cast<int>(v.alternate_bases(idx).size()));
+  }
+  features.push_back(std::max(0, ins_len));
+  features.push_back(std::max(0, del_len));
+  features.push_back(v.alternate_bases_size() > 1 ? 1 : 0);
+  features.push_back(static_cast<int>(alt_allele_indices.size()) > 1 ? 1 : 0);
+  {
+    const auto& vaf_at_pos = candidate.allele_frequency_at_position();
+    const int half = kSmallModelVafContextWindow / 2;
+    for (int o = -half; o <= half; ++o) {
+      const int64_t pos = v.start() + o;
+      auto it = vaf_at_pos.find(static_cast<int>(pos));
+      features.push_back(it != vaf_at_pos.end() ? it->second : 0);
+    }
+  }
+
+  // ── Haplotype-expanded block: 12 × 3 = 36 extra features ─────────────────
+  // Mirrors expand_by_haplotype=True in upstream FeatureEncoder:
+  //   for sample in [only_sample]:
+  //     for hp in [HP_0, HP_1, HP_2]:
+  //       encode 12 BaseFeatures filtered to reads with that HP tag
+  for (int8_t hp = 0; hp <= 2; ++hp) {
+    AppendBaseFeaturesForHP(candidate, alt_allele_indices, hp,
+                             read_hp_tags, &features);
   }
 
   return features;

@@ -117,6 +117,7 @@ ABSL_DECLARE_FLAG(std::string, population_vcfs);
 ABSL_DECLARE_FLAG(double, vsc_max_fraction_snps_for_non_target_sample);
 ABSL_DECLARE_FLAG(double, vsc_max_fraction_indels_for_non_target_sample);
 ABSL_DECLARE_FLAG(bool,   sort_by_alt_allele_support_somatic);
+ABSL_DECLARE_FLAG(bool,   small_model_use_haplotypes);
 ABSL_DECLARE_FLAG(std::string, small_model_cvo_outfile_tumor);
 ABSL_DECLARE_FLAG(int, pileup_image_height_tumor);
 ABSL_DECLARE_FLAG(int, pileup_image_height_normal);
@@ -247,6 +248,7 @@ static void ApplyModelFlags(const std::string& model_type,
   if (mt == "PACBIO") {
     me_args.push_back("--pileup_image_width=147");
     me_args.push_back("--channel_list_preset=LONG_READ_PACBIO");
+    me_args.push_back("--small_model_use_haplotypes=true");  // 106-feature model
     me_args.push_back("--min_mapping_quality=1");
     me_args.push_back("--min_base_quality=1");
     me_args.push_back("--max_reads_per_partition=1500");
@@ -267,6 +269,7 @@ static void ApplyModelFlags(const std::string& model_type,
   } else if (mt == "ONT") {
     me_args.push_back("--pileup_image_width=199");
     me_args.push_back("--channel_list_preset=LONG_READ_ONT");
+    me_args.push_back("--small_model_use_haplotypes=true");  // 106-feature model
     me_args.push_back("--min_mapping_quality=1");
     me_args.push_back("--min_base_quality=1");
     me_args.push_back("--max_reads_per_partition=1500");
