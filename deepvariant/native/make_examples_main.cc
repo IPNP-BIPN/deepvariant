@@ -557,9 +557,24 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   }
   // sort_by_haplotypes: long-read models sort pileup rows by HP tag.
   pic.set_sort_by_haplotypes(absl::GetFlag(FLAGS_sort_by_haplotypes));
-  // num_channels is derived from the channels() list above; set it
-  // explicitly so downstream code (e.g. MetalInception::Create) can
-  // read the declared channel count without counting the repeated field.
+  // Alt-aligned channels: also appear in channels() so make_examples_native.cc
+  // allocates the correct buffer size (uses channels().size() as depth).
+  // diff_channels and base_channels each add 2 extra channels to the pileup.
+  // Must be done BEFORE set_num_channels() so the count is correct.
+  {
+    const std::string& aap = pic.alt_aligned_pileup();
+    if (aap == "diff_channels") {
+      pic.add_channels("diff_channels_alternate_allele_1");
+      pic.add_channels("diff_channels_alternate_allele_2");
+    } else if (aap == "base_channels") {
+      pic.add_channels("base_channels_alternate_allele_1");
+      pic.add_channels("base_channels_alternate_allele_2");
+    }
+  }
+  // num_channels is derived from the channels() list above (now including
+  // any alt_aligned channels); set it explicitly so downstream code (e.g.
+  // MetalInception::Create) can read the declared channel count without
+  // counting the repeated field.
   pic.set_num_channels(static_cast<int>(pic.channels_size()));
   *opts.mutable_pic_options() = pic;
 
