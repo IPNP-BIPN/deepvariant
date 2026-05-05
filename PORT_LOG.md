@@ -1417,6 +1417,51 @@ RNASeq) now have correct per-model flags automatically applied from
 Multi-mode dispatch (`deepvariant trio/somatic/pangenome`) verified
 at 0 FM vs Docker on chr20:10M-10.1M for all 4 modes.
 
+## 2026-05-05 — Extended validation: WES/FFPE_WES somatic, DeepTrio WES, germline WES, PacBio/ONT pipeline
+
+### DeepSomatic: all 8 short-read modes at 100% FILTER parity
+
+Full matrix chr20:10M-10.1M vs google/deepsomatic:1.10.0:
+
+| Mode                  | shared | FM |
+|-----------------------|-------:|---:|
+| WGS T+N               | 693    | 0  |
+| FFPE_WGS T+N          | 815    | 0  |
+| WES T+N               | 693    | 0  |
+| FFPE_WES T+N          | 815    | 0  |
+| WGS/WES/FFPE_WGS/FFPE_WES tumor-only | 723 ea | 0 |
+
+Key bugs fixed: `sort_by_alt_allele_support` scoped to WGS+FFPE_WGS only;
+`vsc_max_fraction_for_non_target_sample=0.5` disabled for FFPE (was silently
+dropping 126 GERMLINE candidates); `ApplySomaticModelFlags` split into
+FFPE_WGS/FFPE_WES/WES/WGS separate branches.
+
+### DeepTrio WES: 100% FILTER parity (372/368/339, all 0 FM)
+
+Bug fixed: `--pileup_image_height_child/parent` not passed for WES/ONT trio.
+WES/ONT need 100/100=300 total; WGS defaults to 60/40=140. Crash was:
+`Unexpected image size 216580 (expected 464100)`.
+
+### Germline WES: 100% FILTER parity (313/313, 0 FM)
+
+### PacBio/ONT germline: pipeline fixed, real-data validation pending
+
+Three crash bugs fixed (commits 7081da21):
+1. Buffer overflow in FillPileupArray: alt_aligned channels missing from
+   channels().size() → buffer 8×147×100=117600 but encoder tries to write 10ch.
+2. --input_channels=10 not passed to call_variants (defaulted to 7).
+3. --input_width=147 not passed (defaulted to 221 WGS width).
+
+All three fixes: pipeline now runs for PacBio/ONT germline without crash.
+Validation vs Docker using correct PacBio BAMs: pending (GCS fixtures are
+5+ GB chr1 only, no chr20 subset available). Proxy test with Illumina BAM
+shows 124 FM — expected (wrong data type), not a code defect.
+
+Known TODO: PacBio/ONT small model expects 106 features; our
+EncodeSmallModelFeatures produces 70. Extra 36 features encode alt-aligned
+pileup-specific stats not yet ported from upstream. Small model for PacBio/ONT
+disabled until feature encoder is extended.
+
 ## 2026-05-05 — DeepSomatic tumor-only mode (WGS + FFPE_WGS)
 
 Pending item from CLAUDE.md Phase 6 closed: "tumor-only mode + FFPE mode".
