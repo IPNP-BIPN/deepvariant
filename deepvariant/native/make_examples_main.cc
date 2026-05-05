@@ -211,6 +211,15 @@ ABSL_FLAG(int, vsc_small_indel_threshold, -1,
           "INDEL length threshold small vs large (<0 = disabled).");
 ABSL_FLAG(bool, split_skip_reads, false,
           "Split reads on N CIGAR ops (RNA-seq).");
+// Somatic non-target (normal) AF cap: candidates where the normal sample has
+// alt VAF > threshold are skipped as clear germline het/hom.
+// Default -1.0 = disabled (FFPE_WGS/FFPE_WES do not declare this in their
+// model.example_info.json; WGS/WES/PacBio/ONT declare 0.5).
+ABSL_FLAG(double, vsc_max_fraction_snps_for_non_target_sample, -1.0,
+          "Normal AF cap for SNPs (<0 = disabled). Set 0.5 for WGS/WES/LR.");
+ABSL_FLAG(double, vsc_max_fraction_indels_for_non_target_sample, -1.0,
+          "Normal AF cap for INDELs (<0 = disabled). Set 0.5 for WGS/WES/LR.");
+
 // Panel of Normals VCF for tumor-only allele_frequency pileup channel.
 // Path to bgzipped+tabix-indexed VCF. When set, each tumor-only candidate's
 // dv_call.allele_frequency map is populated from the PON's per-allele AF INFO
@@ -692,17 +701,26 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
       // is preserved in the proto float field as a true IEEE infinity.
       s->mutable_variant_caller_options()->set_min_fraction_multiplier(
           std::numeric_limits<float>::infinity());
-      // Somatic non-target (normal) AF cap from
-      // /opt/models/deepsomatic/wgs/model.example_info.json:
-      //   vsc_max_fraction_{snps,indels}_for_non_target_sample = 0.5
-      // Candidates where the normal sample has alt VAF > 0.5 are skipped
-      // (they're clear germline het/hom). Used by AlleleFilter at
-      // variant_calling_multisample.cc:271-288. Default is 0 which
-      // disables the filter.
-      s->mutable_variant_caller_options()
-          ->set_max_fraction_snps_for_non_target_sample(0.5f);
-      s->mutable_variant_caller_options()
-          ->set_max_fraction_indels_for_non_target_sample(0.5f);
+      // Somatic non-target (normal) AF cap.
+      // WGS/WES/PacBio/ONT declare 0.5 in model.example_info.json →
+      // cli.cc passes --vsc_max_fraction_snps/indels_for_non_target_sample=0.5.
+      // FFPE_WGS/FFPE_WES do NOT declare this flag → stays at -1 (disabled).
+      // Without the cap, FFPE emits germline-het candidates and GERMLINE-filters
+      // them in postprocess (the correct Docker behaviour).
+      {
+        const double snp_cap =
+            absl::GetFlag(FLAGS_vsc_max_fraction_snps_for_non_target_sample);
+        const double ind_cap =
+            absl::GetFlag(FLAGS_vsc_max_fraction_indels_for_non_target_sample);
+        if (snp_cap >= 0.0)
+          s->mutable_variant_caller_options()
+              ->set_max_fraction_snps_for_non_target_sample(
+                  static_cast<float>(snp_cap));
+        if (ind_cap >= 0.0)
+          s->mutable_variant_caller_options()
+              ->set_max_fraction_indels_for_non_target_sample(
+                  static_cast<float>(ind_cap));
+      }
       // Adjacent VAF context window for the small_model. DeepSomatic
       // WGS uses 51; the small_model is trained with a 51-position
       // VAF context block. Used by variant_calling_multisample.cc:1160
