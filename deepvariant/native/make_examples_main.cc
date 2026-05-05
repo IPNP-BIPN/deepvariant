@@ -48,6 +48,7 @@
 #include "absl/strings/str_split.h"
 #include "third_party/nucleus/io/reference.h"
 #include "third_party/nucleus/io/sam_reader.h"
+#include "third_party/nucleus/io/vcf_reader.h"
 #include "third_party/nucleus/protos/range.pb.h"
 #include "third_party/nucleus/protos/reads.pb.h"
 #include "third_party/nucleus/protos/reference.pb.h"
@@ -210,6 +211,13 @@ ABSL_FLAG(int, vsc_small_indel_threshold, -1,
           "INDEL length threshold small vs large (<0 = disabled).");
 ABSL_FLAG(bool, split_skip_reads, false,
           "Split reads on N CIGAR ops (RNA-seq).");
+// Panel of Normals VCF for tumor-only allele_frequency pileup channel.
+// Path to bgzipped+tabix-indexed VCF. When set, each tumor-only candidate's
+// dv_call.allele_frequency map is populated from the PON's per-allele AF INFO
+// field, enabling the 8th channel to carry population AFs as expected by
+// deepsomatic.*_tumor_only models. Leave empty → default (ref=1, alts=0).
+ABSL_FLAG(std::string, population_vcfs, "",
+          "Panel-of-Normals VCF for tumor-only allele_frequency channel.");
 ABSL_FLAG(int, threads, 1,
           "Worker threads inside this process. >1 enables true intra-process "
           "parallelism (one process showing N×100 % CPU). Each worker opens "
@@ -629,19 +637,31 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
     // samples_in_order = [normal(0), tumor(1)] when normal provided
     //                  = [tumor(0)]            for tumor-only.
     // Mirrors deepvariant/make_examples_somatic.py:152-218.
-    //
-    // Apply somatic-specific pic_options overrides per
-    // /opt/models/deepsomatic/wgs/model.example_info.json:flags_for_calling.
-    // sort_by_alt_allele_support=true groups reads by which alt they
-    // support before the position sort — without this, the tumor pileup
-    // rows are ordered purely by alignment position and diverge from
-    // Docker's pileup at sites with multiple alt alleles (visible at
-    // chr20:10023577 etc.). Channels stay 7; height stays 100 per
-    // sample; only the row-sort key changes.
-    opts.mutable_pic_options()->set_sort_by_alt_allele_support(true);
     const std::string normal_reads = absl::GetFlag(FLAGS_reads_normal);
     const std::string tumor_reads  = absl::GetFlag(FLAGS_reads_tumor);
     const bool has_normal = !normal_reads.empty();
+
+    // sort_by_alt_allele_support=true: tumor+normal models only.
+    // Groups reads by which alt they support before the position sort;
+    // without it the tumor pileup rows diverge from Docker at multi-alt
+    // sites (e.g. chr20:10023577). Tumor-only models do NOT declare this
+    // flag in model.example_info.json — leave false for tumor-only.
+    if (has_normal) {
+      opts.mutable_pic_options()->set_sort_by_alt_allele_support(true);
+    }
+
+    // Tumor-only: 8th channel = allele_frequency (CH_ALLELE_FREQUENCY=8).
+    // Mirrors deepsomatic.*_tumor_only/model.example_info.json channels:
+    //   WGS/WES/FFPE: [1,2,3,4,5,6,19,8] (base-7 WGS channels + allele_freq)
+    //   PacBio/ONT:   MASSEQ 7ch + alt_aligned×2 + allele_freq = 10ch,
+    //                 matching example_info shape [100, w, 10].
+    // Tumor+normal models use 7 ch (WGS/WES/FFPE) or 9 ch (long-read),
+    // with no allele_frequency.
+    if (!has_normal) {
+      opts.mutable_pic_options()->add_channels("allele_frequency");
+      opts.mutable_pic_options()->set_num_channels(
+          opts.pic_options().num_channels() + 1);
+    }
     int tumor_h  = absl::GetFlag(FLAGS_pileup_image_height_tumor);
     int normal_h = absl::GetFlag(FLAGS_pileup_image_height_normal);
     if (tumor_h  <= 0) tumor_h  = 100;  // dv_constants.PILEUP_DEFAULT_HEIGHT
@@ -1002,6 +1022,68 @@ struct WorkerStats {
   int64_t total_big_dispatched = 0;
 };
 
+// FillAlleleFrequencyFromPon — populate dv_call.allele_frequency map from
+// a Panel-of-Normals VCF for each candidate.
+// Mirrors Python's allele_frequency.add_allele_frequencies_to_candidates.
+// For reads supporting an alt allele, AlleleFrequencyChannel reads the
+// per-allele population AF from this map to encode the 8th pileup channel.
+//
+// If a candidate's position is not in the PON, sets ref=1.0, all alts=0.0
+// (same as Python's fallback when population_vcf_reader is None).
+static void FillAlleleFrequencyFromPon(
+    std::vector<DeepVariantCall>& candidates,
+    nucleus::VcfReader& pon_reader) {
+  using nucleus::genomics::v1::Range;
+  using nucleus::genomics::v1::Variant;
+  for (auto& c : candidates) {
+    const auto& v = c.variant();
+    // Clear and set defaults first: ref=1.0, all ALTs=0.0.
+    c.mutable_allele_frequency()->clear();
+    (*c.mutable_allele_frequency())[v.reference_bases()] = 1.0f;
+    for (const auto& alt : v.alternate_bases())
+      (*c.mutable_allele_frequency())[alt] = 0.0f;
+
+    Range range;
+    range.set_reference_name(v.reference_name());
+    range.set_start(v.start());
+    range.set_end(v.end());
+
+    auto it_or = pon_reader.Query(range);
+    if (!it_or.ok()) continue;
+    auto it = it_or.ValueOrDie();
+
+    Variant pon_v;
+    while (true) {
+      auto next_or = it->Next(&pon_v);
+      if (!next_or.ok() || !next_or.ValueOrDie()) break;
+      if (pon_v.reference_bases() != v.reference_bases()) continue;
+
+      // Find AF INFO field (per-allele, one value per ALT in PON entry).
+      auto af_it = pon_v.info().find("AF");
+      if (af_it == pon_v.info().end()) continue;
+      const auto& af_vals = af_it->second.values();
+
+      float sum_alt_af = 0.0f;
+      for (int i = 0; i < pon_v.alternate_bases_size(); ++i) {
+        const std::string& pon_alt = pon_v.alternate_bases(i);
+        float af = (i < af_vals.size() && af_vals[i].has_number_value())
+                       ? static_cast<float>(af_vals[i].number_value()) : 0.0f;
+        // Map only PON alts that match a candidate alt.
+        for (const auto& cand_alt : v.alternate_bases()) {
+          if (pon_alt == cand_alt) {
+            (*c.mutable_allele_frequency())[cand_alt] = af;
+            sum_alt_af += af;
+          }
+        }
+      }
+      // Recompute ref AF = 1 - sum(matched alt AFs).
+      (*c.mutable_allele_frequency())[v.reference_bases()] =
+          std::max(0.0f, 1.0f - sum_alt_af);
+      break;  // Use first matching PON entry at this position.
+    }
+  }
+}
+
 int RunMakeExamples(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
 
@@ -1302,6 +1384,21 @@ int RunMakeExamples(int argc, char** argv) {
       }
     }
 
+    // Per-thread PON VcfReader for tumor-only allele_frequency channel.
+    // Opened once per thread (VcfReader is NOT thread-safe — each thread
+    // needs its own handle). Empty path → pon_reader stays null → defaults.
+    std::unique_ptr<nucleus::VcfReader> pon_reader;
+    {
+      const std::string pon_path = absl::GetFlag(FLAGS_population_vcfs);
+      if (!pon_path.empty()) {
+        nucleus::genomics::v1::VcfReaderOptions pon_opts;
+        auto pon_or = nucleus::VcfReader::FromFile(pon_path, pon_opts);
+        CHECK(pon_or.ok()) << "thread " << tid
+                           << ": PON VCF open failed: " << pon_path;
+        pon_reader = std::move(pon_or.ValueOrDie());
+      }
+    }
+
     multi_sample::VariantCaller caller(
         opts.sample_options(opts.main_sample_index()).variant_caller_options());
 
@@ -1494,6 +1591,13 @@ int RunMakeExamples(int argc, char** argv) {
         if (candidates.empty()) continue;
         C.total_candidates += candidates.size();
 
+        // Tumor-only allele_frequency channel: fill from PON VCF when present.
+        // Mirrors Python's add_allele_frequencies_to_candidates called from
+        // make_examples_core.py:2380 when 'allele_frequency' is in channels.
+        if (pon_reader) {
+          FillAlleleFrequencyFromPon(candidates, *pon_reader);
+        }
+
         // VAF context — uses the target sample's AlleleCounts.
         if (C.small_model && counters[s]) {
           const auto& allele_counts = counters[s]->Counts();
@@ -1572,6 +1676,43 @@ int RunMakeExamples(int argc, char** argv) {
         }
 
         if (big_candidates.empty()) continue;
+
+        // Phase 9 / Step 4b — DirectPhasing per-region (trio path).
+        // Mirrors the single-sample wire-up at line ~1999, using only
+        // the target sample's reads (reads_per_sample_v[s]). Each
+        // target sample (child / parent1 / parent2) gets phased
+        // independently against its own read pool — same semantic
+        // as upstream's per-sample DirectPhasing invocation in
+        // make_examples_core.py.
+        if (absl::GetFlag(FLAGS_use_direct_phasing)) {
+          std::vector<
+              nucleus::ConstProtoPtr<const nucleus::genomics::v1::Read>>
+              dp_read_ptrs;
+          dp_read_ptrs.reserve(reads_per_sample_v[s].size());
+          for (auto& r : reads_per_sample_v[s]) dp_read_ptrs.emplace_back(&r);
+          ::learning::genomics::deepvariant::DirectPhasing dp(
+              opts.direct_phasing_options());
+          auto so = dp.PhaseReads(absl::MakeSpan(big_candidates),
+                                   absl::MakeSpan(dp_read_ptrs));
+          if (so.ok()) {
+            const auto phased = dp.GetPhasedVariants();
+            int64_t current_ps = -1;
+            std::map<int64_t, int64_t> position_to_ps;
+            for (const auto& pv : phased) {
+              if (pv.is_first_in_block) current_ps = pv.position;
+              if (current_ps >= 0 && pv.phase_1_bases != pv.phase_2_bases) {
+                position_to_ps[pv.position] = current_ps;
+              }
+            }
+            for (auto& c : big_candidates) {
+              const int64_t pos = c.variant().start();
+              auto it = position_to_ps.find(pos);
+              if (it == position_to_ps.end()) continue;
+              if (c.variant().calls_size() == 0) continue;
+              c.mutable_variant()->mutable_calls(0)->set_is_phased(true);
+            }
+          }
+        }
 
         // ExamplesGenerator: 3 sample read vectors in upstream order
         // [parent1, child, parent2], rendered with this target's order

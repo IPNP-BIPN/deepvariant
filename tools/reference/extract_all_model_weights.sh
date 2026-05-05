@@ -394,6 +394,83 @@ extract_dvw \
   "${IMG_DS}"
 
 # ══════════════════════════════════════════════════════════════════════════
+# 5b. DeepSomatic tumor-only big models — google/deepsomatic:1.10.0
+# Tumor-only models use separate SavedModels: 8 channels for WGS/WES/FFPE
+# (base-6 + insert_size + allele_frequency), 10 for PacBio/ONT (base-6 +
+# haplotype + suppl/fuzzy + alt_aligned×2 + allele_frequency), h=100.
+# No small models exist for any tumor-only variant.
+# ══════════════════════════════════════════════════════════════════════════
+
+log "--- DeepSomatic tumor-only big models ---"
+
+extract_dvw \
+  "${MODELS_DIR}/deepsomatic.wgs_tumor_only" \
+  "${DVW_OUT}/deepsomatic.wgs_tumor_only.dvw" \
+  "${IMG_DS}"
+
+extract_dvw \
+  "${MODELS_DIR}/deepsomatic.wes_tumor_only" \
+  "${DVW_OUT}/deepsomatic.wes_tumor_only.dvw" \
+  "${IMG_DS}"
+
+extract_dvw \
+  "${MODELS_DIR}/deepsomatic.ffpe_wgs_tumor_only" \
+  "${DVW_OUT}/deepsomatic.ffpe_wgs_tumor_only.dvw" \
+  "${IMG_DS}"
+
+extract_dvw \
+  "${MODELS_DIR}/deepsomatic.ffpe_wes_tumor_only" \
+  "${DVW_OUT}/deepsomatic.ffpe_wes_tumor_only.dvw" \
+  "${IMG_DS}"
+
+extract_dvw \
+  "${MODELS_DIR}/deepsomatic.pacbio_tumor_only" \
+  "${DVW_OUT}/deepsomatic.pacbio_tumor_only.dvw" \
+  "${IMG_DS}"
+
+extract_dvw \
+  "${MODELS_DIR}/deepsomatic.ont_tumor_only" \
+  "${DVW_OUT}/deepsomatic.ont_tumor_only.dvw" \
+  "${IMG_DS}"
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5c. DeepSomatic Panel-of-Normals (PON) — google/deepsomatic:1.10.0
+# population_vcfs in tumor-only example_info.json flags_for_calling.
+# Required for allele-frequency filtering in make_examples tumor-only mode.
+# Extracted once; stored alongside model weights.
+# ══════════════════════════════════════════════════════════════════════════
+
+log "--- DeepSomatic PON file ---"
+
+PON_OUT="${DVW_OUT}/deepsomatic_pon"
+PON_FILE="${PON_OUT}/AF_ilmn_PON_DeepVariant.GRCh38.AF0.05.vcf.gz"
+if [[ -s "${PON_FILE}" ]]; then
+  log "SKIP (exists) AF_ilmn_PON_DeepVariant.GRCh38.AF0.05.vcf.gz"
+else
+  log "Extracting PON from ${IMG_DS}"
+  mkdir -p "${PON_OUT}"
+  PON_ABS="$(cd "${PON_OUT}" && pwd)"
+  docker run --rm --platform linux/amd64 \
+    -v "${PON_ABS}:/out" \
+    "${IMG_DS}" \
+    bash -c '
+      src=/opt/models/deepsomatic/pons/AF_ilmn_PON_DeepVariant.GRCh38.AF0.05.vcf.gz
+      tbi="${src}.tbi"
+      if [[ -f "${src}" ]]; then
+        cp "${src}" /out/
+        if [[ -f "${tbi}" ]]; then
+          cp "${tbi}" /out/
+        else
+          tabix -p vcf /out/AF_ilmn_PON_DeepVariant.GRCh38.AF0.05.vcf.gz 2>/dev/null || true
+        fi
+        echo "done"
+      else
+        echo "WARNING: PON not found at ${src}" >&2
+      fi
+    '
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
 # 6. DeepSomatic small models — google/deepsomatic:1.10.0
 # Paths from example_info.json trained_small_model_path:
 #   deepsomatic.wgs     → /opt/smallmodels/wgs/model.keras
