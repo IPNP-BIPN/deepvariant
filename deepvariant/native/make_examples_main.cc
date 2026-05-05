@@ -225,6 +225,15 @@ ABSL_FLAG(bool, sort_by_alt_allele_support_somatic, false,
 ABSL_FLAG(double, vsc_max_fraction_indels_for_non_target_sample, -1.0,
           "Normal AF cap for INDELs (<0 = disabled). Set 0.5 for WGS/WES/LR.");
 
+// Enable haplotype-expanded small model features (PacBio/ONT germline).
+// When true, EncodeSmallModelFeaturesHaplotype is used instead of
+// EncodeSmallModelFeatures: 70 standard + 36 HP-filtered = 106 total.
+// Must be set when --small_model_path points to a 106-input model
+// (pacbio_small_weights, ont_small_weights). Auto-set by cli.cc for
+// PACBIO and ONT model types.
+ABSL_FLAG(bool, small_model_use_haplotypes, false,
+          "Use haplotype-expanded (106-feature) small model for PacBio/ONT.");
+
 // Panel of Normals VCF for tumor-only allele_frequency pileup channel.
 // Path to bgzipped+tabix-indexed VCF. When set, each tumor-only candidate's
 // dv_call.allele_frequency map is populated from the PON's per-allele AF INFO
@@ -2109,6 +2118,23 @@ int RunMakeExamples(int argc, char** argv) {
         PopulateVafContext(&c, allele_counts);
       }
 
+      // Build HP tag map for haplotype-expanded small model (PacBio/ONT).
+      // Maps fragment_name+"/"+read_number → HP tag (0=unphased, 1, 2).
+      const bool use_haplotypes = absl::GetFlag(FLAGS_small_model_use_haplotypes);
+      std::unordered_map<std::string, int8_t> read_hp_tags;
+      if (use_haplotypes) {
+        for (const auto& r : working_reads) {
+          auto hp_it = r.info().find("HP");
+          if (hp_it == r.info().end() || hp_it->second.values().empty()) continue;
+          const auto& hp_val = hp_it->second.values(0);
+          if (!hp_val.has_number_value()) continue;
+          const int8_t hp = static_cast<int8_t>(hp_val.number_value());
+          const std::string key = r.fragment_name() + "/" +
+                                   std::to_string(r.read_number());
+          read_hp_tags[key] = hp;
+        }
+      }
+
       for (auto& c : candidates) {
         const int n_alts = c.variant().alternate_bases_size();
         // Build the list of alt-index sets to query: single + combinations.
@@ -2124,7 +2150,9 @@ int RunMakeExamples(int argc, char** argv) {
         bool any_failed = false;
         c.clear_make_examples_alt_allele_indices();
         for (const auto& idx_set : alt_idx_sets) {
-          const auto features = EncodeSmallModelFeatures(c, idx_set);
+          const auto features = use_haplotypes
+              ? EncodeSmallModelFeaturesHaplotype(c, idx_set, read_hp_tags)
+              : EncodeSmallModelFeatures(c, idx_set);
           float probs[3] = {0, 0, 0};
           bool pred_ok = small_model->Predict(features.data(), 1, probs);
           bool accept = false;
