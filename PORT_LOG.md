@@ -1417,3 +1417,39 @@ RNASeq) now have correct per-model flags automatically applied from
 Multi-mode dispatch (`deepvariant trio/somatic/pangenome`) verified
 at 0 FM vs Docker on chr20:10M-10.1M for all 4 modes.
 
+## 2026-05-05 — DeepSomatic tumor-only mode (WGS + FFPE_WGS)
+
+Pending item from CLAUDE.md Phase 6 closed: "tumor-only mode + FFPE mode".
+
+### Root causes fixed vs a naive tumor-only attempt
+
+1. **Wrong model checkpoint**: tumor+normal and tumor-only are SEPARATE
+   SavedModels. Docker's `--model_type=WGS_TUMOR_ONLY` selects
+   `/opt/models/deepsomatic/wgs_tumor_only` (not `wgs`). Our
+   `SomaticModelPath(model_type, has_normal)` does the same.
+2. **Wrong channel count**: WGS tumor-only = 8 channels (adds
+   `allele_frequency` / CH_ALLELE_FREQUENCY=8 to the standard 7). Fixed
+   in `make_examples_main.cc` somatic block when `!has_normal`.
+3. **sort_by_alt_allele_support hardcoded for all somatic**: was always
+   `true`; tumor-only JSONs don't declare it. Now conditional on
+   `has_normal`.
+4. **Wrong VSC thresholds**: tumor-only `vsc_min_fraction_snps=0.05` /
+   `indels=0.07` (TN uses 0.029/0.05). No small-model GQ thresholds.
+5. **PON (Panel of Normals)**: new `--population_vcfs` flag +
+   `FillAlleleFrequencyFromPon()` C++ helper fills `dv_call.allele_frequency`
+   from the extracted PON VCF per candidate, mirroring Python's
+   `allele_frequency.add_allele_frequencies_to_candidates`. The 8th
+   channel `AlleleFrequencyChannel` reads this map to encode population
+   AFs into the pileup image.
+
+### Validation (chr20:10M-10.1M, 2026-05-05)
+
+| Mode                 | shared | only_ours | only_docker | FM |
+|----------------------|-------:|----------:|------------:|---:|
+| WGS_TUMOR_ONLY       | 723    | 0         | 0           | **0** |
+| FFPE_WGS_TUMOR_ONLY  | 723    | 0         | 0           | **0** |
+
+**100% FILTER-class parity vs `google/deepsomatic:1.10.0` on both modes
+at first run.** PASS: WGS_TO=17, FFPE_WGS_TO=7 (identical to Docker).
+Pipeline shape: `(100, 221, 8)`, wall-time ~36 s on M4 Max (14 threads).
+
