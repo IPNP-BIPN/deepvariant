@@ -113,6 +113,7 @@ ABSL_DECLARE_FLAG(std::string, sample_name_normal);
 ABSL_DECLARE_FLAG(std::string, examples_tumor);
 ABSL_DECLARE_FLAG(std::string, examples_normal);
 ABSL_DECLARE_FLAG(std::string, small_model_path_somatic);
+ABSL_DECLARE_FLAG(std::string, population_vcfs);
 ABSL_DECLARE_FLAG(std::string, small_model_cvo_outfile_tumor);
 ABSL_DECLARE_FLAG(int, pileup_image_height_tumor);
 ABSL_DECLARE_FLAG(int, pileup_image_height_normal);
@@ -332,22 +333,95 @@ static TrioDims TrioInputDims(const std::string& model_type) {
   return                     {140, 140, 7, 221};  // WGS default
 }
 
-// SomaticInputDims — {h_tumor_normal, h_tumor_only, channels, width}.
-struct SomaticDims { int h_tn; int h_to; int channels; int width; };
-static SomaticDims SomaticInputDims(const std::string& model_type) {
+// SomaticInputDims — call_variants input shape per model_type × has_normal.
+// Source: deepsomatic.<model>[_tumor_only]/model.example_info.json shape field.
+struct SomaticDims { int h; int channels; int width; };
+static SomaticDims SomaticInputDims(const std::string& model_type,
+                                    bool has_normal) {
   std::string mt = model_type;
   for (char& c : mt) c = static_cast<char>(std::toupper(c));
-  if (mt == "PACBIO") return {200, 100, 9, 147};
-  if (mt == "ONT")    return {200, 100, 9,  99};
-  return                     {200, 100, 7, 221};
+  if (!has_normal) {
+    // Tumor-only: h=100 for all types; channels = base+1 (allele_frequency).
+    // PacBio/ONT tumor-only width=99 (narrower than TN PacBio 147).
+    if (mt == "PACBIO" || mt == "ONT") return {100, 10,  99};
+    return                                    {100,  8, 221};
+  }
+  // Tumor+normal shapes from model.example_info.json.
+  if (mt == "PACBIO") return {200, 9, 147};
+  if (mt == "ONT")    return {200, 9,  99};
+  return                     {200, 7, 221};   // WGS/WES/FFPE_WGS/FFPE_WES
+}
+
+// SomaticModelPath — default model bundle path for somatic mode.
+// Returns .mlpackage (CoreML/ane_speculate) from DEEPVARIANT_MODELS_DIR.
+// Metal backend callers pass --checkpoint pointing to the .dvw in the same dir.
+static std::string SomaticModelPath(const std::string& model_type,
+                                    bool has_normal) {
+  const char* env = std::getenv("DEEPVARIANT_MODELS_DIR");
+  std::string base = env ? env
+                         : "/opt/homebrew/share/deepvariant-models";
+  std::string mt = model_type;
+  for (char& c : mt) c = static_cast<char>(std::tolower(c));
+  if (!has_normal) {
+    return absl::StrCat(base, "/deepsomatic.", mt, "_tumor_only.mlpackage");
+  }
+  return absl::StrCat(base, "/deepsomatic.", mt, ".mlpackage");
 }
 
 // ApplySomaticModelFlags — somatic make_examples flags from
-// deepsomatic.<model>/model.example_info.json flags_for_calling.
+// deepsomatic.<model>[_tumor_only]/model.example_info.json flags_for_calling.
+// Note: sort_by_alt_allele_support and track_ref_reads are set directly in
+// make_examples_main.cc (conditioned on has_normal); not passed as flags here.
 static void ApplySomaticModelFlags(const std::string& model_type,
+                                    bool has_normal,
                                     std::vector<std::string>& me_args) {
   std::string mt = model_type;
   for (char& c : mt) c = static_cast<char>(std::toupper(c));
+
+  if (!has_normal) {
+    // ── Tumor-only flag dispatch ──────────────────────────────────────────
+    // Mirrors deepsomatic.*_tumor_only/model.example_info.json flags_for_calling.
+    // No small model for any tumor-only variant (no trained_small_model_path).
+    // sort_by_alt_allele_support absent from all tumor-only JSONs → stays false
+    // (handled in make_examples_main.cc).
+    if (mt == "PACBIO") {
+      me_args.push_back("--pileup_image_width=99");   // tumor-only width=99 not 147
+      me_args.push_back("--channel_list_preset=MASSEQ");
+      me_args.push_back("--alt_aligned_pileup=diff_channels");
+      me_args.push_back("--sort_by_haplotypes=true");
+      me_args.push_back("--phase_reads=true");
+      me_args.push_back("--parse_sam_aux_fields=true");
+      me_args.push_back("--trim_reads_for_pileup=true");
+      me_args.push_back("--realigner_enabled=false");
+      me_args.push_back("--min_mapping_quality=5");
+      me_args.push_back("--partition_size=25000");
+      me_args.push_back("--vsc_min_fraction_snps=0.02");
+      me_args.push_back("--vsc_min_fraction_indels=0.1");
+      me_args.push_back("--vsc_min_count_snps=1");
+    } else if (mt == "ONT") {
+      me_args.push_back("--pileup_image_width=99");
+      me_args.push_back("--channel_list_preset=MASSEQ");
+      me_args.push_back("--alt_aligned_pileup=diff_channels");
+      me_args.push_back("--sort_by_haplotypes=true");
+      me_args.push_back("--phase_reads=true");
+      me_args.push_back("--parse_sam_aux_fields=true");
+      me_args.push_back("--trim_reads_for_pileup=true");
+      me_args.push_back("--realigner_enabled=false");
+      me_args.push_back("--min_mapping_quality=5");
+      me_args.push_back("--partition_size=25000");
+      me_args.push_back("--vsc_min_fraction_snps=0.05");
+      me_args.push_back("--vsc_min_fraction_indels=0.1");
+    } else {
+      // WGS / WES / FFPE_WGS / FFPE_WES tumor-only.
+      // All four use identical thresholds per their example_info.json files:
+      //   vsc_min_fraction_snps=0.05, vsc_min_fraction_indels=0.07.
+      me_args.push_back("--vsc_min_fraction_snps=0.05");
+      me_args.push_back("--vsc_min_fraction_indels=0.07");
+    }
+    return;
+  }
+
+  // ── Tumor+normal flag dispatch ────────────────────────────────────────────
   if (mt == "PACBIO") {
     me_args.push_back("--pileup_image_width=147");
     me_args.push_back("--channel_list_preset=MASSEQ");
@@ -388,7 +462,7 @@ static void ApplySomaticModelFlags(const std::string& model_type,
     me_args.push_back("--small_model_indel_gq_threshold=36");
     me_args.push_back("--small_model_vaf_context_window_size=51");
   } else {
-    // WGS / WES default somatic.
+    // WGS / WES default somatic tumor+normal.
     me_args.push_back("--vsc_min_fraction_snps=0.029");
     me_args.push_back("--vsc_min_fraction_indels=0.05");
     me_args.push_back("--small_model_snp_gq_threshold=31");
@@ -912,8 +986,11 @@ int RunAllSomatic(int argc, char** argv) {
 
   std::string ckpt = absl::GetFlag(FLAGS_checkpoint);
   if (ckpt.empty()) {
-    LOG(ERROR) << "Somatic: --checkpoint (.dvw) required";
-    return 1;
+    // Auto-select model bundle based on model_type × has_normal.
+    // For metal backend the user should pass --checkpoint=path/to/.dvw;
+    // for coreml/ane_speculate the .mlpackage path is returned here.
+    ckpt = SomaticModelPath(model_type, has_normal);
+    LOG(INFO) << "Somatic: auto-selected model " << ckpt;
   }
 
   const std::string sm_path =
@@ -969,8 +1046,15 @@ int RunAllSomatic(int argc, char** argv) {
       me_args.push_back(absl::StrCat("--small_model_cvo_outfile_tumor=",
                                       small_cvo_pattern));
     }
-    // Per-model flags from deepsomatic.<model>/model.example_info.json.
-    ApplySomaticModelFlags(model_type, me_args);
+    // Per-model flags from deepsomatic.<model>[_tumor_only]/model.example_info.json.
+    ApplySomaticModelFlags(model_type, has_normal, me_args);
+    // Tumor-only: forward PON VCF path for allele_frequency channel encoding.
+    {
+      const std::string pon = absl::GetFlag(FLAGS_population_vcfs);
+      if (!has_normal && !pon.empty()) {
+        me_args.push_back(absl::StrCat("--population_vcfs=", pon));
+      }
+    }
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
@@ -982,16 +1066,15 @@ int RunAllSomatic(int argc, char** argv) {
   // ── Stage 2: call_variants on the tumor model. ────────────
   LOG(INFO) << "Somatic Stage 2: call_variants";
   {
-    // Per-model input shape from deepsomatic example_info.json.
-    const SomaticDims sdims = SomaticInputDims(model_type);
-    const int tumor_h = has_normal ? sdims.h_tn : sdims.h_to;
+    // Per-model input shape from deepsomatic[_tumor_only] example_info.json.
+    const SomaticDims sdims = SomaticInputDims(model_type, has_normal);
     std::vector<std::string> cv_args = {
         absl::StrCat("--examples=", examples_pattern),
         absl::StrCat("--outfile=", cvo_path),
         absl::StrCat("--checkpoint=", ckpt),
         absl::StrCat("--batch_size=", EffectiveBatchSize()),
         absl::StrCat("--inference_backend=", inference_backend),
-        absl::StrCat("--input_height=", tumor_h),
+        absl::StrCat("--input_height=", sdims.h),
         absl::StrCat("--input_channels=", sdims.channels),
     };
     AppendAneSpeculateArgs(cv_args, inference_backend,
