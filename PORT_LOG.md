@@ -1462,6 +1462,63 @@ EncodeSmallModelFeatures produces 70. Extra 36 features encode alt-aligned
 pileup-specific stats not yet ported from upstream. Small model for PacBio/ONT
 disabled until feature encoder is extended.
 
+## 2026-05-06 — DeepTrio PacBio/ONT shape fix + WGS temperature scan
+
+### DeepTrio PacBio/ONT — shape fix (commit 7a8974c4)
+
+DeepTrio PacBio/ONT models use **MASSEQ preset (7ch) + alt-aligned diff_channels
+(2ch) = 9 total, width=199**, whereas `ApplyModelFlags(PACBIO)` for germline sets
+`LONG_READ_PACBIO` (8ch, width=147). After the ApplyModelFlags call in RunAllTrio,
+two overrides were missing:
+
+1. `--pileup_image_width=199 --channel_list_preset=MASSEQ --alt_aligned_pileup=diff_channels`
+   (Abseil last-wins in `me_args` vector — override fires after ApplyModelFlags).
+2. `--input_width=tdims.width` not forwarded to call_variants (defaulted to 221).
+
+**Root symptom progression:**
+- `Unexpected image size 164640 (expected 278460)` — 164640=140×147×8 (wrong width + wrong 8ch)
+- After pileup_image_width + MASSEQ: `195020 (expected 250740)` — 195020=199×140×7 (no alt-aligned)
+- After alt_aligned_pileup=diff_channels: `250740 (expected 278460)` — 250740=199×140×9 ✓ but input_width mismatch
+- After input_width=199: clean run
+
+**Proxy test results** (WGS BAMs, chr20:10M-10.1M, trio mode):
+
+| Model type | Expected shape | Confirmed shape | Status |
+|------------|---------------|-----------------|--------|
+| PACBIO     | (140,199,9)   | ✅ (140,199,9)  | No crash |
+| ONT        | (300,199,9)   | ✅ (300,199,9)  | No crash |
+
+Note: proxy test uses WGS Illumina BAMs with long-read PacBio/ONT models —
+results are not scientifically valid but confirm the pipeline shape and end-to-end
+flow. True parity validation requires real PacBio/ONT BAMs (~5 GB from GIAB/SRA).
+
+### WGS temperature calibration — conclusion
+
+Scanned T ∈ {0.6, 0.7, 0.8, 0.9, 1.0} on full chr20 HG002. Results:
+
+| T   | PASS    | RefCall | NoCall  |
+|-----|---------|---------|---------|
+| 0.6 | 107,109 | 93,698  |  9,581  |
+| 0.7 | 107,109 | 91,356  | 11,923  |
+| 0.8 | 107,109 | 88,601  | 14,678  |
+| 0.9 | 107,109 | 85,138  | 18,141  |
+| 1.0 | 107,109 | 79,734  | 23,545  |
+
+**Observation:** PASS count is identical across all temperatures (107,109).
+Temperature scaling shifts only the RefCall↔NoCall boundary — it does NOT
+affect PASS vs non-PASS classification. PASS sites are high-confidence
+(dominant argmax far from GQ threshold); temperature scaling within the
+studied range is insufficient to flip them.
+
+**Conclusion:** Temperature calibration via `--enable_temp_scaling` cannot
+improve FILTER-class FM vs Docker for the WGS model. The infrastructure
+stays as an opt-in flag (`--enable_temp_scaling=true --temp_scaling_T=T`)
+for users who want to experiment with GQ recalibration, but the default
+(T=1.0 = disabled) is correct.
+
+The chr20 WGS baseline after Phase 9 additions: F1 SNP=0.997402,
+INDEL=0.995985 (unchanged from Phase 8 Tier 6.0 measurement).
+
 ## 2026-05-05 — DeepSomatic tumor-only mode (WGS + FFPE_WGS)
 
 Pending item from CLAUDE.md Phase 6 closed: "tumor-only mode + FFPE mode".
