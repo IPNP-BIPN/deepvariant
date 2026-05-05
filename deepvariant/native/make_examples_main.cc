@@ -217,6 +217,11 @@ ABSL_FLAG(bool, split_skip_reads, false,
 // model.example_info.json; WGS/WES/PacBio/ONT declare 0.5).
 ABSL_FLAG(double, vsc_max_fraction_snps_for_non_target_sample, -1.0,
           "Normal AF cap for SNPs (<0 = disabled). Set 0.5 for WGS/WES/LR.");
+// Sort pileup rows by alt-allele support in somatic TN mode.
+// Declared by WGS + FFPE_WGS tumor+normal JSONs only; NOT by WES/FFPE_WES/
+// PacBio/ONT. cli.cc sets this flag for WGS and FFPE_WGS TN only.
+ABSL_FLAG(bool, sort_by_alt_allele_support_somatic, false,
+          "Sort somatic pileup rows by alt support (WGS/FFPE_WGS TN only).");
 ABSL_FLAG(double, vsc_max_fraction_indels_for_non_target_sample, -1.0,
           "Normal AF cap for INDELs (<0 = disabled). Set 0.5 for WGS/WES/LR.");
 
@@ -650,12 +655,12 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
     const std::string tumor_reads  = absl::GetFlag(FLAGS_reads_tumor);
     const bool has_normal = !normal_reads.empty();
 
-    // sort_by_alt_allele_support=true: tumor+normal models only.
-    // Groups reads by which alt they support before the position sort;
-    // without it the tumor pileup rows diverge from Docker at multi-alt
-    // sites (e.g. chr20:10023577). Tumor-only models do NOT declare this
-    // flag in model.example_info.json — leave false for tumor-only.
-    if (has_normal) {
+    // sort_by_alt_allele_support: declared by WGS + FFPE_WGS TN JSONs only.
+    // WES, FFPE_WES, PacBio, ONT do NOT declare it. Tumor-only never does.
+    // cli.cc passes --sort_by_alt_allele_support_somatic=true for WGS/FFPE_WGS
+    // TN only (based on each model's flags_for_calling).
+    if (has_normal &&
+        absl::GetFlag(FLAGS_sort_by_alt_allele_support_somatic)) {
       opts.mutable_pic_options()->set_sort_by_alt_allele_support(true);
     }
 
