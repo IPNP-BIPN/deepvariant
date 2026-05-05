@@ -116,6 +116,7 @@ ABSL_DECLARE_FLAG(std::string, small_model_path_somatic);
 ABSL_DECLARE_FLAG(std::string, population_vcfs);
 ABSL_DECLARE_FLAG(double, vsc_max_fraction_snps_for_non_target_sample);
 ABSL_DECLARE_FLAG(double, vsc_max_fraction_indels_for_non_target_sample);
+ABSL_DECLARE_FLAG(bool,   sort_by_alt_allele_support_somatic);
 ABSL_DECLARE_FLAG(std::string, small_model_cvo_outfile_tumor);
 ABSL_DECLARE_FLAG(int, pileup_image_height_tumor);
 ABSL_DECLARE_FLAG(int, pileup_image_height_normal);
@@ -467,23 +468,36 @@ static void ApplySomaticModelFlags(const std::string& model_type,
     me_args.push_back("--small_model_snp_gq_threshold=53");
     me_args.push_back("--small_model_indel_gq_threshold=36");
     me_args.push_back("--small_model_vaf_context_window_size=51");
-  } else if (mt == "FFPE_WGS" || mt == "FFPE_WES") {
-    // FFPE tumor+normal: no vsc_max_fraction_for_non_target_sample (not in JSON).
-    // Docker FFPE generates all germline-het candidates and GERMLINE-labels them
-    // in postprocess; applying the 0.5 cap would skip those candidates silently.
+  } else if (mt == "FFPE_WGS") {
+    // FFPE_WGS tumor+normal: sort_by_alt_allele_support=true (declared in JSON).
+    // No vsc_max_fraction_for_non_target_sample (NOT in FFPE_WGS JSON).
+    me_args.push_back("--sort_by_alt_allele_support_somatic=true");
     me_args.push_back("--vsc_min_fraction_snps=0.029");
     me_args.push_back("--vsc_min_fraction_indels=0.05");
     me_args.push_back("--small_model_snp_gq_threshold=53");
     me_args.push_back("--small_model_indel_gq_threshold=36");
     me_args.push_back("--small_model_vaf_context_window_size=51");
+  } else if (mt == "FFPE_WES") {
+    // FFPE_WES tumor+normal: no sort_by_alt_allele_support, no small model,
+    // no vsc_max_fraction (none declared in FFPE_WES JSON).
+    me_args.push_back("--vsc_min_fraction_snps=0.029");
+    me_args.push_back("--vsc_min_fraction_indels=0.05");
+  } else if (mt == "WES") {
+    // WES tumor+normal: vsc_max_fraction=0.5 declared; no sort_by_alt_allele,
+    // no small model (WES JSON has no trained_small_model_path).
+    me_args.push_back("--vsc_min_fraction_snps=0.029");
+    me_args.push_back("--vsc_min_fraction_indels=0.05");
+    me_args.push_back("--vsc_max_fraction_snps_for_non_target_sample=0.5");
+    me_args.push_back("--vsc_max_fraction_indels_for_non_target_sample=0.5");
   } else {
-    // WGS / WES default somatic tumor+normal.
+    // WGS default somatic tumor+normal: sort_by_alt_allele_support=true +
+    // small model GQ thresholds + vsc_max_fraction=0.5 (all in WGS JSON).
+    me_args.push_back("--sort_by_alt_allele_support_somatic=true");
     me_args.push_back("--vsc_min_fraction_snps=0.029");
     me_args.push_back("--vsc_min_fraction_indels=0.05");
     me_args.push_back("--small_model_snp_gq_threshold=31");
     me_args.push_back("--small_model_indel_gq_threshold=29");
     me_args.push_back("--small_model_vaf_context_window_size=51");
-    // WGS/WES declare vsc_max_fraction_*_for_non_target_sample=0.5 in JSON.
     me_args.push_back("--vsc_max_fraction_snps_for_non_target_sample=0.5");
     me_args.push_back("--vsc_max_fraction_indels_for_non_target_sample=0.5");
   }
