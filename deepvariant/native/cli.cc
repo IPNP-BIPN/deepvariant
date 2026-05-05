@@ -877,6 +877,18 @@ int RunAllTrio(int argc, char** argv) {
     }
     // Per-model pileup/read flags from example_info.json.
     ApplyModelFlags(model_type, me_args);
+    // Per-model pileup heights for trio (per-sample, stacked in make_examples).
+    // WGS/PacBio: child=60 parent=40 → total 140. WES/ONT: child=100 parent=100
+    // → total 300. make_examples defaults to 60/40 (WGS); override for others.
+    {
+      std::string mt = model_type;
+      for (char& c : mt) c = static_cast<char>(std::toupper(c));
+      if (mt == "WES" || mt == "ONT") {
+        me_args.push_back("--pileup_image_height_child=100");
+        me_args.push_back("--pileup_image_height_parent=100");
+      }
+      // WGS / PacBio: defaults 60/40 in make_examples_main.cc are correct.
+    }
     // DeepTrio threshold overrides (upstream scripts/run_deeptrio.py).
     // WGS trio uses SNP_GQ=15 / INDEL_GQ=29; long-read models use
     // the thresholds from ApplyModelFlags() already.
