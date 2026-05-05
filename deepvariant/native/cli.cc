@@ -910,6 +910,24 @@ int RunAllTrio(int argc, char** argv) {
       }
       // WGS / PacBio: defaults 60/40 in make_examples_main.cc are correct.
     }
+    // DeepTrio PacBio/ONT channel + width overrides.
+    // ApplyModelFlags(PACBIO) sets LONG_READ_PACBIO (8ch, width=147) and
+    // ApplyModelFlags(ONT) sets LONG_READ_ONT (8ch, width=199).
+    // But DeepTrio PacBio/ONT models use MASSEQ preset (7ch) + alt-aligned (9)
+    // with width=199.  Push overrides AFTER ApplyModelFlags; Abseil last-wins.
+    {
+      std::string mt = model_type;
+      for (char& c : mt) c = static_cast<char>(std::toupper(c));
+      if (mt == "PACBIO" || mt == "ONT") {
+        // DeepTrio PacBio/ONT use MASSEQ preset (7ch) + alt-aligned (9ch total)
+        // with width=199, matching model.example_info.json shape [140,199,9] /
+        // [300,199,9]. ApplyModelFlags (germline) sets LONG_READ_PACBIO (8ch,
+        // width=147) — override both.
+        me_args.push_back("--pileup_image_width=199");
+        me_args.push_back("--channel_list_preset=MASSEQ");
+        me_args.push_back("--alt_aligned_pileup=diff_channels");
+      }
+    }
     // DeepTrio threshold overrides (upstream scripts/run_deeptrio.py).
     // WGS trio uses SNP_GQ=15 / INDEL_GQ=29; long-read models use
     // the thresholds from ApplyModelFlags() already.
@@ -947,6 +965,7 @@ int RunAllTrio(int argc, char** argv) {
           absl::StrCat("--inference_backend=", inference_backend),
           absl::StrCat("--input_height=", input_h),
           absl::StrCat("--input_channels=", tdims.channels),
+          absl::StrCat("--input_width=", tdims.width),
       };
       AppendAneSpeculateArgs(cv_args, inference_backend, ane_dvw[pi]);
       auto argv_cv = MakeArgv("deepvariant_call_variants", cv_args);
