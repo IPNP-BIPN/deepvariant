@@ -1,15 +1,11 @@
 class Deepvariant < Formula
-  desc "Native arm64 macOS port of Google DeepVariant (single-sample WGS)"
+  desc "Native arm64 macOS DeepVariant — germline/trio/somatic/pangenome + Metal/ANE"
   homepage "https://github.com/benjamindemaille/deepvariant"
-  version "0.1.0"
+  version "1.10.0"
   license "BSD-3-Clause"
-  head "https://github.com/benjamindemaille/deepvariant.git", branch: "feature/apple-silicon-native-v2"
 
-  # Bottle-only formula: arm64 macOS only. We do NOT publish a from-source
-  # build path because the CMake graph pulls in static htslib / abseil /
-  # protobuf / ssw / re2 / boost and a Docker round-trip for model
-  # conversion. End users get a pre-signed binary; developers build from
-  # source (see README).
+  # Bottle-only: arm64 macOS. Build requires htslib/abseil/protobuf/re2/boost
+  # + Docker for model conversion — end users get a pre-signed binary.
   bottle do
     root_url "https://github.com/benjamindemaille/deepvariant/releases/download/v#{version}"
     rebuild 0
@@ -17,30 +13,46 @@ class Deepvariant < Formula
     sha256 cellar: :any_skip_relocation, arm64_sonoma:  "REPLACE_WITH_BOTTLE_SHA256"
   end
 
-  depends_on :macos => :sonoma           # macOS 14 floor
-  depends_on arch: :arm64                # Apple Silicon only
-  depends_on "deepvariant-models"        # the .mlpackage models live there
+  depends_on :macos => :sonoma
+  depends_on arch: :arm64
+  depends_on "htslib"             # bgzip + tabix at runtime
+  depends_on "deepvariant-models" # .mlpackage, .dvw, small-model weights, PON
 
   def install
     bin.install "deepvariant"
   end
 
   def caveats
+    models = "#{HOMEBREW_PREFIX}/share/deepvariant-models"
     <<~EOS
-      DeepVariant on Apple Silicon — quick start:
+      Quick start (models auto-discovered from deepvariant-models formula):
 
+        # Germline WGS
+        deepvariant run --reads=HG002.bam --ref=GRCh38.fa \\
+          --output_vcf=out.vcf --model_type=WGS
+
+        # DeepTrio
         deepvariant run \\
-          --reads=sample.bam \\
-          --ref=ref.fa \\
-          --output_vcf=out.vcf \\
-          --model=#{HOMEBREW_PREFIX}/share/deepvariant-models/wgs.mlpackage \\
-          --small_model_path=#{HOMEBREW_PREFIX}/share/deepvariant-models/wgs_small.mlpackage \\
-          --compute_units=all
+          --reads=child.bam --reads_parent1=p1.bam --reads_parent2=p2.bam \\
+          --ref=ref.fa --model_type=WGS \\
+          --output_vcf_child=child.vcf \\
+          --output_vcf_parent1=p1.vcf --output_vcf_parent2=p2.vcf
 
-      Models live in $(brew --prefix)/share/deepvariant-models/
-      (separate formula: deepvariant-models).
+        # DeepSomatic tumor+normal
+        deepvariant somatic \\
+          --reads_tumor=tumor.bam --reads_normal=normal.bam \\
+          --ref=ref.fa --model_type=WGS --output_vcf=somatic.vcf
 
-      For trio / somatic / pangenome, see deepvariant --help.
+        # DeepSomatic tumor-only (with Panel-of-Normals)
+        deepvariant somatic \\
+          --reads_tumor=tumor.bam --ref=ref.fa \\
+          --model_type=WGS_TUMOR_ONLY \\
+          --population_vcfs=#{models}/deepsomatic_pon/AF_ilmn_PON_DeepVariant.GRCh38.AF0.05.vcf.gz \\
+          --output_vcf=tumor_only.vcf
+
+      ANE acceleration: add --inference_backend=ane_speculate to any command.
+      Models directory: #{models}
+      Override: export DEEPVARIANT_MODELS_DIR=/custom/path
     EOS
   end
 

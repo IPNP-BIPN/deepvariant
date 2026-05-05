@@ -1,11 +1,14 @@
 class DeepvariantModels < Formula
-  desc "Pre-converted Core ML .mlpackage models for DeepVariant on Apple Silicon"
+  desc "Models for DeepVariant on Apple Silicon — CoreML, Metal DVW, small-model weights, PON"
   homepage "https://github.com/benjamindemaille/deepvariant"
-  version "0.1.0"
+  version "1.10.0"
   license "BSD-3-Clause"
 
-  # All 25+ .mlpackage models bundled into a single archive (~3.5 GB).
-  # Hosted on GitHub Releases (or R2 mirror) — fetched once on install.
+  # Archive contents (~8.5 GB uncompressed):
+  #   *.mlpackage          — CoreML/ANE backend (one per model variant)
+  #   *.dvw                — Metal MPSGraph FP32 backend
+  #   *_small_weights/     — BNNS-CPU MLP weights (.npy, 6 files each)
+  #   deepsomatic_pon/     — Panel-of-Normals VCF for tumor-only calling
   url "https://github.com/benjamindemaille/deepvariant/releases/download/v#{version}/deepvariant-models-#{version}.tar.gz"
   sha256 "REPLACE_WITH_TARBALL_SHA256"
 
@@ -13,32 +16,34 @@ class DeepvariantModels < Formula
   depends_on arch: :arm64
 
   def install
-    # Every .mlpackage and its small-model sibling lands in the share dir.
-    # The deepvariant binary picks them up by --model=<path> or via the
-    # DEEPVARIANT_MODELS_DIR env var.
-    (share/"deepvariant-models").install Dir["*.mlpackage"]
-    (share/"deepvariant-models").install Dir["*_small.mlpackage"]
+    d = share/"deepvariant-models"
+    d.install Dir["*.mlpackage"]
+    d.install Dir["*.dvw"]
+    Dir["*_small_weights"].each { |dir| (d/dir).install Dir["#{dir}/*.npy"] }
+    (d/"deepsomatic_pon").install Dir["deepsomatic_pon/*"] if Dir.exist?("deepsomatic_pon")
   end
 
   def caveats
     <<~EOS
-      DeepVariant models installed to:
-        #{share}/deepvariant-models/
+      Models: #{share}/deepvariant-models/
 
-      Available variants (all FP32, bit-parity with upstream Linux x86):
-        wgs, wes, pacbio, ont, hybrid, masseq, rnaseq          (DeepVariant)
-        deeptrio.{wgs,wes,pacbio,ont}_{child,parent}            (DeepTrio)
-        deepsomatic.{wgs,wes,pacbio,ont}{,_tumor_only}          (DeepSomatic)
-        deepsomatic.{ffpe_wgs,ffpe_wes}{,_tumor_only}           (FFPE somatic)
+      DeepVariant germline: wgs, wes, pacbio, ont, hybrid, masseq, rnaseq
+      DeepTrio:             deeptrio.{wgs,wes,pacbio,ont}_{child,parent}
+      DeepSomatic T+N:      deepsomatic.{wgs,wes,pacbio,ont,ffpe_wgs,ffpe_wes}
+      DeepSomatic TO:       deepsomatic.*_tumor_only
+      Pangenome:            pangenome.wgs
 
-      The deepvariant binary auto-discovers them when DEEPVARIANT_MODELS_DIR
-      is unset. Override with:
-        export DEEPVARIANT_MODELS_DIR=#{share}/deepvariant-models
+      Each variant ships .mlpackage (ANE/GPU) + .dvw (Metal FP32).
+      Small-model weights (*_small_weights/) provided for WGS, PacBio, ONT,
+      DeepSomatic WGS, PacBio, ONT, FFPE_WGS variants.
+      Panel-of-Normals in deepsomatic_pon/ for --population_vcfs flag.
+
+      Override path: export DEEPVARIANT_MODELS_DIR=#{share}/deepvariant-models
     EOS
   end
 
   test do
-    # Sanity: the canonical wgs model is in place.
     assert_predicate share/"deepvariant-models/wgs.mlpackage", :exist?
+    assert_predicate share/"deepvariant-models/wgs.dvw",       :exist?
   end
 end
