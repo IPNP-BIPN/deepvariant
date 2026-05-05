@@ -1160,6 +1160,7 @@ int RunAllSomatic(int argc, char** argv) {
         absl::StrCat("--inference_backend=", inference_backend),
         absl::StrCat("--input_height=", sdims.h),
         absl::StrCat("--input_channels=", sdims.channels),
+        absl::StrCat("--input_width=", sdims.width),
     };
     AppendAneSpeculateArgs(cv_args, inference_backend,
                            absl::GetFlag(FLAGS_ane_speculate_metal_checkpoint_somatic));

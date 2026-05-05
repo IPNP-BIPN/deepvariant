@@ -36,13 +36,15 @@ class MetalInception {
   // nullptr on any error (file missing, weight tensor missing, MPSGraph
   // failure).
   //
-  // input_height/input_channels parameterize the placeholder input
-  // shape: WGS uses (100, 221, 7); DeepTrio WGS uses (140, 221, 7);
-  // pangenome uses (100, 221, 9), etc. Width is fixed at 221.
+  // input_height/input_width/input_channels parameterize the placeholder
+  // input shape. WGS: (100,221,7). DeepTrio WGS: (140,221,7).
+  // PacBio germline: (100,147,10). ONT: (100,199,10). MASSEQ: (100,199,9).
+  // Somatic PacBio TN: (200,147,9). Somatic ONT TN: (200,99,9).
   static std::unique_ptr<MetalInception> Create(
       const std::string& dvw_path,
       int input_height = 100,
-      int input_channels = 7);
+      int input_channels = 7,
+      int input_width = 221);
 
   ~MetalInception();
 
