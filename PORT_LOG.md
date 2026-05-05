@@ -1462,6 +1462,66 @@ EncodeSmallModelFeatures produces 70. Extra 36 features encode alt-aligned
 pileup-specific stats not yet ported from upstream. Small model for PacBio/ONT
 disabled until feature encoder is extended.
 
+## 2026-05-06 — Full mode coverage: MetalInception input_width + proxy tests
+
+### Bug: MetalInception hardcoded width=221 (commit b30aa7bd)
+
+All three MPSGraph references in `metal_inference.mm` used `@221` for the
+input tensor width instead of a parameterized value. Additionally,
+`cli.cc` somatic stage-2 args were missing `--input_width=sdims.width`.
+Together these caused DeepSomatic PacBio TN (width=147) and ONT TN/TO
+(width=99) to build a 221-wide MPSGraph while make_examples produced
+147-/99-wide images — resulting in a process hang (MPSGraph block with
+wrong tensor shape never returned).
+
+**Fix:** added `input_width` field to `MetalInceptionImpl`, new fourth
+parameter `MetalInception::Create(dvw, H, C, W=221)` (backward-compatible
+default), forwarded from `FLAGS_input_width` at both call-variant call
+sites; also added `--input_width=sdims.width` to somatic cv_args in cli.cc.
+
+### Full proxy test matrix after both shape fixes (2026-05-06)
+
+All tests use WGS Illumina BAMs with chr20:10M-10.1M. Shapes confirm the
+pipeline runs without crash; scientific validity requires per-technology BAMs.
+
+| Mode                          | Expected shape  | Confirmed       |
+|-------------------------------|-----------------|-----------------|
+| Germline WGS                  | (100,221,7)     | ✅ (pre-existing) |
+| Germline WES                  | (100,221,7)     | ✅ (pre-existing) |
+| Germline PacBio               | (100,147,10)    | ✅ (pre-existing) |
+| Germline ONT                  | (100,199,10)    | ✅ (pre-existing) |
+| Germline MASSEQ               | (100,199,9)     | ✅ this session  |
+| Germline RNASEQ               | (100,221,6)     | ✅ this session  |
+| Germline HYBRID               | (100,221,6)     | ✅ this session  |
+| DeepTrio WGS                  | (140,221,7)     | ✅ (pre-existing) |
+| DeepTrio WES                  | (100,221,7)     | ✅ (pre-existing) |
+| DeepTrio PacBio               | (140,199,9)     | ✅ this session  |
+| DeepTrio ONT                  | (300,199,9)     | ✅ this session  |
+| Somatic WGS TN                | (200,221,7)     | ✅ (pre-existing) |
+| Somatic WES TN                | (200,221,7)     | ✅ (pre-existing) |
+| Somatic FFPE_WGS TN           | (200,221,7)     | ✅ (pre-existing) |
+| Somatic FFPE_WES TN           | (200,221,7)     | ✅ (pre-existing) |
+| Somatic WGS TO                | (100,221,8)     | ✅ (pre-existing) |
+| Somatic WES TO                | (100,221,8)     | ✅ (pre-existing) |
+| Somatic FFPE_WGS TO           | (100,221,8)     | ✅ (pre-existing) |
+| Somatic FFPE_WES TO           | (100,221,8)     | ✅ (pre-existing) |
+| Somatic PacBio TN             | (200,147,9)     | ✅ this session  |
+| Somatic ONT TN                | (200,99,9)      | ✅ this session  |
+| Somatic PacBio TO             | (100,99,10)     | ✅ this session  |
+| Somatic ONT TO                | (100,99,10)     | ✅ this session  |
+| Pangenome WGS                 | (100,221,9)     | ✅ (pre-existing) |
+
+**All 23 operational modes produce correct pipeline shapes without crash.**
+
+Modes with validated FILTER-class parity (0 FM vs Docker on chr20:10M-10.1M):
+WGS ✅ · WES ✅ · DeepTrio WGS ✅ · DeepTrio WES ✅ ·
+Somatic WGS/WES/FFPE_WGS/FFPE_WES TN ✅ ·
+Somatic WGS/WES/FFPE_WGS/FFPE_WES TO ✅ · Pangenome WGS ✅ (14/23)
+
+Modes needing real PacBio/ONT BAMs for parity validation:
+Germline PacBio · Germline ONT · Germline MASSEQ · Germline RNASEQ ·
+DeepTrio PacBio · DeepTrio ONT · Somatic PacBio/ONT TN/TO (9/23)
+
 ## 2026-05-06 — DeepTrio PacBio/ONT shape fix + WGS temperature scan
 
 ### DeepTrio PacBio/ONT — shape fix (commit 7a8974c4)
