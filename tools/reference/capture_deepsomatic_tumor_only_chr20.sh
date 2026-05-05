@@ -56,7 +56,7 @@ docker pull --platform linux/amd64 "${IMG}"
 # ── Helper ───────────────────────────────────────────────────────────────────
 
 run_deepsomatic_tumor_only() {
-  local mode="$1"     # WGS | FFPE_WGS
+  local mode="$1"     # WGS_TUMOR_ONLY | FFPE_WGS_TUMOR_ONLY
   local mode_lc
   mode_lc="$(echo "${mode}" | tr '[:upper:]' '[:lower:]')"
   local out_dir="${OUT_BASE}/${mode_lc}"
@@ -83,11 +83,10 @@ run_deepsomatic_tumor_only() {
         --model_type=${mode} \
         --ref=/work/ref/${REF_BASE} \
         --reads_tumor=/work/cache/HG002.chr20.10_10p1mb.bam \
-        --output_vcf=/work/output/docker.vcf \
+        --output_vcf=/work/output/docker.vcf.gz \
         --regions=${REGION} \
         --intermediate_results_dir=/work/tmp_${mode_lc} \
-        --num_shards=1 \
-        bgzip -f /work/output/docker.vcf
+        --num_shards=1
       tabix -f -p vcf /work/output/docker.vcf.gz
     "
 
@@ -96,10 +95,10 @@ run_deepsomatic_tumor_only() {
 
 # ── Run both modes ────────────────────────────────────────────────────────────
 
-run_deepsomatic_tumor_only "WGS"
-run_deepsomatic_tumor_only "FFPE_WGS"
+run_deepsomatic_tumor_only "WGS_TUMOR_ONLY"
+run_deepsomatic_tumor_only "FFPE_WGS_TUMOR_ONLY"
 
 echo ""
 echo "==> Capture complete."
-echo "  WGS tumor-only:      ${OUT_BASE}/wgs/docker.vcf.gz"
-echo "  FFPE_WGS tumor-only: ${OUT_BASE}/ffpe_wgs/docker.vcf.gz"
+echo "  WGS tumor-only:      ${OUT_BASE}/wgs_tumor_only/docker.vcf.gz"
+echo "  FFPE_WGS tumor-only: ${OUT_BASE}/ffpe_wgs_tumor_only/docker.vcf.gz"
