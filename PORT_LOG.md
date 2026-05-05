@@ -1554,7 +1554,18 @@ flow. True parity validation requires real PacBio/ONT BAMs (~5 GB from GIAB/SRA)
 
 ### WGS temperature calibration — conclusion
 
-Scanned T ∈ {0.6, 0.7, 0.8, 0.9, 1.0} on full chr20 HG002. Results:
+**Critical caveat:** temperature scan runs did not specify `--small_model_path`,
+so small_model_hits=0 for all runs. Docker's `run_deepvariant --model_type=WGS`
+always uses the small model (277/313 candidates in chr20:10M-10.1M = 88%
+handled by small model). The PASS counts are therefore not comparable to Docker.
+To compare correctly, run native with `--small_model_path=<wgs_small_weights>`.
+
+Confirmed: WGS + small model on chr20:10M-10.1M → **0 FM** (Phase 5.5d gate
+still holds). Temperature calibration infrastructure stays as opt-in `--enable_temp_scaling`
+flag; no temperature value improves FILTER parity (PASS count changes were
+all within the small-model-disabled range and not relevant to production runs).
+
+Scanned T ∈ {0.6, 0.7, 0.8, 0.9, 1.0} on full chr20 HG002 WITHOUT small model. Results:
 
 | T   | PASS    | RefCall | NoCall  |
 |-----|---------|---------|---------|
