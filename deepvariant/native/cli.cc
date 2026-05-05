@@ -336,6 +336,21 @@ static TrioDims TrioInputDims(const std::string& model_type) {
   return                     {140, 140, 7, 221};  // WGS default
 }
 
+// GermlineInputDims — call_variants input shape for single-sample germline.
+// Source: tools/conversion/models/<model>/model.example_info.json shape field.
+// Height is always 100 for germline models.
+struct GermlineDims { int channels; int width; };
+static GermlineDims GermlineInputDims(const std::string& model_type) {
+  std::string mt = model_type;
+  for (char& c : mt) c = static_cast<char>(std::toupper(c));
+  if (mt == "PACBIO")                             return {10, 147}; // base8+alt2
+  if (mt == "ONT")                                return {10, 199}; // base8+alt2
+  if (mt == "MASSEQ")                             return { 9, 199}; // base7+alt2
+  if (mt == "HYBRID_PACBIO_ILLUMINA" ||
+      mt == "HYBRID" || mt == "RNASEQ")           return { 6, 221}; // BASE_CHANNELS
+  return                                                 { 7, 221}; // WGS/WES default
+}
+
 // SomaticInputDims — call_variants input shape per model_type × has_normal.
 // Source: deepsomatic.<model>[_tumor_only]/model.example_info.json shape field.
 struct SomaticDims { int h; int channels; int width; };
@@ -642,12 +657,15 @@ int RunAll(int argc, char** argv) {
   // ── Stage 2: call_variants ────────────────────────────────────────────────
   LOG(INFO) << "Stage 2: call_variants";
   {
+    const GermlineDims gdims = GermlineInputDims(model_type);
     std::vector<std::string> cv_args = {
         absl::StrCat("--examples=", examples_pattern),
         absl::StrCat("--outfile=", cvo_pattern),
         absl::StrCat("--checkpoint=", model_path),
         absl::StrCat("--batch_size=", EffectiveBatchSize()),
         absl::StrCat("--inference_backend=", inference_backend),
+        absl::StrCat("--input_channels=", gdims.channels),
+        absl::StrCat("--input_width=", gdims.width),
     };
     AppendAneSpeculateArgs(cv_args, inference_backend,
                            absl::GetFlag(FLAGS_ane_speculate_metal_checkpoint));

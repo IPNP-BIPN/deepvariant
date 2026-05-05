@@ -63,7 +63,10 @@ ABSL_FLAG(int, input_height, 100,
           "(60 child + 2x40 parent), pangenome=100, etc.");
 ABSL_FLAG(int, input_channels, 7,
           "Pileup-image channels for the Metal backend. WGS/Trio=7, "
-          "pangenome=9.");
+          "PacBio/ONT germline=10, MaSeq=9, Hybrid/RNASeq=6.");
+ABSL_FLAG(int, input_width, 221,
+          "Pileup-image width for the Metal backend. WGS/WES/MaSeq=221, "
+          "PacBio=147, ONT=199.");
 ABSL_FLAG(std::string, inference_backend, "metal",
           "Inference backend: metal (default, MPSGraph + BNNS-CPU .dvw — "
           "GPU FP32 on Apple Silicon), coreml (Core ML .mlpackage — ANE "
@@ -274,7 +277,7 @@ int RunCallVariants(int argc, char** argv) {
     // MPSGraph placeholder is built with the right shape. Defaults
     // (100×221×7) match WGS; trio passes 140 via --input_height.
     H = absl::GetFlag(FLAGS_input_height);
-    W = 221;
+    W = absl::GetFlag(FLAGS_input_width);
     C = absl::GetFlag(FLAGS_input_channels);
     K = 3;
     metal_model = MetalInception::Create(checkpoint_path, H, C);
@@ -302,7 +305,7 @@ int RunCallVariants(int argc, char** argv) {
     }
     LOG(INFO) << "Loading ane_speculate GPU rerun:   " << metal_ckpt;
     H = absl::GetFlag(FLAGS_input_height);
-    W = 221;
+    W = absl::GetFlag(FLAGS_input_width);
     C = absl::GetFlag(FLAGS_input_channels);
     K = 3;
     metal_model = MetalInception::Create(metal_ckpt, H, C);
