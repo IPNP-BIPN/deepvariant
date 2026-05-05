@@ -114,6 +114,8 @@ ABSL_DECLARE_FLAG(std::string, examples_tumor);
 ABSL_DECLARE_FLAG(std::string, examples_normal);
 ABSL_DECLARE_FLAG(std::string, small_model_path_somatic);
 ABSL_DECLARE_FLAG(std::string, population_vcfs);
+ABSL_DECLARE_FLAG(double, vsc_max_fraction_snps_for_non_target_sample);
+ABSL_DECLARE_FLAG(double, vsc_max_fraction_indels_for_non_target_sample);
 ABSL_DECLARE_FLAG(std::string, small_model_cvo_outfile_tumor);
 ABSL_DECLARE_FLAG(int, pileup_image_height_tumor);
 ABSL_DECLARE_FLAG(int, pileup_image_height_normal);
@@ -439,6 +441,8 @@ static void ApplySomaticModelFlags(const std::string& model_type,
     me_args.push_back("--small_model_snp_gq_threshold=60");
     me_args.push_back("--small_model_indel_gq_threshold=57");
     me_args.push_back("--small_model_vaf_context_window_size=51");
+    me_args.push_back("--vsc_max_fraction_snps_for_non_target_sample=0.5");
+    me_args.push_back("--vsc_max_fraction_indels_for_non_target_sample=0.5");
   } else if (mt == "ONT") {
     me_args.push_back("--pileup_image_width=99");
     me_args.push_back("--channel_list_preset=MASSEQ");
@@ -455,7 +459,18 @@ static void ApplySomaticModelFlags(const std::string& model_type,
     me_args.push_back("--small_model_snp_gq_threshold=51");
     me_args.push_back("--small_model_indel_gq_threshold=56");
     me_args.push_back("--small_model_vaf_context_window_size=51");
+    me_args.push_back("--vsc_max_fraction_snps_for_non_target_sample=0.5");
+    me_args.push_back("--vsc_max_fraction_indels_for_non_target_sample=0.5");
   } else if (mt == "FFPE_WGS" || mt == "FFPE_WES") {
+    me_args.push_back("--vsc_min_fraction_snps=0.029");
+    me_args.push_back("--vsc_min_fraction_indels=0.05");
+    me_args.push_back("--small_model_snp_gq_threshold=53");
+    me_args.push_back("--small_model_indel_gq_threshold=36");
+    me_args.push_back("--small_model_vaf_context_window_size=51");
+  } else if (mt == "FFPE_WGS" || mt == "FFPE_WES") {
+    // FFPE tumor+normal: no vsc_max_fraction_for_non_target_sample (not in JSON).
+    // Docker FFPE generates all germline-het candidates and GERMLINE-labels them
+    // in postprocess; applying the 0.5 cap would skip those candidates silently.
     me_args.push_back("--vsc_min_fraction_snps=0.029");
     me_args.push_back("--vsc_min_fraction_indels=0.05");
     me_args.push_back("--small_model_snp_gq_threshold=53");
@@ -468,6 +483,9 @@ static void ApplySomaticModelFlags(const std::string& model_type,
     me_args.push_back("--small_model_snp_gq_threshold=31");
     me_args.push_back("--small_model_indel_gq_threshold=29");
     me_args.push_back("--small_model_vaf_context_window_size=51");
+    // WGS/WES declare vsc_max_fraction_*_for_non_target_sample=0.5 in JSON.
+    me_args.push_back("--vsc_max_fraction_snps_for_non_target_sample=0.5");
+    me_args.push_back("--vsc_max_fraction_indels_for_non_target_sample=0.5");
   }
 }
 
