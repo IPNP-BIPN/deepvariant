@@ -280,7 +280,7 @@ int RunCallVariants(int argc, char** argv) {
     W = absl::GetFlag(FLAGS_input_width);
     C = absl::GetFlag(FLAGS_input_channels);
     K = 3;
-    metal_model = MetalInception::Create(checkpoint_path, H, C);
+    metal_model = MetalInception::Create(checkpoint_path, H, C, W);
     metal_finalize = BnnsFinalize::Create(checkpoint_path);
     if (!metal_model || !metal_finalize) {
       LOG(ERROR) << "Failed to load Metal/BNNS model: " << checkpoint_path;
@@ -308,7 +308,7 @@ int RunCallVariants(int argc, char** argv) {
     W = absl::GetFlag(FLAGS_input_width);
     C = absl::GetFlag(FLAGS_input_channels);
     K = 3;
-    metal_model = MetalInception::Create(metal_ckpt, H, C);
+    metal_model = MetalInception::Create(metal_ckpt, H, C, W);
     metal_finalize = BnnsFinalize::Create(metal_ckpt);
     if (!metal_model || !metal_finalize) {
       LOG(ERROR) << "Failed to load .dvw fallback bundle: " << metal_ckpt;

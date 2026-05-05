@@ -616,9 +616,12 @@ struct DetLayer {
 
 struct MetalInception::Impl {
   std::unique_ptr<DvwWeights> weights;
-  // Input shape parameters: NHWC, Width fixed at 221.
-  // WGS: H=100 C=7. DeepTrio WGS: H=140 C=7. Pangenome: H=100 C=9.
+  // Input shape parameters: NHWC.
+  // WGS: H=100 W=221 C=7. DeepTrio WGS: H=140 W=221 C=7.
+  // PacBio: H=100 W=147 C=10. ONT: H=100 W=199 C=10.
+  // Somatic PacBio TN: H=200 W=147 C=9.
   int input_height = 100;
+  int input_width = 221;
   int input_channels = 7;
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> queue = nil;
@@ -688,10 +691,12 @@ bool MetalInception::IsGpuFinalize() const {
 std::unique_ptr<MetalInception> MetalInception::Create(
     const std::string& dvw_path,
     int input_height,
-    int input_channels) {
+    int input_channels,
+    int input_width) {
   auto self = std::unique_ptr<MetalInception>(new MetalInception());
   auto& I = *self->impl_;
   I.input_height = input_height;
+  I.input_width = input_width;
   I.input_channels = input_channels;
 
   // Phase 5.5f: read DV_METAL_UNFOLDED_BN before any graph stages are
@@ -752,7 +757,7 @@ std::unique_ptr<MetalInception> MetalInception::Create(
   // Height/channels parameterized at construction (WGS=100/7, trio=140/7).
   I.input = [I.graph placeholderWithShape:@[@-1,
                                               @(I.input_height),
-                                              @221,
+                                              @(I.input_width),
                                               @(I.input_channels)]
                                   dataType:MPSDataTypeFloat32
                                       name:@"input_nhwc"];
@@ -1367,7 +1372,7 @@ bool MetalInception::PredictAtTap(const std::string& tap_name,
     MPSGraphExecutable* exe = I.execCache[tap_ns];
     if (!exe) {
       MPSShape* in_shape =
-          @[@(batch_size), @(I.input_height), @221, @(I.input_channels)];
+          @[@(batch_size), @(I.input_height), @(I.input_width), @(I.input_channels)];
       MPSGraphShapedType* in_st =
           [[MPSGraphShapedType alloc] initWithShape:in_shape
                                             dataType:MPSDataTypeFloat32];
@@ -1388,13 +1393,13 @@ bool MetalInception::PredictAtTap(const std::string& tap_name,
 
     // Wrap input as MPSGraphTensorData.
     const NSUInteger n_in = (NSUInteger)batch_size *
-        I.input_height * 221 * I.input_channels;
+        I.input_height * I.input_width * I.input_channels;
     NSData* in_data = [NSData dataWithBytes:input
                                      length:n_in * sizeof(float)];
     MPSGraphTensorData* in_td = [[MPSGraphTensorData alloc]
         initWithDevice:[MPSGraphDevice deviceWithMTLDevice:I.device]
                   data:in_data
-                 shape:@[@(batch_size), @(I.input_height), @221,
+                 shape:@[@(batch_size), @(I.input_height), @(I.input_width),
                           @(I.input_channels)]
               dataType:MPSDataTypeFloat32];
 
