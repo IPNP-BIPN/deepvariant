@@ -902,6 +902,11 @@ int RunAllTrio(int argc, char** argv) {
     }
     // Per-model pileup/read flags from example_info.json.
     ApplyModelFlags(model_type, me_args);
+    // Trio vaf_context_window override: run_deeptrio.py never sets
+    // small_model_vaf_context_window_size, so ALL trio models use the default
+    // (5). ApplyModelFlags(WGS/PacBio/ONT) sets 51 (germline default), which
+    // differs from run_deeptrio.py. Restore the default here (Abseil last-wins).
+    me_args.push_back("--small_model_vaf_context_window_size=5");
     // Per-model pileup heights for trio (per-sample, stacked in make_examples).
     // WGS/PacBio: child=60 parent=40 → total 140. WES/ONT: child=100 parent=100
     // → total 300. make_examples defaults to 60/40 (WGS); override for others.
@@ -923,13 +928,30 @@ int RunAllTrio(int argc, char** argv) {
       std::string mt = model_type;
       for (char& c : mt) c = static_cast<char>(std::toupper(c));
       if (mt == "PACBIO" || mt == "ONT") {
-        // DeepTrio PacBio/ONT use MASSEQ preset (7ch) + alt-aligned (9ch total)
-        // with width=199, matching model.example_info.json shape [140,199,9] /
-        // [300,199,9]. ApplyModelFlags (germline) sets LONG_READ_PACBIO (8ch,
-        // width=147) — override both.
+        // DeepTrio PacBio/ONT: channel/width overrides + trio-specific flags
+        // from run_deeptrio.py (different from germline ApplyModelFlags values).
+        // Abseil last-wins: these override ApplyModelFlags(PACBIO/ONT) values.
         me_args.push_back("--pileup_image_width=199");
         me_args.push_back("--channel_list_preset=MASSEQ");
         me_args.push_back("--alt_aligned_pileup=diff_channels");
+        // Trio uses max_reads_for_dynamic_bases_per_region=200, not 1500
+        // (run_deeptrio.py:682, 705 — germline uses 1500 via MASSEQ block).
+        me_args.push_back("--max_reads_for_dynamic_bases_per_region=200");
+        // discard_non_dna_regions=true is in run_deeptrio.py but not yet
+        // implemented as an ABSL_FLAG in make_examples_main.cc (proto field 56
+        // exists). Minor effect on standard chr1-22/X/Y; relevant for alt
+        // contigs. TODO: add ABSL_FLAG + N-region filter when adding alt-contig
+        // support.
+      }
+      if (mt == "ONT") {
+        // ONT trio overrides vs germline ONT:
+        //   min_mapping_quality=5 (germline uses 1)
+        //   max_reads_per_partition=500 (germline uses 1500)
+        //   vsc_min_fraction_indels=0.12 (germline uses 0.1)
+        // Source: run_deeptrio.py:688-706
+        me_args.push_back("--min_mapping_quality=5");
+        me_args.push_back("--max_reads_per_partition=500");
+        me_args.push_back("--vsc_min_fraction_indels=0.12");
       }
     }
     // DeepTrio threshold overrides (upstream scripts/run_deeptrio.py).
