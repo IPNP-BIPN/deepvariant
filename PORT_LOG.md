@@ -1669,11 +1669,13 @@ multi-allelic variants, and repetitive sequences. Two effects combine:
    small-model dispatch at 21 sites and produces 1 additional FM where both
    tools use the small model but get different answers.
 
-### Shard count is not the cause
+### Shard count is not the cause (doubly confirmed)
 
-`--num_shards=1` and `--num_shards=14` on chr20 produce **identical** VCFs
-(0 FM between them). Reservoir sampling is seeded by region coordinates, not
-shard ID — sharding is not relevant.
+1. `--num_shards=1` and `--num_shards=14` on chr20 produce **identical** native
+   VCFs (0 FM between them). Reservoir sampling is seeded by region coordinates.
+2. Docker re-run with `--regions=chr20 --num_shards=14` (exactly matching our
+   native shard setup) produces the **identical 428 FM** as the old full-genome
+   Docker VCF. This definitively rules out any shard-boundary effect.
 
 ### Updated Homebrew ship gate
 
