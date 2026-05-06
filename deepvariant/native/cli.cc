@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <fstream>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <vector>
 
@@ -250,7 +251,9 @@ static void ApplyModelFlags(const std::string& model_type,
     me_args.push_back("--channel_list_preset=LONG_READ_PACBIO");
     me_args.push_back("--small_model_use_haplotypes=true");  // 106-feature model
     me_args.push_back("--min_mapping_quality=1");
-    me_args.push_back("--min_base_quality=1");
+    // min_base_quality intentionally NOT set for PacBio: Docker's
+    // pacbio/model.example_info.json does not include this flag, so the
+    // default (10) applies. ONT sets 1 explicitly; PacBio does not.
     me_args.push_back("--max_reads_per_partition=1500");
     me_args.push_back("--partition_size=25000");
     me_args.push_back("--sort_by_haplotypes=true");
@@ -478,8 +481,9 @@ static void ApplySomaticModelFlags(const std::string& model_type,
     me_args.push_back("--small_model_snp_gq_threshold=51");
     me_args.push_back("--small_model_indel_gq_threshold=56");
     me_args.push_back("--small_model_vaf_context_window_size=51");
-    me_args.push_back("--vsc_max_fraction_snps_for_non_target_sample=0.5");
-    me_args.push_back("--vsc_max_fraction_indels_for_non_target_sample=0.5");
+    // ONT uses 0.6 (not 0.5 like PacBio/WGS) per deepsomatic/ont/model.example_info.json
+    me_args.push_back("--vsc_max_fraction_snps_for_non_target_sample=0.6");
+    me_args.push_back("--vsc_max_fraction_indels_for_non_target_sample=0.6");
   } else if (mt == "FFPE_WGS" || mt == "FFPE_WES") {
     me_args.push_back("--vsc_min_fraction_snps=0.029");
     me_args.push_back("--vsc_min_fraction_indels=0.05");
@@ -1133,9 +1137,28 @@ int RunAllSomatic(int argc, char** argv) {
     // Per-model flags from deepsomatic.<model>[_tumor_only]/model.example_info.json.
     ApplySomaticModelFlags(model_type, has_normal, me_args);
     // Tumor-only: forward PON VCF path for allele_frequency channel encoding.
-    {
-      const std::string pon = absl::GetFlag(FLAGS_population_vcfs);
-      if (!has_normal && !pon.empty()) {
+    // Priority: explicit --population_vcfs flag > auto-discovered from
+    // DEEPVARIANT_MODELS_DIR. Auto-discovery picks the correct PON per model:
+    //   PACBIO/ONT → AF_pacbio_PON_CoLoRSdb.GRCh38.AF0.05.vcf.gz
+    //   WGS/WES/FFPE_* → AF_ilmn_PON_DeepVariant.GRCh38.AF0.05.vcf.gz
+    if (!has_normal) {
+      std::string pon = absl::GetFlag(FLAGS_population_vcfs);
+      if (pon.empty()) {
+        // Auto-discover PON from models directory.
+        const char* env = std::getenv("DEEPVARIANT_MODELS_DIR");
+        std::string models_dir = env ? env : "/opt/homebrew/share/deepvariant-models";
+        std::string mt_up = model_type;
+        for (char& c : mt_up) c = static_cast<char>(std::toupper(c));
+        const bool is_long_read = (mt_up == "PACBIO" || mt_up == "ONT");
+        const std::string pon_name = is_long_read
+            ? "AF_pacbio_PON_CoLoRSdb.GRCh38.AF0.05.vcf.gz"
+            : "AF_ilmn_PON_DeepVariant.GRCh38.AF0.05.vcf.gz";
+        pon = absl::StrCat(models_dir, "/deepsomatic_pon/", pon_name);
+        // Only use auto-discovered path if file exists.
+        struct stat st;
+        if (stat(pon.c_str(), &st) != 0) pon.clear();
+      }
+      if (!pon.empty()) {
         me_args.push_back(absl::StrCat("--population_vcfs=", pon));
       }
     }
