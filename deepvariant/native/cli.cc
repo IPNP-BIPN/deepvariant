@@ -115,6 +115,7 @@ ABSL_DECLARE_FLAG(std::string, examples_tumor);
 ABSL_DECLARE_FLAG(std::string, examples_normal);
 ABSL_DECLARE_FLAG(std::string, small_model_path_somatic);
 ABSL_DECLARE_FLAG(std::string, population_vcfs);
+ABSL_DECLARE_FLAG(std::string, pon_filtering);
 ABSL_DECLARE_FLAG(double, vsc_max_fraction_snps_for_non_target_sample);
 ABSL_DECLARE_FLAG(double, vsc_max_fraction_indels_for_non_target_sample);
 ABSL_DECLARE_FLAG(bool,   sort_by_alt_allele_support_somatic);
@@ -1246,6 +1247,16 @@ int RunAllSomatic(int argc, char** argv) {
         absl::StrCat("--output_vcf_outfile=", out_vcf),
         "--process_somatic=true",
     };
+    // pon_filtering: forward user flag, otherwise stay empty (matches
+    // upstream's --use_default_pon_filtering=False default; auto-default
+    // is opt-in via --use_default_pon_filtering=true OR by setting
+    // --pon_filtering explicitly).
+    {
+      const std::string user_pon = absl::GetFlag(FLAGS_pon_filtering);
+      if (!user_pon.empty()) {
+        pp_args.push_back(absl::StrCat("--pon_filtering=", user_pon));
+      }
+    }
     auto argv_pp = MakeArgv("deepvariant_postprocess", pp_args);
     int n = static_cast<int>(argv_pp.size()) - 1;
     if (int rc = RunPostprocessVariants(n, argv_pp.data()); rc != 0) {
