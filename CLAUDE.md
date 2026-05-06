@@ -55,22 +55,37 @@ If any of the following happen, stop, write a report in `PORT_LOG.md`, and surfa
 - After **Phase 3** first end-to-end native run — first real VCF produced.
 - After **Phase 4** validation — release go/no-go.
 
-## Where the project actually stands (rolling status)
+## Where the project actually stands (rolling status, 2026-05-06)
 
-Phases 0–6 done (last updated 2026-05-06). Phase 7 (virgin-machine matrix) not started — needs physical M1/M2/M3/M4 hardware. Phase 9 (DV-base feature completion) done. Honest backlog tracked in `PORT_LOG.md`. Effort estimates below (updated to reflect done vs remaining):
+**Phases 0–6 done. Phase 9 (DV-base feature completion) done. Phase 7 (virgin-machine matrix) pending — needs physical M1/M2/M3/M4 hardware.**
 
-- DeepTrio orchestration (3-BAM make_examples, 6-channel pileup): ~1 wk
-- DeepSomatic orchestration (tumor + normal, somatic filtering): ~1-2 wk
-- Pangenome-aware (12-channel + GBZ reader): ~1 wk
-- gVCF blocks (`--output_gvcf` impl): ~3 d
-- DirectPhasing wired in: ~3 d
-- Alt-aligned pileup (PacBio/ONT): ~2 d
-- Methylation channels: ~2 d
-- GIAB hap.py F1 validation: ~1 wk
-- Code signing + notarization scripts: ~2 d
-- Homebrew formulas (`deepvariant`, `deepvariant-models`): ~2 d
-- Virgin-machine M1/M2/M3/M4 matrix: ~2 d
-- Closing the WGS chr20 16% VCF delta to >99%: ~1 wk
+### Release gates — current status
+
+| Gate | Threshold | Status |
+|------|-----------|--------|
+| SNP F1 vs Docker (HG002 WG) | ≥ Docker − 0.05 % | ✅ **Δ = 0** (0.996440 = Docker, commit f9364c2d) |
+| INDEL F1 vs Docker (HG002 WG) | ≥ Docker − 0.10 % | ✅ **Δ = 0** (0.995766 = Docker, commit f9364c2d) |
+| FILTER parity: chr20:10M-10.1M | 0 FM | ✅ **0 FM** (313/313 shared, re-confirmed 2026-05-06) |
+| FILTER parity: full chr20 | ≤ 0.25 % FM | ✅ **0.20 %** (428/210,179, all FP32-drift) |
+| GPU truly engaged | powermetrics > 0 | ✅ (verified Phase 5.5a) |
+| Wall-time speedup vs Docker/Rosetta | ≥ 2.5× | ⚠️ **1.84× at WG** (Docker is running under Rosetta, not native Linux — compare to Linux x86 is TBD) |
+| All 23 pipeline modes run | no crash | ✅ (proxy-tested 2026-05-06) |
+| Docker FILTER parity: 14 modes | 0 FM on chr20:10M-10.1M | ✅ all 14 Illumina short-read modes at 0 FM |
+
+### What still needs external resources
+
+- **PacBio/ONT parity validation** (9 modes): needs GIAB PacBio + ONT chr20 BAMs (~5 GB each). Pipeline shapes are correct (proxy-tested). Scientific validation deferred.
+- **Virgin-machine matrix** (Phase 7): needs M1/M2/M3/M4 hardware.
+- **Code signing + notarization**: needs Apple Developer account.
+- **GLnexus native packaging**: blocked by upstream deleted `fcmm` dependency.
+
+### Previously estimated backlog — now done
+
+All previously listed items are done:
+✅ DeepTrio orchestration · ✅ DeepSomatic orchestration · ✅ Pangenome-aware ·
+✅ gVCF blocks · ✅ DirectPhasing · ✅ Alt-aligned pileup · ✅ Methylation channels ·
+✅ GIAB hap.py F1 validation (WG, 2026-05-02) · ✅ Homebrew formulas ·
+✅ Closing WGS chr20 VCF delta (0 FM on chr20:10M-10.1M; 0.20 % on full chr20)
 
 A claim "near release-ready" requires those gates met, not just a
 working WGS pipeline at 84% match.
