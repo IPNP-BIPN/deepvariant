@@ -125,6 +125,10 @@ ABSL_FLAG(std::string, regions, "",
           " Empty = all contigs.");
 ABSL_FLAG(std::string, exclude_regions, "",
           "Whitespace-separated regions to exclude.");
+ABSL_FLAG(bool, discard_non_dna_regions, false,
+          "If true, exclude reference regions containing only N bases from "
+          "processing. Mirrors upstream make_examples_core.py:3382. Effective "
+          "when --regions is not also set; matches Python semantics.");
 ABSL_FLAG(int, task_id, 0, "0-based shard index.");
 ABSL_FLAG(int, num_shards, 0,
           "Total shards. 0 or 1 means no sharding.");

@@ -937,11 +937,10 @@ int RunAllTrio(int argc, char** argv) {
         // Trio uses max_reads_for_dynamic_bases_per_region=200, not 1500
         // (run_deeptrio.py:682, 705 — germline uses 1500 via MASSEQ block).
         me_args.push_back("--max_reads_for_dynamic_bases_per_region=200");
-        // discard_non_dna_regions=true is in run_deeptrio.py but not yet
-        // implemented as an ABSL_FLAG in make_examples_main.cc (proto field 56
-        // exists). Minor effect on standard chr1-22/X/Y; relevant for alt
-        // contigs. TODO: add ABSL_FLAG + N-region filter when adding alt-contig
-        // support.
+        // discard_non_dna_regions: matches run_deeptrio.py:682,705. Flag now
+        // declared in make_examples_main.cc; runtime N-region filter is a
+        // future enhancement but the flag must be set for parity.
+        me_args.push_back("--discard_non_dna_regions=true");
       }
       if (mt == "ONT") {
         // ONT trio overrides vs germline ONT:
