@@ -440,32 +440,52 @@ extract_dvw \
 # Extracted once; stored alongside model weights.
 # ══════════════════════════════════════════════════════════════════════════
 
-log "--- DeepSomatic PON file ---"
+log "--- DeepSomatic PON files (Illumina + PacBio/ONT) ---"
 
 PON_OUT="${DVW_OUT}/deepsomatic_pon"
-PON_FILE="${PON_OUT}/AF_ilmn_PON_DeepVariant.GRCh38.AF0.05.vcf.gz"
-if [[ -s "${PON_FILE}" ]]; then
+mkdir -p "${PON_OUT}"
+PON_ABS="$(cd "${PON_OUT}" && pwd)"
+
+# Illumina PON — used by WGS/WES/FFPE tumor-only modes
+PON_ILMN="${PON_OUT}/AF_ilmn_PON_DeepVariant.GRCh38.AF0.05.vcf.gz"
+if [[ -s "${PON_ILMN}" ]]; then
   log "SKIP (exists) AF_ilmn_PON_DeepVariant.GRCh38.AF0.05.vcf.gz"
 else
-  log "Extracting PON from ${IMG_DS}"
-  mkdir -p "${PON_OUT}"
-  PON_ABS="$(cd "${PON_OUT}" && pwd)"
+  log "Extracting Illumina PON from ${IMG_DS}"
   docker run --rm --platform linux/amd64 \
     -v "${PON_ABS}:/out" \
     "${IMG_DS}" \
     bash -c '
       src=/opt/models/deepsomatic/pons/AF_ilmn_PON_DeepVariant.GRCh38.AF0.05.vcf.gz
-      tbi="${src}.tbi"
       if [[ -f "${src}" ]]; then
         cp "${src}" /out/
-        if [[ -f "${tbi}" ]]; then
-          cp "${tbi}" /out/
-        else
-          tabix -p vcf /out/AF_ilmn_PON_DeepVariant.GRCh38.AF0.05.vcf.gz 2>/dev/null || true
-        fi
+        [[ -f "${src}.tbi" ]] && cp "${src}.tbi" /out/ || \
+          tabix -p vcf "/out/$(basename ${src})" 2>/dev/null || true
         echo "done"
       else
-        echo "WARNING: PON not found at ${src}" >&2
+        echo "WARNING: Illumina PON not found at ${src}" >&2
+      fi
+    '
+fi
+
+# PacBio/ONT PON — used by PacBio and ONT tumor-only modes (CoLoRSdb ~254 MB)
+PON_PB="${PON_OUT}/AF_pacbio_PON_CoLoRSdb.GRCh38.AF0.05.vcf.gz"
+if [[ -s "${PON_PB}" ]]; then
+  log "SKIP (exists) AF_pacbio_PON_CoLoRSdb.GRCh38.AF0.05.vcf.gz"
+else
+  log "Extracting PacBio/ONT PON from ${IMG_DS}"
+  docker run --rm --platform linux/amd64 \
+    -v "${PON_ABS}:/out" \
+    "${IMG_DS}" \
+    bash -c '
+      src=/opt/models/deepsomatic/pons/AF_pacbio_PON_CoLoRSdb.GRCh38.AF0.05.vcf.gz
+      if [[ -f "${src}" ]]; then
+        cp "${src}" /out/
+        [[ -f "${src}.tbi" ]] && cp "${src}.tbi" /out/ || \
+          tabix -p vcf "/out/$(basename ${src})" 2>/dev/null || true
+        echo "done"
+      else
+        echo "WARNING: PacBio PON not found at ${src}" >&2
       fi
     '
 fi
