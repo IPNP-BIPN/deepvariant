@@ -1692,3 +1692,74 @@ F1 is unaffected: **SNP F1 = 0.997402, INDEL F1 = 0.995985**
 (within gate thresholds; both PASS and non-PASS classification are accurate
 at medically relevant positions outside the pericentromeric zone).
 
+## 2026-05-07 — Comprehensive flag audit + pon_filtering feature
+
+Final flag audit pass against upstream `model.example_info.json`,
+`run_deeptrio.py`, and `run_deepsomatic.py`. Six bugs found and fixed:
+
+1. **PacBio germline**: removed erroneous `--min_base_quality=1`. Docker's
+   pacbio JSON does not set this flag; default (10) applies. ONT keeps
+   `min_base_quality=1` (Docker sets it explicitly).
+2. **Somatic ONT TN**: `vsc_max_fraction_*_for_non_target_sample` corrected
+   from 0.5 to **0.6** (Docker's ONT-specific value).
+3. **PON auto-discovery**: cli.cc now picks the correct tumor-only PON
+   from `DEEPVARIANT_MODELS_DIR/deepsomatic_pon/`: PacBio/ONT →
+   `AF_pacbio_PON_CoLoRSdb`; others → `AF_ilmn_PON_DeepVariant`.
+4. **Somatic WGS_TO/WES_TO**: added `vsc_max_fraction_*=0.5` (declared in
+   their JSONs; FFPE_TO modes do not declare it).
+5. **FFPE_WGS TN dead-code branch**: previous `else if (FFPE_WGS||FFPE_WES)`
+   caught FFPE_WGS before its dedicated branch could set
+   `sort_by_alt_allele_support=true`. Separated into distinct branches.
+6. **DeepTrio PacBio/ONT trio-specific flags**: added trio overrides not
+   in germline `ApplyModelFlags`:
+   - `max_reads_for_dynamic_bases_per_region=200` (germline PACBIO uses 1500)
+   - ONT trio: `min_mapping_quality=5`, `max_reads_per_partition=500`,
+     `vsc_min_fraction_indels=0.12` (different from germline ONT)
+   - All trio: `--small_model_vaf_context_window_size=5` reset
+     (run_deeptrio.py never sets this; default is 5; germline sets 51)
+
+### New features added this session
+- `--discard_non_dna_regions` flag declared in make_examples_main.cc
+  (mirrors upstream proto field 56). Default false; trio override sets
+  true to match run_deeptrio.py. Runtime N-region filter is a future
+  enhancement (only affects alt contigs).
+- `--pon_filtering` flag in postprocess_main.cc. Reads PON VCF via
+  `nucleus::VcfReader::Query`, tags matching PASS variants as PON,
+  adds PON line to FILTER header when active.
+- `extract_all_model_weights.sh` extracts both Illumina and PacBio PON
+  files (~111 MB + ~254 MB).
+
+### FILTER-class parity matrix on chr20:10M-10.1M (final)
+
+| Mode                          | shared | only_d | only_o | FM |
+|-------------------------------|-------:|-------:|-------:|---:|
+| Germline WGS + small_model    |    313 |      0 |      0 | **0** |
+| Germline WES                  |    313 |      0 |      0 | **0** |
+| DeepTrio WGS (HG002)          |    372 |      0 |      0 | **1** † |
+| DeepTrio WGS (HG003)          |    368 |      0 |      0 | **2** † |
+| DeepTrio WGS (HG004)          |    339 |      0 |      0 | **0** |
+| DeepSomatic WGS TN            |    687 |      6 |      6 | **0** |
+| DeepSomatic WES TN            |    693 |      0 |      0 | **0** |
+| DeepSomatic FFPE_WGS TN       |    813 |      2 |      2 | **0** |
+| DeepSomatic FFPE_WES TN       |    815 |      0 |      0 | **0** |
+| DeepSomatic WGS TO            |    723 |      0 |      0 | **0** |
+| DeepSomatic WES TO            |    723 |      0 |      0 | **0** |
+| DeepSomatic FFPE_WGS TO       |    723 |      0 |      0 | **0** |
+| DeepSomatic FFPE_WES TO       |    723 |      0 |      0 | **0** |
+| Pangenome WGS (earlier)       |    322 |      0 |      0 | **0** |
+
+† DeepTrio WGS 1+2+0 FM are RefCall↔NoCall swaps from BNNS-CPU vs
+TF/Keras 1-GQ-unit differences in the small model. Zero PASS impact.
+
+**14 short-read modes confirmed at scientific FILTER parity (0 PASS-class FM).**
+
+Modes deferred for real long-read BAMs (~5 GB each from GIAB/SRA):
+- Germline PacBio, ONT, MASSEQ, RNASEQ, HYBRID
+- DeepTrio PacBio, ONT
+- DeepSomatic PacBio TN/TO, ONT TN/TO
+
+### pon_filtering smoke test
+WGS TN somatic + `--pon_filtering=AF_ilmn_PON_*.vcf.gz` (chr20:10M-10.1M):
+24 PASS variants tagged PON (554 RefCall / 13 NoCall / 10 PASS / 24 PON
+/ 92 GERMLINE). Baseline without PON: unchanged, FM=0 vs Docker.
+
