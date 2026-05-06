@@ -43,6 +43,7 @@
 #include "third_party/nucleus/io/merge_variants.h"
 #include "third_party/nucleus/io/reference.h"
 #include "third_party/nucleus/io/variant_reader.h"
+#include "third_party/nucleus/io/vcf_reader.h"
 #include "third_party/nucleus/io/vcf_writer.h"
 #include "third_party/nucleus/protos/range.pb.h"
 #include "third_party/nucleus/protos/reference.pb.h"
@@ -80,6 +81,12 @@ ABSL_FLAG(double, qual_filter, 1.0,
 ABSL_FLAG(double, cnn_homref_call_min_gq, 20.0,
           "All CNN RefCalls whose GQ is less than this become ./. NoCall "
           "instead of 0/0 RefCall (matches upstream default 20.0).");
+ABSL_FLAG(std::string, pon_filtering, "",
+          "Optional. Only used if --process_somatic=true. Path to a Panel-of-"
+          "Normals VCF. Variants whose (CHROM,POS,REF,ALT) matches the PON have "
+          "PASS removed and FILTER set to PON. Mirrors upstream "
+          "postprocess_variants.py:--pon_filtering. Auto-discovered by cli.cc "
+          "for tumor-only modes when DEEPVARIANT_MODELS_DIR is set.");
 ABSL_FLAG(bool, process_somatic, false,
           "Enable DeepSomatic-style postprocess: heterozygous (0/1) calls "
           "are reclassified as GERMLINE 0/0 (mirrors third_party/nucleus/"
@@ -382,9 +389,19 @@ nucleus::genomics::v1::VcfHeader MakeVcfHeader(
   // Somatic-only filter: GERMLINE for non-somatic variants. Mirrors
   // upstream postprocess_variants.py:2303-2308 + dv_vcf_constants.
   if (absl::GetFlag(FLAGS_process_somatic)) {
-    auto* f = hdr.add_filters();
-    f->set_id("GERMLINE");
-    f->set_description("Non somatic variants");
+    {
+      auto* f = hdr.add_filters();
+      f->set_id("GERMLINE");
+      f->set_description("Non somatic variants");
+    }
+    // PON filter: variants present in the panel of normals.
+    // Only declared if --pon_filtering is set (mirrors upstream behavior:
+    // header field appears only when PON filtering is active).
+    if (!absl::GetFlag(FLAGS_pon_filtering).empty()) {
+      auto* f = hdr.add_filters();
+      f->set_id("PON");
+      f->set_description("Variant present in panel of normals");
+    }
   }
 
   // INFO fields.
@@ -911,6 +928,62 @@ int RunPostprocessVariants(int argc, char** argv) {
         }
       }
     }
+  }
+
+  // PON filtering pass — Phase 9 step (--pon_filtering, somatic only).
+  // Mirrors upstream postprocess_variants.py:filter_pon. For each PASS
+  // variant, look up (CHROM,POS,REF,ALT) in the PON VCF; if present,
+  // remove PASS and add FILTER=PON.
+  const std::string pon_path = absl::GetFlag(FLAGS_pon_filtering);
+  if (process_somatic && !pon_path.empty()) {
+    nucleus::genomics::v1::VcfReaderOptions pon_opts;
+    auto pon_or = nucleus::VcfReader::FromFile(pon_path, pon_opts);
+    CHECK(pon_or.ok()) << "PON open failed: " << pon_path;
+    auto pon_reader = std::move(pon_or.ValueOrDie());
+
+    int pon_hits = 0;
+    for (auto& v : variants_buffer) {
+      if (v.filter_size() == 0) continue;
+      // Only check PASS variants (untouched by GERMLINE pass).
+      bool has_pass = false;
+      for (const auto& f : v.filter()) {
+        if (f == "PASS") { has_pass = true; break; }
+      }
+      if (!has_pass) continue;
+
+      // Build query range covering this site (1bp at v.start()).
+      nucleus::genomics::v1::Range range;
+      range.set_reference_name(v.reference_name());
+      range.set_start(v.start());
+      range.set_end(v.start() + 1);
+
+      auto iter_or = pon_reader->Query(range);
+      if (!iter_or.ok()) continue;
+      auto iter = std::move(iter_or.ValueOrDie());
+
+      bool match = false;
+      nucleus::genomics::v1::Variant pv;
+      while (true) {
+        auto next_or = iter->Next(&pv);
+        if (!next_or.ok() || !next_or.ValueOrDie()) break;
+        if (pv.start() != v.start()) continue;
+        if (pv.reference_bases() != v.reference_bases()) continue;
+        // Match if any of OUR alts equal any PON alt (allow multi-allelic).
+        for (const auto& our_alt : v.alternate_bases()) {
+          for (const auto& pon_alt : pv.alternate_bases()) {
+            if (our_alt == pon_alt) { match = true; break; }
+          }
+          if (match) break;
+        }
+        if (match) break;
+      }
+      if (match) {
+        v.clear_filter();
+        v.add_filter("PON");
+        ++pon_hits;
+      }
+    }
+    LOG(INFO) << "PON filter: " << pon_hits << " variants tagged PON.";
   }
 
   if (gvcf_outfile.empty()) {
