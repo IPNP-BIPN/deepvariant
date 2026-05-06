@@ -436,11 +436,17 @@ static void ApplySomaticModelFlags(const std::string& model_type,
       me_args.push_back("--vsc_min_fraction_snps=0.05");
       me_args.push_back("--vsc_min_fraction_indels=0.1");
     } else {
-      // WGS / WES / FFPE_WGS / FFPE_WES tumor-only.
-      // All four use identical thresholds per their example_info.json files:
-      //   vsc_min_fraction_snps=0.05, vsc_min_fraction_indels=0.07.
+      // WGS/WES/FFPE_WGS/FFPE_WES tumor-only: shared vsc thresholds.
       me_args.push_back("--vsc_min_fraction_snps=0.05");
       me_args.push_back("--vsc_min_fraction_indels=0.07");
+      // WGS_TO and WES_TO declare vsc_max_fraction=0.5 in their JSON;
+      // FFPE_WGS_TO and FFPE_WES_TO do not. In tumor-only mode the
+      // "non_target" sample doesn't exist, so this is effectively a no-op,
+      // but set to match Docker's example_info.json exactly.
+      if (mt == "WGS" || mt == "WES") {
+        me_args.push_back("--vsc_max_fraction_snps_for_non_target_sample=0.5");
+        me_args.push_back("--vsc_max_fraction_indels_for_non_target_sample=0.5");
+      }
     }
     return;
   }
@@ -484,14 +490,8 @@ static void ApplySomaticModelFlags(const std::string& model_type,
     // ONT uses 0.6 (not 0.5 like PacBio/WGS) per deepsomatic/ont/model.example_info.json
     me_args.push_back("--vsc_max_fraction_snps_for_non_target_sample=0.6");
     me_args.push_back("--vsc_max_fraction_indels_for_non_target_sample=0.6");
-  } else if (mt == "FFPE_WGS" || mt == "FFPE_WES") {
-    me_args.push_back("--vsc_min_fraction_snps=0.029");
-    me_args.push_back("--vsc_min_fraction_indels=0.05");
-    me_args.push_back("--small_model_snp_gq_threshold=53");
-    me_args.push_back("--small_model_indel_gq_threshold=36");
-    me_args.push_back("--small_model_vaf_context_window_size=51");
   } else if (mt == "FFPE_WGS") {
-    // FFPE_WGS tumor+normal: sort_by_alt_allele_support=true (declared in JSON).
+    // FFPE_WGS TN: sort_by_alt_allele_support=true + small model (in JSON).
     // No vsc_max_fraction_for_non_target_sample (NOT in FFPE_WGS JSON).
     me_args.push_back("--sort_by_alt_allele_support_somatic=true");
     me_args.push_back("--vsc_min_fraction_snps=0.029");
@@ -500,7 +500,7 @@ static void ApplySomaticModelFlags(const std::string& model_type,
     me_args.push_back("--small_model_indel_gq_threshold=36");
     me_args.push_back("--small_model_vaf_context_window_size=51");
   } else if (mt == "FFPE_WES") {
-    // FFPE_WES tumor+normal: no sort_by_alt_allele_support, no small model,
+    // FFPE_WES TN: no sort_by_alt_allele_support, no small model,
     // no vsc_max_fraction (none declared in FFPE_WES JSON).
     me_args.push_back("--vsc_min_fraction_snps=0.029");
     me_args.push_back("--vsc_min_fraction_indels=0.05");
