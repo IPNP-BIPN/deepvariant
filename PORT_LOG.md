@@ -2019,6 +2019,45 @@ This is a multi-day specialist debugging task — not feasible inline.
      CreateCombinedAllelesSupport (deterministic across platforms)
   3. Both verified byte-identical output to before (defensive only)
 
+## 2026-05-07 — Phase 9 / Step 4c: PS info field for DirectPhasing (commit fbead42f)
+
+**Status:** PS field wiring complete. Closes Phase 9 / Step 4 fully.
+
+When `--use_direct_phasing=true`, big-model candidates now emit:
+- `is_phased=true` (was Step 4b)
+- **NEW** `PS` info field = 1-based position of phase block start
+
+**Three changes:**
+1. `make_examples_main.cc:1763-1773` (trio path) + `:2236-2248` (solo path):
+   `nucleus::SetInfoField("PS", ps_id, call)` after `set_is_phased(true)`.
+2. `postprocess_main.cc:438`: declare `##FORMAT=<ID=PS,Number=1,Type=Integer,...>` in VCF header.
+3. `cli.cc`: forward `--use_direct_phasing` flag to make_examples (was missing —
+   user-passed flag was silently dropped). Both solo + trio paths.
+
+**Validation chr20:1M-2M (HG002, --use_direct_phasing=true):**
+- 2316 total records
+- **128 phased GTs** (`0|1`, `1|1`, etc.)
+- **128 records with PS** info field
+- PS IDs correctly group adjacent phased variants:
+  - PS=1115274 covers 1115274 + 1115337
+  - PS=1572410 covers 11 variants (1572410 → 1572924)
+  - New blocks correctly start at boundaries
+
+**Cross-region stitching (Step 4c.2): SKIPPED — UPSTREAM PARITY ALREADY ACHIEVED.**
+Investigation of upstream `make_examples_core.py:add_phasing_to_candidate`
+(line 2701) shows upstream uses `phase_contig = f'{task_id}-{region_number}'`
+as PS_CONTIG — also per-region, no cross-region stitching at make_examples
+level. Our positional PS (`int`) provides equivalent per-region behavior
+plus standard VCF v4.3 PS spec compliance (a small bonus over upstream's
+custom `PS_CONTIG`).
+
+**Regression check (full chr20, default `--use_direct_phasing=false`):**
+- Output **byte-identical** to e346b522 (0 lines diff excluding new PS header).
+- FM vs Docker: **428 (unchanged)** — documented baseline preserved.
+- F1 SNP=0.997402 / INDEL=0.995985 (unchanged from chr20 validation).
+
+**Default-off WGS = no-op.** Production pipeline unchanged.
+
 ### 2026-05-07 deeper trace — divergence isolated to make_examples cvo
 
 Continued the C++ trace by extracting `dump_cvo` output from BOTH
