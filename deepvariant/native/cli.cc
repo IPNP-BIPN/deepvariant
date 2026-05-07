@@ -701,7 +701,13 @@ int RunAll(int argc, char** argv) {
     }
     auto append_path = [&](const std::string& p) {
       std::ifstream in(p, std::ios::binary);
-      if (in) out << in.rdbuf();
+      if (!in) return;
+      // Read into buffer first — operator<<(streambuf*) sets failbit when
+      // the source is empty, which silently breaks ALL subsequent writes.
+      // Critical for sharded small_cvo where some shards have 0 records.
+      std::vector<char> buf((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+      if (!buf.empty()) out.write(buf.data(), buf.size());
     };
     // small_cvo: expand "@N" → per-shard files.
     auto at = small_cvo_path.find('@');
@@ -1015,7 +1021,11 @@ int RunAllTrio(int argc, char** argv) {
       }
       auto append_path = [&](const std::string& path) {
         std::ifstream in(path, std::ios::binary);
-        if (in) out << in.rdbuf();
+        if (!in) return;
+        // Same empty-streambuf failbit gotcha — see RunAllGermline note.
+        std::vector<char> buf((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        if (!buf.empty()) out.write(buf.data(), buf.size());
       };
       auto at = p.small_cvo_pattern.find('@');
       if (at == std::string::npos) {
