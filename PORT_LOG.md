@@ -1803,3 +1803,28 @@ Remaining for full DeepSomatic long-read coverage: PacBio TO + ONT TN/TO
 need real long-read tumor BAMs (synthetic somatic from HG002+HG003 is
 sufficient for parity validation but real tumor samples are not in GIAB).
 
+### Whole-genome WGS regression check (2026-05-07)
+
+Byte-level diff of chr20 portion between:
+  - 2026-05-02 WG VCF (commit f9364c2d, before this session's 12 commits)
+  - 2026-05-07 chr20-only run (commit 6da5b18f, all session fixes applied)
+
+Result: **0 lines diff** — bit-identical 210,388 records.
+
+This conclusively proves all 12 session fixes (somatic flag audit,
+DeepTrio flag audit, PON auto-discovery, --pon_filtering feature,
+--discard_non_dna_regions, CVO merge bugfix) are **byte-clean for WGS**.
+
+Therefore the WG benchmark from 2026-05-02 is preserved without
+re-running the 3.5h pipeline:
+  - SNP F1   = 0.996440 (= Docker, Δ=0)
+  - INDEL F1 = 0.995766 (= Docker, Δ=0)
+  - TP/FN/FP identical to Docker
+  - 4,146 FM / 7,706,210 shared sites = 0.054 % FM rate (WG)
+  - 99.9935 % PASS-set agreement with Docker
+
+Full chr20 (210,179 shared) post-all-fixes: same 428 FM as before.
+Confirms WGS pipeline is unchanged across all flag-audit and
+CVO-merge fixes — the fixes correctly target only somatic / PacBio /
+ONT / sparse-shard paths and never touch the standard WGS path.
+
