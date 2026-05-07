@@ -1462,6 +1462,14 @@ EncodeSmallModelFeatures produces 70. Extra 36 features encode alt-aligned
 pileup-specific stats not yet ported from upstream. Small model for PacBio/ONT
 disabled until feature encoder is extended.
 
+✅ **RESOLVED (commit a6c688a0):** ported the 12-feature
+"haplotype-expanded" block (12 base counts × N samples + 7 read-quality
+stats + 51 VAF context = 70 + 36 = 106) into
+`small_model_features.{h,cc}::EncodeHaplotypeExpandedFeatures`. Trio path
+covered separately by commit d4eb7d15. PacBio/ONT small_model is now
+enabled; B1+B2 validation 2026-05-07 confirmed PacBio SNP F1 = 1.000000
+(matches Docker exactly) when the small model is loaded.
+
 ## 2026-05-06 — Full mode coverage: MetalInception input_width + proxy tests
 
 ### Bug: MetalInception hardcoded width=221 (commit b30aa7bd)
