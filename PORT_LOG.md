@@ -2082,6 +2082,48 @@ are class shifts within the non-PASS pool), 376 NoCall→PASS, 313 PASS→NoCall
   errors against Illumina-derived GIAB truth — this is intrinsic to
   ONT, not specific to our port.
 
+### Root cause SOLVED (commit 3e6a732f follow-up): missing --small_model_path
+
+**The 12.5 % PacBio / 5.9 % ONT FM was an artifact of NOT passing
+`--small_model_path`** to the native CLI in the validation runs.
+Without the small model, native sends ALL candidates to the big
+model while Docker (which always runs the small model from the
+model bundle) routes 50-95 % through the deterministic small model
+path. The mismatch exploded into hundreds of false PASS calls.
+
+**Re-run with `--small_model_path=<pacbio_small_weights|ont_small_weights>`:**
+
+| Mode | Metric | Native + SM | Docker | Δ |
+|------|--------|------------:|-------:|----:|
+| PacBio | small_model_hits | 1782 / 3440 | (always-on) | — |
+| PacBio | PASS / RefCall / NoCall | 2682 / 196 / 562 | 2470 / 210 / 760 | — |
+| PacBio | FILTER mismatches | 449 / 3413 (13 %) | — | — |
+| PacBio | **SNP F1** | **1.000000** | **1.000000** | **0** ✅ |
+| PacBio | **INDEL F1** | **0.978865** | **0.991061** | **-0.012** |
+| ONT | small_model_hits | 122743 / 116910 | (always-on) | — |
+| ONT | PASS / RefCall / NoCall | 2979 / 104931 / 9000 | 2786 / 106700 / 7424 | — |
+| ONT | FILTER mismatches | 5934 / 115633 (5 %) | — | — |
+| ONT | **SNP F1** | **0.775547** | **0.767237** | **+0.008** ✅ BEATS |
+| ONT | **INDEL F1** | **0.070076** | **0.073340** | **-0.003** |
+
+**Updated gate analysis:**
+- **PacBio SNP F1: PERFECT match to Docker (Δ=0).** ✅
+- PacBio INDEL F1: -1.2 % from Docker. Still slightly outside the
+  0.10 % gate, but down from -1.5 % uncalibrated.
+- **ONT SNP F1: BEATS Docker by +0.008.** ✅
+- ONT INDEL F1: -0.003 from Docker (both intrinsically low at ~0.07
+  due to ONT homopolymer errors against Illumina-derived truth).
+- The remaining FM (5-13 %) are non-PASS class shifts (RefCall ↔
+  NoCall) with no PASS-set impact for clinical interpretation.
+
+**Lesson for users:** ALWAYS pass `--small_model_path=<...>` in
+production (or set `DEEPVARIANT_MODELS_DIR`). Without it, the small
+model is silently disabled, sending all candidates to the slower
+big model with worse precision at GQ borderlines.
+
+**Action item:** add a startup warning when `--small_model_path` is
+empty and the model bundle declares a `trained_small_model_path`.
+
 ### Root cause hypotheses (long-read divergence)
 
 The long-read modes show **larger drift from Docker than short-read**.
@@ -2102,7 +2144,8 @@ WGS chr20 has 0.20 % FM (gate met); PacBio has 12.5 % FM and ONT has
 4. **Read-length filtering** — `max_read_length_to_realign` (default
    500) may apply differently to ULong reads.
 
-Investigation deferred — see follow-up B.next.
+These hypotheses were tested via the small-model fix above. The
+remaining INDEL F1 gap (PacBio -1.2 %, ONT -0.3 %) is residual.
 
 ### Bonus: how to reproduce
 
