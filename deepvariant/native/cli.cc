@@ -381,6 +381,79 @@ static void MaybeAutoDiscoverTrioOrSomaticSmallModel(
   small_model_path = discovered;
 }
 
+// EnsurePathExists — early existence check for user-supplied file/dir paths.
+// Returns true (with no logging) when path is empty or `stat()` succeeds;
+// returns false + LOG(ERROR) when the path is non-empty but doesn't exist.
+//
+// Intended use: validate --reads / --ref / --checkpoint at the top of each
+// Run* dispatcher so a typo like --ref=/tmp/GRCh38.fa.bak fails in 1 ms with
+// a clear "file not found" instead of failing minutes later inside Nucleus
+// with "could not open SAM/FASTA reader" (cause obscured by the wrapper).
+//
+// Empty path is treated as "user didn't set it"; existing required-flag
+// checks (LOG(ERROR) << "... required") handle that case separately, so this
+// helper just no-ops on empty input.
+static bool EnsurePathExists(const std::string& path,
+                              const std::string& flag_name) {
+  if (path.empty()) return true;
+  struct stat st{};
+  if (::stat(path.c_str(), &st) == 0) return true;
+  LOG(ERROR) << flag_name << "=" << path
+             << " not found on disk (check the path for typos).";
+  return false;
+}
+
+// EnsureFastaIndexed — for --ref FASTA paths, confirm that an `.fai` sibling
+// exists. Nucleus's IndexedFastaReader requires it; without one, the make_
+// examples worker dies several seconds in with a generic open error. This
+// catches the missing-index case in <1 ms with an actionable message
+// pointing the user at `samtools faidx`.
+static bool EnsureFastaIndexed(const std::string& fasta_path) {
+  if (fasta_path.empty()) return true;
+  const std::string fai = absl::StrCat(fasta_path, ".fai");
+  struct stat st{};
+  if (::stat(fai.c_str(), &st) == 0) return true;
+  LOG(ERROR) << "--ref=" << fasta_path
+             << " has no .fai index (expected at " << fai
+             << "). Generate one with: samtools faidx " << fasta_path;
+  return false;
+}
+
+// EnsureBamIndexed — for --reads BAM/CRAM paths, confirm that a sibling
+// index exists (`.bai` for BAM, `.crai` for CRAM, in either samtools or
+// Picard naming). Nucleus's SamReader needs the index for region queries;
+// without one, the worker fails on the first `query()` call with a
+// confusing "no index" error from htslib.
+static bool EnsureBamIndexed(const std::string& bam_path,
+                              const std::string& flag_name) {
+  if (bam_path.empty()) return true;
+  const auto exists = [](const std::string& p) {
+    struct stat st{};
+    return ::stat(p.c_str(), &st) == 0;
+  };
+  const std::string ext = bam_path.size() >= 4
+      ? bam_path.substr(bam_path.size() - 4) : "";
+  if (ext == ".bam") {
+    if (exists(absl::StrCat(bam_path, ".bai"))) return true;
+    if (exists(bam_path.substr(0, bam_path.size() - 4) + ".bai")) return true;
+    LOG(ERROR) << flag_name << "=" << bam_path
+               << " has no .bai index. Generate one with: "
+               << "samtools index " << bam_path;
+    return false;
+  }
+  if (bam_path.size() >= 5 &&
+      bam_path.substr(bam_path.size() - 5) == ".cram") {
+    if (exists(absl::StrCat(bam_path, ".crai"))) return true;
+    if (exists(bam_path.substr(0, bam_path.size() - 5) + ".crai")) return true;
+    LOG(ERROR) << flag_name << "=" << bam_path
+               << " has no .crai index. Generate one with: "
+               << "samtools index " << bam_path;
+    return false;
+  }
+  // Other extensions (.sam, etc.) — skip the check; we can't enforce it.
+  return true;
+}
+
 // ApplyModelFlags — appends make_examples flags from model example_info.json.
 // Values mirror tools/conversion/models/<name>/model.example_info.json exactly.
 static void ApplyModelFlags(const std::string& model_type,
@@ -700,6 +773,17 @@ int RunAll(int argc, char** argv) {
                   "--output_vcf=<VCF> [--model_type=WGS] [--regions=chr20]";
     return 1;
   }
+  // Early-fail: catch typos in --reads / --ref / --checkpoint in <1 ms
+  // instead of letting them surface minutes later as a Nucleus open error.
+  // --output_vcf is intentionally NOT checked: it's an OUTPUT path that
+  // postprocess will create, so its absence is expected and correct.
+  if (!EnsurePathExists(reads_flag, "--reads") ||
+      !EnsureBamIndexed (reads_flag, "--reads") ||
+      !EnsurePathExists(ref_flag,   "--ref")   ||
+      !EnsureFastaIndexed(ref_flag) ||
+      !EnsurePathExists(absl::GetFlag(FLAGS_checkpoint), "--checkpoint")) {
+    return 1;
+  }
 
   // Single-process pipeline: one make_examples call (using --threads=N for
   // intra-process parallelism, writing sharded `name-NNNNN-of-NNNNN`
@@ -961,6 +1045,19 @@ int RunAllTrio(int argc, char** argv) {
   if (ckpt_child.empty() || ckpt_parent.empty()) {
     LOG(ERROR) << "Trio: requires --checkpoint_child + --checkpoint_parent "
                   "(or --checkpoint as a shared fallback)";
+    return 1;
+  }
+  // Early-fail: catch typos in 3× --reads_* + --ref + 2× checkpoints.
+  if (!EnsurePathExists(reads_child,   "--reads")         ||
+      !EnsureBamIndexed (reads_child,  "--reads")         ||
+      !EnsurePathExists(reads_parent1, "--reads_parent1") ||
+      !EnsureBamIndexed (reads_parent1,"--reads_parent1") ||
+      !EnsurePathExists(reads_parent2, "--reads_parent2") ||
+      !EnsureBamIndexed (reads_parent2,"--reads_parent2") ||
+      !EnsurePathExists(ref_flag,      "--ref")           ||
+      !EnsureFastaIndexed(ref_flag) ||
+      !EnsurePathExists(ckpt_child,    "--checkpoint_child")  ||
+      !EnsurePathExists(ckpt_parent,   "--checkpoint_parent")) {
     return 1;
   }
   std::string sm_child  = absl::GetFlag(FLAGS_small_model_path_child);
@@ -1284,6 +1381,16 @@ int RunAllSomatic(int argc, char** argv) {
     ckpt = SomaticModelPath(model_type, has_normal);
     LOG(INFO) << "Somatic: auto-selected model " << ckpt;
   }
+  // Early-fail: catch typos in --reads_tumor / --reads_normal / --ref / ckpt.
+  if (!EnsurePathExists(reads_tumor,  "--reads_tumor")  ||
+      !EnsureBamIndexed (reads_tumor, "--reads_tumor")  ||
+      !EnsurePathExists(reads_normal, "--reads_normal") ||
+      !EnsureBamIndexed (reads_normal,"--reads_normal") ||
+      !EnsurePathExists(ref_flag,     "--ref")          ||
+      !EnsureFastaIndexed(ref_flag) ||
+      !EnsurePathExists(ckpt,         "--checkpoint")) {
+    return 1;
+  }
 
   std::string sm_path =
       absl::GetFlag(FLAGS_small_model_path_somatic);
@@ -1496,6 +1603,19 @@ int RunAllPangenome(int argc, char** argv) {
   std::string ckpt = absl::GetFlag(FLAGS_checkpoint);
   if (ckpt.empty()) {
     LOG(ERROR) << "Pangenome: --checkpoint (.dvw) required";
+    return 1;
+  }
+  // Early-fail: catch typos in --reads / --reads_pangenome / --ref / --checkpoint.
+  // --reads_pangenome can be a real BAM (synthetic reads from GBZ→BAM
+  // preprocessing) so the .bai check applies normally.
+  // ref_flag is declared at the top of this function (~line 1580).
+  if (!EnsurePathExists(reads_main,      "--reads")           ||
+      !EnsureBamIndexed (reads_main,     "--reads")           ||
+      !EnsurePathExists(reads_pangenome, "--reads_pangenome") ||
+      !EnsureBamIndexed (reads_pangenome,"--reads_pangenome") ||
+      !EnsurePathExists(ref_flag,        "--ref")             ||
+      !EnsureFastaIndexed(ref_flag) ||
+      !EnsurePathExists(ckpt,            "--checkpoint")) {
     return 1;
   }
 
