@@ -1199,6 +1199,17 @@ int RunMakeExamples(int argc, char** argv) {
   nucleus::genomics::v1::SamReaderOptions sam_opts;
   sam_opts.mutable_read_requirements()->set_min_mapping_quality(
       absl::GetFlag(FLAGS_min_mapping_quality));
+  // Phase 5.5d/15 — propagate keep_supplementary_alignments to SamReader.
+  // Without this, sam_reader.cc::PartialReadSatisfiesRequirements rejects
+  // supplementary alignments at the BAM-read source level, regardless of
+  // what we set later on `read_reqs` (which only flows into AlleleCounter
+  // and PileupImage). For PACBIO/ONT, supplementary reads carry
+  // significant pileup depth at chimeric-alignment regions; dropping
+  // them at the source produced 8-10× DP underflow vs Docker
+  // (e.g. chr20:62642 our DP=7 vs Docker DP=55) and missed candidates
+  // entirely (1342 Docker-only PASS sites including homopolymer indels).
+  sam_opts.mutable_read_requirements()->set_keep_supplementary_alignments(
+      absl::GetFlag(FLAGS_keep_supplementary_alignments));
   {
     std::string probe_bam = reads_path;
     if (probe_bam.empty() && IsSomaticMode()) {
