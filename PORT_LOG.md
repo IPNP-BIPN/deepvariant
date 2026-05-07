@@ -1828,3 +1828,45 @@ Confirms WGS pipeline is unchanged across all flag-audit and
 CVO-merge fixes — the fixes correctly target only somatic / PacBio /
 ONT / sparse-shard paths and never touch the standard WGS path.
 
+### PASS-flip root-cause analysis (chr20 full, 120 PASS↔non-PASS sites)
+
+Of the 428 FM, 120 involve a PASS class (63 PASS→NoCall, 56 NoCall→PASS,
+1 PASS→RefCall). All 120 are at chr20:26-31Mb (pericentromere). All have
+GQ ≤ 18.
+
+Decomposition:
+  - **15/120 (12.5 %)** identical AD between Docker and native — pure
+    MPSGraph FP32 non-associativity at GQ borderlines. Not fixable
+    without `DV_METAL_SERIAL_FULL=1` (3× slower; in fact tested in
+    Phase 8 / Tier 6.0 → makes the count *worse*, 8837 FM, because the
+    sequential-FMA drift goes in a different direction than Docker).
+  - **105/120 (87.5 %)** different AD by 1–9 reads — realigner SSW
+    alignment scores differ. Both Docker and native run libssw with
+    SIMD; the path divergence is `sse2neon.h` (our compile-time
+    SSE→NEON translation) vs Rosetta's runtime SSE→ARM translation.
+    The vendored sse2neon is the early Ratcliff/NVIDIA version (8798
+    lines, missing fixes from modern DLTcollab fork). Edge cases like
+    `_mm_slli_si128` byte-shifts produce 1-2 unit score differences
+    at borderline pericentromeric reads → 1-9 reads reclassified
+    between ref/alt → GQ flips around the threshold.
+
+**Net impact:** 120 sites is 0.11 % of the 107,113 Docker PASS variants;
+the asymmetry is 64 lost - 56 gained = -8 net PASS (-0.007 %). F1 vs
+GIAB v4.2.1 truth is **bit-identical to Docker** (SNP=0.996440,
+INDEL=0.995766, ΔTP=ΔFN=ΔFP=0).
+
+**Remediation path (deferred):** upgrade `sse2neon.h` in libssw to the
+modern DLTcollab fork (https://github.com/DLTcollab/sse2neon) which has
+been validated against Rosetta's translation for these edge cases.
+Requires:
+  1. Fork libssw with the new header
+  2. Update CMakeLists.txt FetchContent URL
+  3. Rerun chr20 + WG hap.py validation
+
+Not applied this session because:
+  - F1 is already bit-identical to Docker (the scientific gold standard)
+  - 120 PASS-flips are 0.11 % of sites, all in 5-Mb pericentromere
+  - Net asymmetry is negligible (-8 PASS out of 107,113)
+  - Risk of introducing other drift patterns
+  - The Homebrew ship gate (≤0.25 % chr20 FM) is already met (0.20 %)
+
