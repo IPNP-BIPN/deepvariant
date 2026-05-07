@@ -83,9 +83,10 @@ ABSL_FLAG(bool, use_direct_phasing, false,
           "phasing) on candidates+reads per region, mark each candidate's "
           "VariantCall.is_phased and info[\"PS\"] before TFRecord emit. "
           "Default false to preserve baseline (matches our shipping "
-          "default; upstream's Python default is true). Library is "
-          "linked but the per-region orchestration in make_examples_main's "
-          "worker loop is a TODO — flag has no effect until that lands.");
+          "default; upstream's Python default is true). Wired in both "
+          "the trio (~line 1731) and solo (~line 2210) worker paths; "
+          "PS info field is populated from the per-region "
+          "position_to_ps map (commit fbead42f).");
 ABSL_FLAG(bool, enable_methylation_calling, false,
           "Phase 9 / Step 2 — read MM/ML SAM tags for base "
           "modifications (5mC). When true, AlleleCounter computes "
