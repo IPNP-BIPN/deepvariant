@@ -1,6 +1,7 @@
 #include "deepvariant/native/cli.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <fstream>
 #include <string>
 #include <sys/stat.h>
@@ -1761,19 +1762,48 @@ int RunAllPangenome(int argc, char** argv) {
 
 }  // namespace deepvariant
 
+// PrintTopLevelHelp — single source of truth for the subcommand list.
+// Goes to stdout (it's information, not an error) so the user can pipe it.
+static void PrintTopLevelHelp() {
+  std::printf(
+      "deepvariant — Apple Silicon native port (v2)\n"
+      "\n"
+      "Usage: deepvariant <subcommand> [flags]\n"
+      "\n"
+      "Top-level pipelines (one BAM in, one VCF out):\n"
+      "  run                 single-sample germline (WGS, WES, PACBIO, ONT, ...)\n"
+      "  trio                3-sample DeepTrio (child + parent1 + parent2)\n"
+      "  somatic             DeepSomatic (tumor + optional normal)\n"
+      "  pangenome           pangenome-aware DeepVariant (BAM + GBZ-derived BAM)\n"
+      "\n"
+      "Stage-level subcommands (compose your own pipeline):\n"
+      "  make_examples       BAM → tfrecord pileup examples\n"
+      "  call_variants       examples → CVO via Inception-v3 / small_model\n"
+      "  postprocess_variants  CVO → final VCF (+ optional gVCF)\n"
+      "\n"
+      "Get per-subcommand flag help:  deepvariant <subcommand> --help\n");
+}
+
 int main(int argc, char** argv) {
   absl::InitializeLog();
   // Default log level: send INFO to stderr.
   absl::SetStderrThreshold(absl::LogSeverity::kInfo);
 
   if (argc < 2) {
-    LOG(ERROR) << "Usage: deepvariant <subcommand> [flags]\n"
-                  "Subcommands: make_examples  call_variants  "
-                  "postprocess_variants  run";
-    return 1;
+    PrintTopLevelHelp();
+    return 0;  // No-arg invocation is informational, not an error.
   }
 
   const std::string sub(argv[1]);
+
+  // Top-level help: -h, --help, help → print help to stdout, return 0.
+  // (Per-subcommand --help is still handled by absl::ParseCommandLine
+  // inside each Run* dispatcher.)
+  if (sub == "-h" || sub == "--help" || sub == "help") {
+    PrintTopLevelHelp();
+    return 0;
+  }
+
   // Shift argv so subcommand sees its own flags.
   argv[1] = argv[0];
   int new_argc = argc - 1;
@@ -1794,9 +1824,8 @@ int main(int argc, char** argv) {
   } else if (sub == "pangenome") {
     return deepvariant::RunAllPangenome(new_argc, new_argv);
   } else {
-    LOG(ERROR) << "Unknown subcommand: " << sub
-               << "\nAvailable: run, trio, somatic, pangenome, make_examples, "
-                  "call_variants, postprocess_variants";
+    LOG(ERROR) << "Unknown subcommand: " << sub;
+    PrintTopLevelHelp();
     return 1;
   }
 }
