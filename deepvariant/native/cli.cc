@@ -120,6 +120,7 @@ ABSL_DECLARE_FLAG(double, vsc_max_fraction_snps_for_non_target_sample);
 ABSL_DECLARE_FLAG(double, vsc_max_fraction_indels_for_non_target_sample);
 ABSL_DECLARE_FLAG(bool,   sort_by_alt_allele_support_somatic);
 ABSL_DECLARE_FLAG(bool,   small_model_use_haplotypes);
+ABSL_DECLARE_FLAG(bool,   use_direct_phasing);
 ABSL_DECLARE_FLAG(std::string, small_model_cvo_outfile_tumor);
 ABSL_DECLARE_FLAG(int, pileup_image_height_tumor);
 ABSL_DECLARE_FLAG(int, pileup_image_height_normal);
@@ -654,6 +655,12 @@ int RunAll(int argc, char** argv) {
       }
       me_args.push_back(absl::StrCat("--alt_aligned_pileup=", aap));
     }
+    // Phase 9 / Step 4c — forward --use_direct_phasing to make_examples.
+    // When true, big-model candidates get is_phased + PS info field;
+    // default false → byte-identical baseline.
+    if (absl::GetFlag(FLAGS_use_direct_phasing)) {
+      me_args.push_back("--use_direct_phasing=true");
+    }
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
@@ -972,6 +979,10 @@ int RunAllTrio(int argc, char** argv) {
         // WGS trio uses realigner (different from single-sample WGS default).
         me_args.push_back("--realigner_enabled=true");
       }
+    }
+    // Phase 9 / Step 4c — forward --use_direct_phasing for trio path.
+    if (absl::GetFlag(FLAGS_use_direct_phasing)) {
+      me_args.push_back("--use_direct_phasing=true");
     }
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;

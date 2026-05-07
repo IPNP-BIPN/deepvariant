@@ -1760,7 +1760,13 @@ int RunMakeExamples(int argc, char** argv) {
               auto it = position_to_ps.find(pos);
               if (it == position_to_ps.end()) continue;
               if (c.variant().calls_size() == 0) continue;
-              c.mutable_variant()->mutable_calls(0)->set_is_phased(true);
+              auto* call = c.mutable_variant()->mutable_calls(0);
+              call->set_is_phased(true);
+              // Phase 9 / Step 4c — emit PS info field. PS = position of
+              // first variant in block (1-based, VCF convention). Mirrors
+              // upstream's stitch_phase_sets first-pass per-region output.
+              const int ps_id = static_cast<int>(it->second + 1);
+              nucleus::SetInfoField("PS", ps_id, call);
             }
           }
         }
@@ -2233,7 +2239,13 @@ int RunMakeExamples(int argc, char** argv) {
           auto it = position_to_ps.find(pos);
           if (it == position_to_ps.end()) continue;
           if (c.variant().calls_size() == 0) continue;
-          c.mutable_variant()->mutable_calls(0)->set_is_phased(true);
+          auto* call = c.mutable_variant()->mutable_calls(0);
+          call->set_is_phased(true);
+          // Phase 9 / Step 4c — emit PS info field. PS = position of
+          // first variant in block (1-based, VCF convention). Mirrors
+          // upstream's stitch_phase_sets first-pass per-region output.
+          const int ps_id = static_cast<int>(it->second + 1);
+          nucleus::SetInfoField("PS", ps_id, call);
         }
       }
     }
