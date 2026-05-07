@@ -241,6 +241,53 @@ int RunAllTrio(int argc, char** argv);
 int RunAllSomatic(int argc, char** argv);
 int RunAllPangenome(int argc, char** argv);
 
+// ExpectsSmallModel — returns true if the model bundle for the given
+// model_type declares a `trained_small_model_path` in upstream Docker's
+// model.example_info.json. When this is true and the user passes an empty
+// --small_model_path (resp. --small_model_path_child / _parent / _somatic),
+// borderline-GQ candidates that Docker fast-paths through the small MLP go
+// instead through the slower Inception-v3 path, and FILTER classification
+// can drift from Docker. Long-read modes (PACBIO/ONT) regress particularly
+// hard — empirically observed in B1+B2 validation 2026-05-07: ONT SNP F1
+// dropped from 0.776 → 0.727 (-5%) when --small_model_path was omitted.
+//
+// Source of truth: tools/conversion/models/<dir>/model.example_info.json.
+//   has trained_small_model_path  →  germline {WGS, ONT, PACBIO}
+//                                    deepsomatic {WGS, ONT, PACBIO, FFPE_WGS}
+//                                    (tumor+normal only — no tumor-only bundle
+//                                     ships a small_model)
+//   no trained_small_model_path   →  WES, MASSEQ, RNASEQ, HYBRID, all
+//                                    tumor-only somatic, all FFPE_WES.
+static bool GermlineExpectsSmallModel(const std::string& mt_upper) {
+  return mt_upper == "WGS" || mt_upper == "ONT" || mt_upper == "PACBIO";
+}
+static bool SomaticExpectsSmallModel(const std::string& mt_upper,
+                                     bool has_normal) {
+  if (!has_normal) return false;  // no tumor-only bundle ships a small_model
+  return mt_upper == "WGS" || mt_upper == "ONT" || mt_upper == "PACBIO" ||
+         mt_upper == "FFPE_WGS";
+}
+
+// WarnIfMissingSmallModel — single-line LOG(WARNING) if `path` is empty and
+// the bundle declares a small_model. `flag_name` is the user-facing flag
+// (e.g., "--small_model_path"); `mt_upper` is upper-case model_type for the
+// message body. No-op when path is non-empty or the bundle has no small model.
+static void WarnIfMissingSmallModel(const std::string& path,
+                                     const std::string& flag_name,
+                                     const std::string& mt_upper,
+                                     bool expects) {
+  if (!path.empty() || !expects) return;
+  LOG(WARNING)
+      << flag_name << " is empty but model_type=" << mt_upper
+      << " bundles a trained small_model in upstream Docker. "
+      << "Without it every candidate goes through the big Inception-v3 "
+      << "(slower) and FILTER classification may drift from Docker — "
+      << "long-read modes can regress SNP F1 by several %. "
+      << "Pass " << flag_name
+      << "=<dir-with-layer_*_kernel.npy> (typically extracted by "
+      << "tools/reference/extract_all_model_weights.sh).";
+}
+
 // ApplyModelFlags — appends make_examples flags from model example_info.json.
 // Values mirror tools/conversion/models/<name>/model.example_info.json exactly.
 static void ApplyModelFlags(const std::string& model_type,
@@ -604,6 +651,12 @@ int RunAll(int argc, char** argv) {
     model_path = ModelPath(model_type);
   }
   const std::string small_model_path = absl::GetFlag(FLAGS_small_model_path);
+  {
+    std::string mt = model_type;
+    for (char& c : mt) c = static_cast<char>(std::toupper(c));
+    WarnIfMissingSmallModel(small_model_path, "--small_model_path", mt,
+                            GermlineExpectsSmallModel(mt));
+  }
 
   // ── Stage 1: make_examples (single in-process call, --threads=N) ─────────
   // Internally fans out N worker threads (each with its own
@@ -816,6 +869,14 @@ int RunAllTrio(int argc, char** argv) {
   }
   const std::string sm_child  = absl::GetFlag(FLAGS_small_model_path_child);
   const std::string sm_parent = absl::GetFlag(FLAGS_small_model_path_parent);
+  {
+    std::string mt = model_type;
+    for (char& c : mt) c = static_cast<char>(std::toupper(c));
+    // Trio bundles use the same per-mode small_model presence as germline.
+    const bool expects = GermlineExpectsSmallModel(mt);
+    WarnIfMissingSmallModel(sm_child,  "--small_model_path_child",  mt, expects);
+    WarnIfMissingSmallModel(sm_parent, "--small_model_path_parent", mt, expects);
+  }
 
   const std::string inference_backend =
       absl::GetFlag(FLAGS_inference_backend);
@@ -1126,6 +1187,12 @@ int RunAllSomatic(int argc, char** argv) {
 
   const std::string sm_path =
       absl::GetFlag(FLAGS_small_model_path_somatic);
+  {
+    std::string mt = model_type;
+    for (char& c : mt) c = static_cast<char>(std::toupper(c));
+    WarnIfMissingSmallModel(sm_path, "--small_model_path_somatic", mt,
+                            SomaticExpectsSmallModel(mt, has_normal));
+  }
 
   const std::string inference_backend =
       absl::GetFlag(FLAGS_inference_backend);

@@ -2123,6 +2123,29 @@ big model with worse precision at GQ borderlines.
 
 **Action item:** add a startup warning when `--small_model_path` is
 empty and the model bundle declares a `trained_small_model_path`.
+✅ **DONE 2026-05-07.** `cli.cc` now declares
+`GermlineExpectsSmallModel` + `SomaticExpectsSmallModel` +
+`WarnIfMissingSmallModel` (helpers near line 244). Wired in three
+places:
+- `RunAll` (single-sample germline) — checks `--small_model_path`
+  for `model_type ∈ {WGS, ONT, PACBIO}`.
+- `RunAllTrio` — checks `--small_model_path_child` and
+  `--small_model_path_parent` for the same three modes.
+- `RunAllSomatic` — checks `--small_model_path_somatic` for
+  `model_type ∈ {WGS, ONT, PACBIO, FFPE_WGS}` AND
+  `has_normal == true` (no tumor-only bundle ships a small_model).
+
+Smoke-tested 2026-05-07 on chr20:10M-10.01M:
+- `--model_type WGS` without `--small_model_path` → `LOG(WARNING)`
+  fires at startup with mode + impact + extraction-script hint.
+- `--model_type WES` without `--small_model_path` → silent (WES
+  bundle has no `trained_small_model_path` upstream).
+- `--model_type WGS --small_model_path <dir>` → silent (no false
+  positive when user did supply the flag).
+
+WES, MASSEQ, RNASEQ, HYBRID, all tumor-only somatic, and FFPE_WES
+remain silent by design (no `trained_small_model_path` in any of
+their `model.example_info.json` bundles upstream).
 
 ### Root cause hypotheses (long-read divergence)
 
