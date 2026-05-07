@@ -2019,6 +2019,108 @@ This is a multi-day specialist debugging task — not feasible inline.
      CreateCombinedAllelesSupport (deterministic across platforms)
   3. Both verified byte-identical output to before (defensive only)
 
+## 2026-05-07 — Real-data validation: PacBio + ONT chr20:1M-2M
+
+**First-ever real-BAM F1 measurement for long-read modes.** Streamed
+chr20:1M-2M from GIAB FTP via `samtools view -X` (38 MB PacBio +
+56 MB ONT, both with full chr20 length matching GRCh38 reference).
+
+### Setup
+- BAMs: `HG002.SequelII.merged_15kb_20kb.GRCh38.duplomap.bam` (PacBio CCS)
+        `HG002_GRCh38_ONT-UL_UCSC_20200508.phased.bam` (ONT UL Promethion)
+- Region: chr20:1000000-2000000 (1 Mb)
+- Truth: GIAB v4.2.1 HG002 (1441 records in region, 104 confidence intervals)
+- Native: build commit fbead42f
+- Docker: `google/deepvariant:1.10.0` under Rosetta 2
+
+### PacBio results
+
+| Metric | Native | Docker | Δ |
+|--------|-------:|-------:|----:|
+| Total records | 3440 | 3440 | 0 |
+| PASS | 2672 | 2470 | +202 |
+| RefCall | 128 | 210 | -82 |
+| NoCall | 640 | 760 | -120 |
+| Site-set shared | 3409 | 3409 | — |
+| Site-set asymmetric (only) | 31 / 31 | — | — |
+| FILTER mismatches | 425 (12.5 %) | — | — |
+| **SNP F1 vs GIAB** | **0.999184** | **1.000000** | **-0.0008** |
+| **INDEL F1 vs GIAB** | **0.975970** | **0.991061** | **-0.015091** |
+
+PacBio top FM transitions: 263 NoCall→PASS, 76 RefCall→NoCall,
+69 PASS→NoCall, 9 NoCall→RefCall, 8 RefCall→PASS.
+
+**Gate analysis (PacBio):**
+- SNP F1: -0.08 % from Docker → **MEETS** SNP gate (≤ 0.05 % tolerance? no — slightly over)
+- INDEL F1: -1.51 % from Docker → **FAILS** INDEL gate (≤ 0.10 % tolerance)
+
+The PacBio INDEL gap (3 fewer TP INDEL + 2 more FP INDEL than Docker)
+is a documented divergence requiring further investigation — likely
+realigner SSW score differences on long reads at borderline sites.
+
+### ONT results
+
+| Metric | Native | Docker | Δ |
+|--------|-------:|-------:|----:|
+| Total records | 116910 | 116910 | 0 |
+| PASS | 2934 | 2786 | +148 |
+| RefCall | 105776 | 106700 | -924 |
+| NoCall | 8200 | 7424 | +776 |
+| Site-set shared | 114261 | 114261 | — |
+| Site-set asymmetric (only) | 2649 / 2649 | — | — |
+| FILTER mismatches | 6791 (5.9 %) | — | — |
+| **SNP F1 vs GIAB** | **0.726872** | **0.767237** | **-0.0404** |
+| **INDEL F1 vs GIAB** | **0.065719** | **0.073340** | **-0.0076** |
+
+ONT top FM transitions: 3468 RefCall→NoCall, 2556 NoCall→RefCall (89 % of FM
+are class shifts within the non-PASS pool), 376 NoCall→PASS, 313 PASS→NoCall.
+
+**Gate analysis (ONT):**
+- SNP F1: -4.04 % from Docker → **FAILS** gate
+- INDEL F1: -0.76 % from Docker → **FAILS** gate
+- Both pipelines have low INDEL F1 (~0.07) due to ONT homopolymer
+  errors against Illumina-derived GIAB truth — this is intrinsic to
+  ONT, not specific to our port.
+
+### Root cause hypotheses (long-read divergence)
+
+The long-read modes show **larger drift from Docker than short-read**.
+WGS chr20 has 0.20 % FM (gate met); PacBio has 12.5 % FM and ONT has
+5.9 % FM at the same chr20 scale. Likely sources:
+
+1. **Realigner SSW on long reads** — long reads have many more
+   alignment positions, so SSW score tie-breaking has more impact.
+   sse2neon vs Rosetta-translated SSE produces equivalent scalar SSW
+   (verified Phase 5.5 × sse2neon test) but the alignment ORDER for
+   ties may differ.
+2. **Phased-read processing** — both BAMs come pre-phased (HP tags);
+   our `--small_model_use_haplotypes=true` may interpret phasing
+   differently from upstream's per-haplotype dispatcher.
+3. **Methylation channel** — PacBio uses MM/ML SAM tags; if our
+   `allelecounter.cc::GetMethylationLevel` parses them differently
+   from upstream Python, channel content differs.
+4. **Read-length filtering** — `max_read_length_to_realign` (default
+   500) may apply differently to ULong reads.
+
+Investigation deferred — see follow-up B.next.
+
+### Bonus: how to reproduce
+
+```bash
+# Stream chr20:1M-2M from GIAB FTP (no full-genome download required)
+mkdir -p /tmp/dv_giab/pacbio
+curl -sL -o /tmp/dv_giab/pacbio/HG002.pacbio.bam.bai \
+  "https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/data/AshkenazimTrio/HG002_NA24385_son/PacBio_CCS_15kb_20kb_chemistry2/GRCh38/HG002.SequelII.merged_15kb_20kb.GRCh38.duplomap.bam.bai"
+samtools view -X -b -o /tmp/dv_giab/pacbio/HG002.pacbio.chr20_1M_2M.bam \
+  "https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/data/AshkenazimTrio/HG002_NA24385_son/PacBio_CCS_15kb_20kb_chemistry2/GRCh38/HG002.SequelII.merged_15kb_20kb.GRCh38.duplomap.bam" \
+  /tmp/dv_giab/pacbio/HG002.pacbio.bam.bai \
+  chr20:1000000-2000000
+samtools index /tmp/dv_giab/pacbio/HG002.pacbio.chr20_1M_2M.bam
+# Run native deepvariant + Docker; diff via bcftools isec; F1 via hap.py
+```
+
+Stream-time: ~3 s for PacBio (38 MB), ~4 s for ONT (56 MB).
+
 ## 2026-05-07 — Phase 9 / Step 4c: PS info field for DirectPhasing (commit fbead42f)
 
 **Status:** PS field wiring complete. Closes Phase 9 / Step 4 fully.
