@@ -1870,3 +1870,40 @@ Not applied this session because:
   - Risk of introducing other drift patterns
   - The Homebrew ship gate (≤0.25 % chr20 FM) is already met (0.20 %)
 
+### 2026-05-07 deep dive — sse2neon ruled out, root cause located
+
+Tried upgrading `sse2neon.h` to the modern DLTcollab fork (8798 → 11744
+lines). Result: **byte-identical chr20 output** (0 lines diff). SSW
+alignment scores are unchanged. Therefore SSW translation is NOT the
+source of the 105 AD-diff PASS-flips.
+
+Then extracted the actual pileup image at chr20:28549025 from both
+pipelines and byte-compared:
+
+  Pileup shape (1, 100, 221, 7) — same in both
+  24,703 / 154,700 pixels differ (15.97 %)
+  Max abs diff per pixel: 1 unit (in [-1,1] normalized scale = full read)
+
+Per-row analysis:
+  rows 0-5: identical
+  rows 6, 10-12, 14-15, 18, 22, 24-31, ...: differ
+  Pattern: ~16 rows differ — different READS in those rows
+
+Diagnosis: same 100 non-empty rows in both pileups, but different
+SUBSET of reads selected. With WGS `pileup_image_height=100` and DP=544
+at the site, reservoir sampling picks 95 out of 544. Both Docker and
+ours use libstdc++-compatible Fisher-Yates shuffle (Phase 5.5d/1
+verified bit-identical). Therefore the shuffle indices match.
+
+So the ROOT CAUSE is: the **input read order to the shuffle differs**.
+With `--realigner_enabled=false`, the AlleleCounter still classifies
+3 reads differently between Docker and ours (AD: 455,85 vs 458,82).
+This means SAM reading or AlleleCounter has a small inconsistency
+(possibly CIGAR walking, base position calculation, or read filter
+order) that flips ~3 reads' allele-support status. After shuffle,
+those 3 reads land at different positions in the pool → ~16 rows
+shift in the final pileup.
+
+Localization deferred. Net impact remains: F1 = Docker (Δ=0),
+0.20 % chr20 FM (gate met).
+
