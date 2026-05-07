@@ -1904,6 +1904,48 @@ order) that flips ~3 reads' allele-support status. After shuffle,
 those 3 reads land at different positions in the pool → ~16 rows
 shift in the final pileup.
 
-Localization deferred. Net impact remains: F1 = Docker (Δ=0),
-0.20 % chr20 FM (gate met).
+### Read-by-read trace at chr20:28549025
+
+Wrote pysam-based read classifier that walks CIGARs and classifies
+each read's base at the candidate position. Ran on macOS arm64 + Docker
+linux/amd64 with the SAME BAM:
+
+  Both: ref(A)=587, alt:C=105, other=4, total=696 ✅ identical
+
+This rules out:
+  ✗ htslib version differences (counts match)
+  ✗ CIGAR walking (matches)
+  ✗ BAM iteration order (matches)
+  ✗ Read filtering (mapq=5/dup/secondary/qcfail filters match)
+
+Per-pipeline accounting at chr20:28549025:
+  pysam basic walk:                696 reads at position
+  Our `dump_allele_counts`:        596 reads classified by AlleleCounter
+  Native VCF AD (455 ref + 85 alt): 540 reads (after VC filtering)
+  Docker VCF AD (458 ref + 82 alt): 540 reads (after VC filtering)
+
+So the AlleleCounter (upstream `allelecounter.cc`, vendored unchanged)
+sees 596 reads. The variant caller emission then filters 56 more to
+540. Of those 56 filters, 3 reads are classified differently between
+Docker and ours: 3 alt:C reads that we keep, Docker drops to ref:A
+(or vice versa).
+
+Pure threshold sweep on (mq, bq) over reads at this position does NOT
+reproduce 455:85 or 458:82 exactly — meaning the divergence is NOT a
+simple threshold mismatch. It's in a more complex filter:
+  - `dbg_min_base_quality=15` (de Bruijn graph filter)
+  - `ws_min_base_quality=20` (window selector filter)
+  - Variant caller indel-based emission filter
+  - `keep_legacy_allele_counter_behavior` (boolean we may set differently)
+
+Or the divergence may come from downstream realigner-window assignment
+even with `--realigner_enabled=false` (the variant caller still uses
+window selection internally).
+
+**Localization stopped here.** Further isolation requires C++
+source-level debugging with breakpoints in `allelecounter.cc` /
+`variant_calling.cc`. Net impact unchanged: F1 bit-identical to
+Docker, chr20 FM ≤ 0.25 % gate met. Documented as "borderline
+pericentromeric chr20:26-31Mb 3-read AlleleCounter divergence in
+variant caller filter logic, source not isolated".
 
