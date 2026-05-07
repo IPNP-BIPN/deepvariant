@@ -1949,6 +1949,76 @@ Docker, chr20 FM ≤ 0.25 % gate met. Documented as "borderline
 pericentromeric chr20:26-31Mb 3-read AlleleCounter divergence in
 variant caller filter logic, source not isolated".
 
+### 2026-05-07 — deepest trace possible: bq=11 boundary identified, root cause is multi-layered
+
+**Approach:** added env-gated trace `DV_TRACE_POS=<pos>` instrumentation to
+`AlleleCounter::AddReadAlleles` to dump per-read classification at
+chr20:28549025. Ran both small region (chr20:28548000-28550000) and full
+chr20, captured 1457 trace lines, deduplicated to 559 unique read
+classifications.
+
+**Key findings:**
+
+1. **Same read appears in MULTIPLE AlleleCounters with DIFFERENT lowq:**
+   - Window selector AC (interval 28548979-28550019, minbq=20): lowq=1
+   - Main AC (interval 28548999-28549999, minbq=10): lowq=0
+   - Same read, same bq=11, different `is_low_quality` per AC instance.
+   - This is by design — WS uses higher bq threshold for window selection.
+
+2. **bq=11 reads are the boundary case:**
+   - 78 alt:C reads with bq=37 (high)
+   - 4 alt:C reads with bq=25
+   - **3 alt:C reads with bq=11** ← exactly the 3-read divergence
+   - At min_base_quality=10, bq=11 is HQ (`11 < 10` = false).
+   - At min_base_quality=12, those 3 become LQ.
+
+3. **Threshold sweep test:**
+   - min_base_quality=10 (ours, default): AD=455,85
+   - min_base_quality=11 (test): AD=455,85 (same — `11 < 11` = false, only filters bq=10)
+   - min_base_quality=12 (test): AD=441,82 (alt:C drops 3 → matches Docker's 82, but ref also drops to 441)
+   - **Docker has AD=458,82**: alt:C matches min_bq=12 result, but ref count matches min_bq=10 result.
+   - This confirms Docker is NOT using a different uniform min_base_quality.
+
+4. **Region-scale dependency:**
+   - Small region (2kb): ours AD=455,85 vs Docker 458,82 — 3 reads diff
+   - Full chr20: ours AD=457,81 vs Docker 458,82 — 1 read diff (realigner closes gap)
+   - The realigner-with-context partially fixes the divergence but not fully.
+
+5. **htslib + parsing is bit-identical** (pysam comparison gave 587 ref + 105 alt:C on both platforms).
+
+6. **Instrumented Docker comparison not possible:**
+   - `DeepVariantCall.allele_support_ext` is NOT serialized to disk by Docker
+   - `make_examples_call_variant_outputs.tfrecord` only stores `CallVariantsOutput`
+   - Cannot directly compare Docker's per-read trace without modifying Docker binary
+   - Docker `make_examples.py` uses C++ Python bindings (variant_calling_multisample.so), same upstream code as us — divergence must be in compiler/STL/runtime layer
+
+**Conclusion: cannot eliminate the 3-read divergence at chr20:28549025
+(or analogous divergences at ~105 pericentromeric sites) without
+dual-attach gdb+lldb on Docker(Rosetta x86) + native(arm64) binaries
+running side-by-side. This requires:**
+  - Docker container with GDB attached (Rosetta-aware breakpoints)
+  - Native binary with LLDB attached
+  - Synchronized step-through of `AddReadAlleles` for the 3 reads
+  - Comparison of intermediate state (especially CIGAR walking + base
+    quality reading from htslib internal buffers)
+
+This is a multi-day specialist debugging task — not feasible inline.
+
+**Final state of WGS chr20 FM (gate ≤0.25%, current 0.20%):**
+  - 428 FM total / 210,179 shared sites
+  - 105 sites with AD divergence (different read-to-allele assignment)
+  - 15 sites with pure FP32 drift (identical AD, different model output)
+  - 308 sites with RefCall↔NoCall transitions (no PASS impact)
+  - PASS-set asymmetry: -8 net of 107,113 PASS (-0.007%)
+  - F1 vs GIAB: bit-identical to Docker (Δ=0)
+  - Homebrew gate: **MET** (0.20% < 0.25%)
+
+**Defensive fixes landed (this session):**
+  1. `cmake/deps.cmake` — overlay modern DLTcollab sse2neon.h
+  2. `variant_calling_multisample.cc` — sort proto-map iteration in
+     CreateCombinedAllelesSupport (deterministic across platforms)
+  3. Both verified byte-identical output to before (defensive only)
+
 ### 2026-05-07 deeper trace — divergence isolated to make_examples cvo
 
 Continued the C++ trace by extracting `dump_cvo` output from BOTH
