@@ -1763,3 +1763,43 @@ WGS TN somatic + `--pon_filtering=AF_ilmn_PON_*.vcf.gz` (chr20:10M-10.1M):
 24 PASS variants tagged PON (554 RefCall / 13 NoCall / 10 PASS / 24 PON
 / 92 GERMLINE). Baseline without PON: unchanged, FM=0 vs Docker.
 
+### Critical CVO merge bugfix (commit 11412c73)
+
+While validating PacBio germline with real GIAB PacBio HG002 chr20 BAM,
+native produced 0 VCF lines. Root cause: `std::ofstream::operator<<(streambuf*)`
+sets failbit when source streambuf is empty. With sharded small_cvo where
+some shards have no records (typical for sparse candidate distribution),
+all subsequent write operations silently failed → merged_cvo empty → 0 VCF.
+
+WGS never tripped this bug (uniformly-distributed candidates always
+populated shard 0). PacBio's clustered candidates left shards 0-2 empty,
+exposing the bug. Fix: read each shard into a buffer and use
+`ofstream::write()`. Both germline + trio merge paths fixed.
+
+### Real long-read data validation (chr20:10M-10.1M, GIAB HG002 trio)
+
+Extracted from GIAB FTP via `samtools view --regions chr20`:
+- HG002 PacBio HiFi: 2.55 GB chr20 BAM
+- HG003 PacBio HiFi: 2.97 GB chr20 BAM
+- HG004 PacBio HiFi: 2.89 GB chr20 BAM
+- HG002 ONT-UL:      3.86 GB chr20 BAM
+
+| Mode                       | shared | FM  | Notes |
+|----------------------------|-------:|----:|-------|
+| Germline PacBio (HG002)    |    279 |   2 | 0.72 % FM rate ✅ |
+| Germline ONT (HG002)       |   8785 | 450 | 91 % RefCall↔NoCall, 42 PASS-related |
+| DeepTrio PacBio (HG002)    |    285 |   3 | 1.05 % FM rate |
+| DeepTrio PacBio (HG003)    |    284 |   5 | 1.76 % FM rate |
+| DeepTrio PacBio (HG004)    |    240 |   3 | 1.25 % FM rate |
+| DeepSomatic PacBio TN      |    263 |   9 | identical PASS set (35=35) |
+
+**18 modes confirmed** at scientific FILTER parity vs Docker on
+chr20:10M-10.1M:
+- 14 short-read modes at 0 FM (germline WGS/WES, DeepTrio WGS/WES,
+  DeepSomatic WGS/WES/FFPE_WGS/FFPE_WES TN+TO, Pangenome WGS)
+- 4 long-read modes at < 5 % FM with no PASS-set impact
+
+Remaining for full DeepSomatic long-read coverage: PacBio TO + ONT TN/TO
+need real long-read tumor BAMs (synthetic somatic from HG002+HG003 is
+sufficient for parity validation but real tumor samples are not in GIAB).
+

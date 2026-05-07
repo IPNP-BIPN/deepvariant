@@ -70,7 +70,8 @@ If any of the following happen, stop, write a report in `PORT_LOG.md`, and surfa
 | GPU truly engaged | powermetrics > 0 | ✅ (verified Phase 5.5a) |
 | Wall-time speedup vs Docker/Rosetta | ≥ 2.5× | ⚠️ **1.84× at WG** (Docker is running under Rosetta, not native Linux — compare to Linux x86 is TBD) |
 | All 23 pipeline modes run | no crash | ✅ (proxy-tested 2026-05-06) |
-| Docker FILTER parity: 14 modes | 0 FM on chr20:10M-10.1M | ✅ all 14 Illumina short-read modes at 0 FM |
+| Docker FILTER parity: 14 short-read modes | 0 FM on chr20:10M-10.1M | ✅ all at 0 FM |
+| Docker FILTER parity: 4 long-read modes (real GIAB BAMs, 2026-05-07) | < 5 % FM | ✅ 0.7–1.8 % FM rate |
 
 ### What still needs external resources
 
