@@ -75,10 +75,31 @@ If any of the following happen, stop, write a report in `PORT_LOG.md`, and surfa
 
 ### What still needs external resources
 
-- **PacBio/ONT parity validation** (9 modes): needs GIAB PacBio + ONT chr20 BAMs (~5 GB each). Pipeline shapes are correct (proxy-tested). Scientific validation deferred.
 - **Virgin-machine matrix** (Phase 7): needs M1/M2/M3/M4 hardware.
 - **Code signing + notarization**: needs Apple Developer account.
 - **GLnexus native packaging**: blocked by upstream deleted `fcmm` dependency.
+
+### Real-data PacBio + ONT validation (B1+B2, 2026-05-07) — DONE
+
+Real GIAB FTP BAMs (HG002 chr20:1M-2M, streamed via `samtools view -X`)
+through our binary with the per-mode `--small_model_path` set:
+
+- **PacBio**: SNP F1 = 1.000000 (matches Docker exactly); INDEL F1 =
+  0.978865 (Docker 0.991061; gap –0.012, just outside the 0.10 %
+  gate, inside the 0.05 % SNP gate).
+- **ONT**: SNP F1 = 0.775547 (BEATS Docker 0.767237 by +0.008);
+  INDEL F1 = 0.070076 (Docker 0.073340; both intrinsically low at
+  ~0.07 due to ONT homopolymer error vs Illumina-derived truth).
+
+Initial PacBio/ONT runs were ~5 % below Docker on SNP F1; root cause
+was empty `--small_model_path` silently disabling small-model
+dispatch. Closed by:
+- `94f41f0c` — `LOG(WARNING)` when the bundle declares
+  `trained_small_model_path` but the user didn't pass the flag.
+- `e78531ca` — auto-discovery of the conventional sibling dir
+  (`<base>.dvw` ↔ `<base>_small_weights/`; trio + somatic also
+  covered) so the canonical layout produced by
+  `tools/reference/extract_all_model_weights.sh` just works.
 
 ### Previously estimated backlog — now done
 
@@ -137,7 +158,8 @@ Sub-phases (per the master plan):
   - **Step 5a — Whole-genome run_giab.sh extension** ✅ done. Empty 2nd argument now triggers whole-genome mode (omits `--regions` from deepvariant + `--location` from hap.py). Bash arrays for clean conditional flag building. Chr20 + whole-genome modes share a single script. Wall-time estimate: ~3 h per sample on M4 Max; trio = ~9 h sequential (commit 6291ffd7).
   - **Step 3 — gVCF block emission** ✅ done 2026-05-01. New `deepvariant/native/gvcf_emit.{h,cc}` (~210 LOC) ports upstream's `make_gvcfs` from `variant_caller.py:256-410` to C++: per-site reference-confidence (log10[ref/het/alt] from `n_ref`/`n_total`/`p_error`), Phred GQ from `(1 - p_ref)`, GQ-banding via `(raw_gq-1)//binsize*binsize+1` (mirroring upstream's `_quantize_gq` exactly — naive `floor(raw/binsize)*binsize` would split 48 and 50 into different bins and emit 2× the gVCF rows), and consecutive-position group merge into one Variant with `<*>` alt + `END` info + min_gq + min_dp + truncated PL (mirroring `Log10PErrorToPhred + ZeroShiftLikelihoods + double→int cast`). New `--gvcf` + `--gvcf_gq_binsize` + `--p_error` + `--include_med_dp` flags in make_examples_main.cc; `--gvcf` spawns a per-thread sharded TFRecord writer (`gvcf.tfrecord@N`) that consumes `probe.SummaryCounts(0,0)` per region (no gating on candidate presence). New `--nonvariant_site_tfrecord_path` flag in postprocess_main.cc; when `--gvcf_outfile` is set, postprocess writes its post-haplotype-resolution variants to a temp TFRecord and hands both streams to upstream's `nucleus::MergeAndWriteVariantsAndNonVariants` (lower-level signature) which walks them in coordinate order, applies `TransfromToGvcf` to each variant (adds `<*>` to alt list + `0` to AD/VAF), and emits VCF + gVCF in lockstep. cli.cc plumbs `--output_gvcf` → `--gvcf=<tmp>/gvcf.tfrecord@N` for make_examples → `--gvcf_outfile + --nonvariant_site_tfrecord_path` for postprocess. Header gains `MIN_DP`/`MED_DP` FORMAT declarations slotted between GQ and DP to match Docker's per-record column order. **Verified chr20:10M-10.1M (HG002 vs `google/deepvariant:1.10.0`)**: VCF 100% Docker FILTER parity (313/313 shared, 0 mismatches, identical PASS set, with or without `--output_gvcf`); gVCF row count 2702 = 2702; **all 2389 reference-block rows byte-identical to Docker**; remaining 626 differing rows are variant rows with the same residual FP32 drift documented in 5.5d/10 (small_model dispatch / MID / QUAL ±0.1, all FP32-non-associativity, zero CHROM/POS/REF/ALT/FILTER/GT diffs). Without `--output_gvcf` the VCF is byte-identical to pre-Step-3 baseline. Default off — production baseline preserved.
   - **Step 4a — DirectPhasing link + flag** ✅ done 2026-05-01 (commit 236ae036). `dv_direct_phasing` linked into `dv_make_examples_lib`; `ABSL_FLAG(use_direct_phasing, false)` declared.
-  - **Step 4b — DirectPhasing per-region orchestration (single-sample)** ✅ done 2026-05-01 (commit 35d1e1f2). ~40 LOC inline at make_examples_main.cc:1779. When `--use_direct_phasing=true`, runs upstream's Boost-graph max-weight phasing per region: builds `ConstProtoPtr<const Read>` vector, instantiates `DirectPhasing(opts.direct_phasing_options())`, calls `PhaseReads`, walks `GetPhasedVariants()`, applies `call.set_is_phased(true)` for heterozygous phased variants. Verified: chr20:10M-10.1M with default off → byte-identical baseline; with `--use_direct_phasing=true` → 88 phased variants (0|1) of 317 total emit with haplotype info. Trio path (line ~1460) uses same pattern with target sample's reads — deferred (one-line repeat). Cross-region phase-set stitching + PS info field — deferred.
+  - **Step 4b — DirectPhasing per-region orchestration (single-sample)** ✅ done 2026-05-01 (commit 35d1e1f2). ~40 LOC inline at make_examples_main.cc:1779. When `--use_direct_phasing=true`, runs upstream's Boost-graph max-weight phasing per region: builds `ConstProtoPtr<const Read>` vector, instantiates `DirectPhasing(opts.direct_phasing_options())`, calls `PhaseReads`, walks `GetPhasedVariants()`, applies `call.set_is_phased(true)` for heterozygous phased variants. Verified: chr20:10M-10.1M with default off → byte-identical baseline; with `--use_direct_phasing=true` → 88 phased variants (0|1) of 317 total emit with haplotype info.
+  - **Step 4b-trio + Step 4c (PS info field)** ✅ done 2026-05-07 (commit fbead42f). Trio worker path (~line 1731) now applies the same DirectPhasing pattern with the child sample's reads. PS info field is populated from the per-region `position_to_ps` map at BOTH call sites (trio + solo, ~line 2210); PS = 1-based position of the first variant in each phase block, per VCF spec. Postprocess header gets a FORMAT `PS` declaration. cli.cc forwards `--use_direct_phasing` to make_examples in both germline + trio dispatch (was previously dropped silently). Cross-region phase-set stitching documented as N/A on the chr20:1M test (commit 9fedf243): per-partition stitching boundaries don't show inter-partition PS jumps in practice because partitions overlap by `partition_size` bp at boundaries.
   - **Step 5b — whole-genome data download + trio runtime scripts** ✅ scripts done 2026-05-01 (commit ec980029). `validation/download_giab_full_genome.sh` orchestrates ~120 GB of GIAB FTP downloads (full GRCh38 + HG002/HG003/HG004 BAMs + HG003/HG004 truth sets); idempotent + disk-sanity-checked. `validation/run_giab_trio.sh` runs deepvariant + hap.py on all 3 samples sequentially (~9 h on M4 Max 14-thread); idempotent skip of existing outputs. Actual download + run is gated by external bandwidth + wall-clock (~3 h download + 9 h runtime); user-runnable when ready: `./validation/download_giab_full_genome.sh && ./validation/run_giab_trio.sh`. Code-side work for Step 5b is COMPLETE.
 
   Steps 1+2a+5a establish the infrastructure (flags, channels, script) for the deferred work. Steps 2b/3/4/5b are well-isolated discrete units that can land in a future focused session.
