@@ -478,6 +478,12 @@ static void ApplyModelFlags(const std::string& model_type,
     me_args.push_back("--parse_sam_aux_fields=true");
     me_args.push_back("--keep_supplementary_alignments=true");
     me_args.push_back("--realigner_enabled=false");
+    // Phase 5.5d/14: enable DirectPhasing so the 106-feature haplotype
+    // small_model gets DP's per-read phase output (matching upstream's
+    // FeatureEncoder(haplotype, read_phases) input). Without this, our
+    // small_model used BAM HP tags (whatshap haplotag), which diverge
+    // from DirectPhasing at phase-block boundaries.
+    me_args.push_back("--use_direct_phasing=true");
     me_args.push_back("--small_model_snp_gq_threshold=19");
     me_args.push_back("--small_model_indel_gq_threshold=22");
     me_args.push_back("--small_model_vaf_context_window_size=51");
@@ -498,6 +504,8 @@ static void ApplyModelFlags(const std::string& model_type,
     me_args.push_back("--phase_reads=true");
     me_args.push_back("--parse_sam_aux_fields=true");
     me_args.push_back("--realigner_enabled=false");
+    // Phase 5.5d/14: same as PACBIO — DP-fed read phases for small_model.
+    me_args.push_back("--use_direct_phasing=true");
     me_args.push_back("--small_model_snp_gq_threshold=9");
     me_args.push_back("--small_model_indel_gq_threshold=17");
     me_args.push_back("--small_model_vaf_context_window_size=51");
