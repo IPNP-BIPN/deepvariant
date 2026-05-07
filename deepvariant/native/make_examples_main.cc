@@ -2107,6 +2107,71 @@ int RunMakeExamples(int argc, char** argv) {
 
     total_candidates += candidates.size();
 
+    // Phase 5.5d/14 — DirectPhasing runs BEFORE small_model dispatch so the
+    // 106-feature haplotype-expanded small_model (PacBio/ONT) sees the same
+    // per-read phase that upstream's FeatureEncoder does. Upstream order
+    // (make_examples_core.py):
+    //   1. direct_phasing.phase_reads(candidates, reads) → read_phases dict
+    //   2. small_model invoked with FeatureEncoder(haplotype, read_phases)
+    //   3. variant phasing via dp.GetPhasedVariants() → is_phased + PS
+    // Pre-fix: small_model used BAM HP tags (whatshap haplotag from BAM
+    // PG line) — these can disagree with DirectPhasing's per-region output
+    // at phase-block boundaries. Sites where BAM HP=0 (unphased) but
+    // DirectPhasing assigns HP=1/2 produce different 106-feature vectors,
+    // flipping small_model GQ across the dispatch threshold.
+    // After-fix: DP output keyed by `fragment_name + "/" + read_number`
+    // (matches allelecounter.cc::ReadKey) overrides BAM HP tags. Only run
+    // when --use_direct_phasing OR --small_model_use_haplotypes is set;
+    // otherwise we'd waste cycles on WGS/WES paths where it has no effect.
+    ::learning::genomics::deepvariant::DirectPhasing dp(
+        opts.direct_phasing_options());
+    bool dp_ran = false;
+    std::unordered_map<std::string, int8_t> read_hp_tags;
+    {
+      const bool need_phasing =
+          absl::GetFlag(FLAGS_use_direct_phasing) ||
+          absl::GetFlag(FLAGS_small_model_use_haplotypes);
+      if (need_phasing) {
+        std::vector<
+            nucleus::ConstProtoPtr<const nucleus::genomics::v1::Read>>
+            dp_read_ptrs;
+        dp_read_ptrs.reserve(working_reads.size());
+        for (auto& r : working_reads) dp_read_ptrs.emplace_back(&r);
+        auto so = dp.PhaseReads(absl::MakeSpan(candidates),
+                                  absl::MakeSpan(dp_read_ptrs));
+        if (so.ok()) {
+          dp_ran = true;
+          const std::vector<int>& phases = so.ValueOrDie();
+          // phases[i] corresponds to working_reads[i]: 0/1/2.
+          for (size_t i = 0;
+               i < working_reads.size() && i < phases.size(); ++i) {
+            if (phases[i] == 0) continue;  // HP_0 default; skip to save memory
+            const auto& r = working_reads[i];
+            read_hp_tags[r.fragment_name() + "/" +
+                         std::to_string(r.read_number())] =
+                static_cast<int8_t>(phases[i]);
+          }
+        }
+      }
+      // Fallback: if DP didn't run or failed and we still need haplotype
+      // features, use BAM HP tags (whatshap haplotag in PacBio BAMs).
+      // Guards against regression for users running --small_model_use_haplotypes
+      // without --use_direct_phasing on a pre-haplotagged BAM.
+      if (!dp_ran && absl::GetFlag(FLAGS_small_model_use_haplotypes)) {
+        for (const auto& r : working_reads) {
+          auto hp_it = r.info().find("HP");
+          if (hp_it == r.info().end() ||
+              hp_it->second.values().empty()) continue;
+          const auto& hp_val = hp_it->second.values(0);
+          if (!hp_val.has_number_value()) continue;
+          const int8_t hp = static_cast<int8_t>(hp_val.number_value());
+          if (hp == 0) continue;
+          read_hp_tags[r.fragment_name() + "/" +
+                       std::to_string(r.read_number())] = hp;
+        }
+      }
+    }
+
     // Small-model first-pass dispatch. Mirror of upstream
     // `SmallModelVariantCaller.call_variants` + `make_small_model_examples.
     // get_set_of_allele_indices`:
@@ -2129,22 +2194,10 @@ int RunMakeExamples(int argc, char** argv) {
         PopulateVafContext(&c, allele_counts);
       }
 
-      // Build HP tag map for haplotype-expanded small model (PacBio/ONT).
-      // Maps fragment_name+"/"+read_number → HP tag (0=unphased, 1, 2).
-      const bool use_haplotypes = absl::GetFlag(FLAGS_small_model_use_haplotypes);
-      std::unordered_map<std::string, int8_t> read_hp_tags;
-      if (use_haplotypes) {
-        for (const auto& r : working_reads) {
-          auto hp_it = r.info().find("HP");
-          if (hp_it == r.info().end() || hp_it->second.values().empty()) continue;
-          const auto& hp_val = hp_it->second.values(0);
-          if (!hp_val.has_number_value()) continue;
-          const int8_t hp = static_cast<int8_t>(hp_val.number_value());
-          const std::string key = r.fragment_name() + "/" +
-                                   std::to_string(r.read_number());
-          read_hp_tags[key] = hp;
-        }
-      }
+      // read_hp_tags is now built above (Phase 5.5d/14): DirectPhasing
+      // output overrides BAM HP tags when DP runs successfully.
+      const bool use_haplotypes =
+          absl::GetFlag(FLAGS_small_model_use_haplotypes);
 
       for (auto& c : candidates) {
         const int n_alts = c.variant().alternate_bases_size();
@@ -2208,46 +2261,35 @@ int RunMakeExamples(int argc, char** argv) {
     DV_SIGNPOST_INTERVAL_END(SmallModel);
     if (big_candidates.empty()) continue;
 
-    // Phase 9 / Step 4b — DirectPhasing per-region orchestration.
-    // Wraps candidates + working_reads for upstream's PhaseReads,
-    // then walks GetPhasedVariants() to mark each candidate's
-    // VariantCall.is_phased = true. The phase set ID (PS info field)
-    // is per-region (= block start position); cross-region stitching
+    // Phase 9 / Step 4b + 5.5d/14 — variant phasing now reuses the `dp`
+    // object built before small_model dispatch (no second PhaseReads
+    // call). Walks GetPhasedVariants() to mark each big_candidate's
+    // VariantCall.is_phased = true and emit PS info field. The phase
+    // set ID is per-region (= start of block); cross-region stitching
     // is a follow-up that mirrors upstream's stitch_phase_sets.
-    if (absl::GetFlag(FLAGS_use_direct_phasing)) {
-      std::vector<
-          nucleus::ConstProtoPtr<const nucleus::genomics::v1::Read>>
-          dp_read_ptrs;
-      dp_read_ptrs.reserve(working_reads.size());
-      for (auto& r : working_reads) dp_read_ptrs.emplace_back(&r);
-      ::learning::genomics::deepvariant::DirectPhasing dp(
-          opts.direct_phasing_options());
-      auto so = dp.PhaseReads(absl::MakeSpan(big_candidates),
-                               absl::MakeSpan(dp_read_ptrs));
-      if (so.ok()) {
-        const auto phased = dp.GetPhasedVariants();
-        // Walk in order; track current phase set (= start of block).
-        int64_t current_ps = -1;
-        std::map<int64_t, int64_t> position_to_ps;
-        for (const auto& pv : phased) {
-          if (pv.is_first_in_block) current_ps = pv.position;
-          if (current_ps >= 0 && pv.phase_1_bases != pv.phase_2_bases) {
-            position_to_ps[pv.position] = current_ps;
-          }
+    if (dp_ran && absl::GetFlag(FLAGS_use_direct_phasing)) {
+      const auto phased = dp.GetPhasedVariants();
+      // Walk in order; track current phase set (= start of block).
+      int64_t current_ps = -1;
+      std::map<int64_t, int64_t> position_to_ps;
+      for (const auto& pv : phased) {
+        if (pv.is_first_in_block) current_ps = pv.position;
+        if (current_ps >= 0 && pv.phase_1_bases != pv.phase_2_bases) {
+          position_to_ps[pv.position] = current_ps;
         }
-        for (auto& c : big_candidates) {
-          const int64_t pos = c.variant().start();
-          auto it = position_to_ps.find(pos);
-          if (it == position_to_ps.end()) continue;
-          if (c.variant().calls_size() == 0) continue;
-          auto* call = c.mutable_variant()->mutable_calls(0);
-          call->set_is_phased(true);
-          // Phase 9 / Step 4c — emit PS info field. PS = position of
-          // first variant in block (1-based, VCF convention). Mirrors
-          // upstream's stitch_phase_sets first-pass per-region output.
-          const int ps_id = static_cast<int>(it->second + 1);
-          nucleus::SetInfoField("PS", ps_id, call);
-        }
+      }
+      for (auto& c : big_candidates) {
+        const int64_t pos = c.variant().start();
+        auto it = position_to_ps.find(pos);
+        if (it == position_to_ps.end()) continue;
+        if (c.variant().calls_size() == 0) continue;
+        auto* call = c.mutable_variant()->mutable_calls(0);
+        call->set_is_phased(true);
+        // Phase 9 / Step 4c — emit PS info field. PS = position of
+        // first variant in block (1-based, VCF convention). Mirrors
+        // upstream's stitch_phase_sets first-pass per-region output.
+        const int ps_id = static_cast<int>(it->second + 1);
+        nucleus::SetInfoField("PS", ps_id, call);
       }
     }
 
