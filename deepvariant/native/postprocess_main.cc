@@ -433,6 +433,9 @@ nucleus::genomics::v1::VcfHeader MakeVcfHeader(
       {"VAF",    "A", "Float",   "Variant allele fractions"},
       {"MID",    "1", "String",  "Model identifier (small_model | deepvariant)"},
       {"PL",     "G", "Integer", "Phred-scaled genotype likelihoods"},
+      // Phase 9 / Step 4c — emitted only when --use_direct_phasing=true;
+      // declared unconditionally for consistent header schema.
+      {"PS",     "1", "Integer", "Phase set ID (1-based position of block start)"},
   };
   for (const auto& f : fmts) {
     auto* fi = hdr.add_formats();
