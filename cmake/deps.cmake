@@ -88,6 +88,21 @@ if(NOT libssw_POPULATED)
   FetchContent_Populate(libssw)
 endif()
 
+# OVERLAY: replace the vendored sse2neon.h (Ratcliff/NVIDIA early version,
+# 8798 lines, missing fixes) with the modern DLTcollab fork (11744 lines,
+# improved fidelity for edge cases like _mm_slli_si128 byte-shifts).
+# This reduces realigner SSW score drift between native arm64 (compile-time
+# SSE→NEON) and Docker on Rosetta (runtime SSE→ARM translation), which
+# was the source of 105/120 PASS-flips on chr20:26-31Mb pericentromere.
+# See PORT_LOG 2026-05-07 "PASS-flip root-cause analysis".
+if(EXISTS "${CMAKE_SOURCE_DIR}/release/vendored/sse2neon.h")
+  configure_file(
+    "${CMAKE_SOURCE_DIR}/release/vendored/sse2neon.h"
+    "${libssw_SOURCE_DIR}/src/sse2neon.h"
+    COPYONLY)
+  message(STATUS "libssw: overlaid modern sse2neon.h from release/vendored/")
+endif()
+
 # libssw has no CMakeLists — define targets here.
 add_library(ssw STATIC
   "${libssw_SOURCE_DIR}/src/ssw.c"
