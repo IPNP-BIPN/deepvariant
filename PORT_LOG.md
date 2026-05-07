@@ -1949,3 +1949,46 @@ Docker, chr20 FM ≤ 0.25 % gate met. Documented as "borderline
 pericentromeric chr20:26-31Mb 3-read AlleleCounter divergence in
 variant caller filter logic, source not isolated".
 
+### 2026-05-07 deeper trace — divergence isolated to make_examples cvo
+
+Continued the C++ trace by extracting `dump_cvo` output from BOTH
+pipelines' `make_examples_call_variant_outputs.tfrecord-00000-of-00001`:
+
+  chr20:28549025 A→C
+    Ours:   DP=544  AD=455,85   probs=[0.826, 0.012, 0.162]
+    Docker: DP=544  AD=458,82   probs=[0.354, 0.011, 0.635]
+
+  chr20:28549031 A→G
+    Ours:   DP=528  AD=454,74
+    Docker: DP=528  AD=447,81
+
+So **the divergence is already present in the make_examples output**
+(before call_variants, before postprocess). This means it's in:
+  - allelecounter.cc, OR
+  - variant_calling_multisample.cc's read-classification logic, OR
+  - The pileup_image generation that feeds make_examples
+
+Tested theories:
+  ✗ NEON M-block classifier   — disabled, same FM=428
+  ✗ sse2neon translation       — upgraded to DLTcollab modern, byte-identical
+  ✗ proto-map iteration order  — sorted CreateCombinedAllelesSupport, byte-identical (path doesn't fire at this site)
+
+Remaining possibilities (NOT investigated, deferred):
+  - Subtle timing in absl::flat_hash_map iteration of read_alleles()
+    in variant_calling_multisample.cc:330 (proto map, hash-based)
+  - The AlleleCounter aggregate `ref_supporting_read_count` increment
+    timing relative to `is_low_quality` checks
+  - Compile-flag differences (libstdc++ vs libc++ STL behavior on
+    `read_alleles()`'s underlying Map<K,V>)
+
+Investigation halted. The 3-read divergence is real, present at
+make_examples output level, and does NOT affect F1 vs GIAB (bit-
+identical to Docker). The full chr20 FM=428 (0.20 %) is fully
+documented as "AlleleCounter cvo divergence, source not isolated".
+
+**Defensive fix landed: `CreateCombinedAllelesSupport` now sorts
+proto-map iteration by read_id** to make the early-break path
+deterministic across platforms (commit 05cab51e). Output unchanged
+for current chr20 sites but defends against future platform
+divergence.
+
