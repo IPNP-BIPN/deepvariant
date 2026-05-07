@@ -288,6 +288,99 @@ static void WarnIfMissingSmallModel(const std::string& path,
       << "tools/reference/extract_all_model_weights.sh).";
 }
 
+// LooksLikeSmallModelDir — cheap fs check: dir exists AND contains
+// `layer_0_kernel.npy` (the file produced by extract_small_model_weights.sh
+// for every supported small-model bundle). Matches the file the BNNS-CPU
+// MLP loader will mmap at runtime.
+static bool LooksLikeSmallModelDir(const std::string& dir) {
+  if (dir.empty()) return false;
+  struct stat st{};
+  const std::string probe = absl::StrCat(dir, "/layer_0_kernel.npy");
+  return ::stat(probe.c_str(), &st) == 0;
+}
+
+// AutoDiscoverGermlineSmallModel — given a `.dvw` checkpoint path, return the
+// conventional sibling small-model dir if it exists, else "".
+// Convention from tools/reference/extract_all_model_weights.sh:
+//   <base>.dvw → <base>_small_weights/   (germline: WGS, ONT, PACBIO)
+// `ckpt_path` may be empty or non-`.dvw` — in both cases we return "".
+static std::string AutoDiscoverGermlineSmallModel(const std::string& ckpt_path) {
+  if (ckpt_path.size() < 5) return "";
+  const std::string suffix = ckpt_path.substr(ckpt_path.size() - 4);
+  if (suffix != ".dvw") return "";
+  const std::string base =
+      ckpt_path.substr(0, ckpt_path.size() - 4);  // strip ".dvw"
+  const std::string candidate = absl::StrCat(base, "_small_weights");
+  if (LooksLikeSmallModelDir(candidate)) return candidate;
+  return "";
+}
+
+// AutoDiscoverTrioOrSomaticSmallModel — given a `<dir>/<base>.dvw` checkpoint
+// where `<base>` follows the trio/somatic naming convention, return the
+// conventional sibling small-model dir if it exists, else "".
+// Convention:
+//   <dir>/deeptrio.<mode>_<role>.dvw → <dir>/deeptrio_<mode>_<role>_small/
+//   <dir>/deepsomatic.<mode>.dvw     → <dir>/deepsomatic_<mode>_small/
+// Mechanism: replace the FIRST `.` in <base> with `_`, then append `_small`.
+// Returns "" if `ckpt_path` is empty, doesn't end in `.dvw`, has no `.` in
+// the basename, or the candidate dir doesn't contain layer_0_kernel.npy.
+static std::string AutoDiscoverTrioOrSomaticSmallModel(
+    const std::string& ckpt_path) {
+  if (ckpt_path.size() < 5) return "";
+  if (ckpt_path.substr(ckpt_path.size() - 4) != ".dvw") return "";
+  // Find the basename (start after last `/`).
+  const auto slash = ckpt_path.find_last_of('/');
+  const std::string parent =
+      slash == std::string::npos ? "" : ckpt_path.substr(0, slash + 1);
+  const std::string base = ckpt_path.substr(
+      slash == std::string::npos ? 0 : slash + 1);
+  // base is like "deeptrio.wgs_child.dvw" or "deepsomatic.wgs.dvw".
+  // Strip ".dvw".
+  const std::string base_noext = base.substr(0, base.size() - 4);
+  // Replace FIRST `.` with `_`. If there's no `.`, this is not a
+  // trio/somatic-style bundle and we return "".
+  const auto dot = base_noext.find('.');
+  if (dot == std::string::npos) return "";
+  std::string flat = base_noext;
+  flat[dot] = '_';
+  const std::string candidate =
+      absl::StrCat(parent, flat, "_small");
+  if (LooksLikeSmallModelDir(candidate)) return candidate;
+  return "";
+}
+
+// MaybeAutoDiscoverGermlineSmallModel — wraps AutoDiscoverGermlineSmallModel
+// with the policy: only kicks in when (a) the user left the flag empty,
+// (b) the bundle expects a small_model, (c) we have a checkpoint path to
+// pivot off. Logs INFO when it finds a dir; the caller must still invoke
+// WarnIfMissingSmallModel afterwards (with the possibly-updated path) so the
+// "no small model" warning fires when discovery fails.
+static void MaybeAutoDiscoverGermlineSmallModel(std::string& small_model_path,
+                                                 const std::string& ckpt_path,
+                                                 const std::string& flag_name,
+                                                 bool expects) {
+  if (!small_model_path.empty() || !expects) return;
+  const std::string discovered = AutoDiscoverGermlineSmallModel(ckpt_path);
+  if (discovered.empty()) return;
+  LOG(INFO) << "Auto-discovered " << flag_name << "=" << discovered
+            << " (sibling of --checkpoint=" << ckpt_path << ")";
+  small_model_path = discovered;
+}
+
+// MaybeAutoDiscoverTrioOrSomaticSmallModel — same policy as above for the
+// trio/somatic naming convention.
+static void MaybeAutoDiscoverTrioOrSomaticSmallModel(
+    std::string& small_model_path, const std::string& ckpt_path,
+    const std::string& flag_name, bool expects) {
+  if (!small_model_path.empty() || !expects) return;
+  const std::string discovered =
+      AutoDiscoverTrioOrSomaticSmallModel(ckpt_path);
+  if (discovered.empty()) return;
+  LOG(INFO) << "Auto-discovered " << flag_name << "=" << discovered
+            << " (sibling of --checkpoint=" << ckpt_path << ")";
+  small_model_path = discovered;
+}
+
 // ApplyModelFlags — appends make_examples flags from model example_info.json.
 // Values mirror tools/conversion/models/<name>/model.example_info.json exactly.
 static void ApplyModelFlags(const std::string& model_type,
@@ -650,12 +743,15 @@ int RunAll(int argc, char** argv) {
   } else {
     model_path = ModelPath(model_type);
   }
-  const std::string small_model_path = absl::GetFlag(FLAGS_small_model_path);
+  std::string small_model_path = absl::GetFlag(FLAGS_small_model_path);
   {
     std::string mt = model_type;
     for (char& c : mt) c = static_cast<char>(std::toupper(c));
+    const bool expects = GermlineExpectsSmallModel(mt);
+    MaybeAutoDiscoverGermlineSmallModel(small_model_path, model_path,
+                                        "--small_model_path", expects);
     WarnIfMissingSmallModel(small_model_path, "--small_model_path", mt,
-                            GermlineExpectsSmallModel(mt));
+                            expects);
   }
 
   // ── Stage 1: make_examples (single in-process call, --threads=N) ─────────
@@ -867,13 +963,17 @@ int RunAllTrio(int argc, char** argv) {
                   "(or --checkpoint as a shared fallback)";
     return 1;
   }
-  const std::string sm_child  = absl::GetFlag(FLAGS_small_model_path_child);
-  const std::string sm_parent = absl::GetFlag(FLAGS_small_model_path_parent);
+  std::string sm_child  = absl::GetFlag(FLAGS_small_model_path_child);
+  std::string sm_parent = absl::GetFlag(FLAGS_small_model_path_parent);
   {
     std::string mt = model_type;
     for (char& c : mt) c = static_cast<char>(std::toupper(c));
     // Trio bundles use the same per-mode small_model presence as germline.
     const bool expects = GermlineExpectsSmallModel(mt);
+    MaybeAutoDiscoverTrioOrSomaticSmallModel(
+        sm_child, ckpt_child, "--small_model_path_child", expects);
+    MaybeAutoDiscoverTrioOrSomaticSmallModel(
+        sm_parent, ckpt_parent, "--small_model_path_parent", expects);
     WarnIfMissingSmallModel(sm_child,  "--small_model_path_child",  mt, expects);
     WarnIfMissingSmallModel(sm_parent, "--small_model_path_parent", mt, expects);
   }
@@ -1185,13 +1285,15 @@ int RunAllSomatic(int argc, char** argv) {
     LOG(INFO) << "Somatic: auto-selected model " << ckpt;
   }
 
-  const std::string sm_path =
+  std::string sm_path =
       absl::GetFlag(FLAGS_small_model_path_somatic);
   {
     std::string mt = model_type;
     for (char& c : mt) c = static_cast<char>(std::toupper(c));
-    WarnIfMissingSmallModel(sm_path, "--small_model_path_somatic", mt,
-                            SomaticExpectsSmallModel(mt, has_normal));
+    const bool expects = SomaticExpectsSmallModel(mt, has_normal);
+    MaybeAutoDiscoverTrioOrSomaticSmallModel(
+        sm_path, ckpt, "--small_model_path_somatic", expects);
+    WarnIfMissingSmallModel(sm_path, "--small_model_path_somatic", mt, expects);
   }
 
   const std::string inference_backend =

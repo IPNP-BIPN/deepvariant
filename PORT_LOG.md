@@ -2147,6 +2147,40 @@ WES, MASSEQ, RNASEQ, HYBRID, all tumor-only somatic, and FFPE_WES
 remain silent by design (no `trained_small_model_path` in any of
 their `model.example_info.json` bundles upstream).
 
+**Follow-up — auto-discovery of small_model dir from checkpoint sibling
+(2026-05-07).** The warning closes the silent-failure mode but still
+asks the user to find and pass an extra path. We extended cli.cc to
+auto-discover the conventional sibling dir produced by
+`tools/reference/extract_all_model_weights.sh`:
+- Germline: `<base>.dvw` ↔ `<base>_small_weights/`
+- Trio:     `<dir>/deeptrio.<mode>_<role>.dvw` ↔ `<dir>/deeptrio_<mode>_<role>_small/`
+- Somatic:  `<dir>/deepsomatic.<mode>.dvw` ↔ `<dir>/deepsomatic_<mode>_small/`
+
+Logic:
+1. If user supplied `--small_model_path[_*]` → use it (no discovery).
+2. Else if bundle expects a small_model AND `--checkpoint` ends in
+   `.dvw` AND the conventional sibling dir contains `layer_0_kernel.npy`
+   → set the path + `LOG(INFO) << "Auto-discovered ..."`.
+3. Else fall through to the existing warning.
+
+This means the canonical extracted layout (default at
+`/opt/homebrew/share/deepvariant-models/` after the Homebrew install
+or at `validation/work/` after running the extraction script) just
+works without the user having to know the convention. Smoke-tested
+2026-05-07:
+- `--checkpoint validation/work/wgs.dvw` → `Auto-discovered
+  --small_model_path=validation/work/wgs_small_weights` (sibling
+  exists) → no warning.
+- Same `.dvw` copied alone into a tmpdir (no sibling) → warning fires
+  exactly as before.
+
+Helpers added: `LooksLikeSmallModelDir`,
+`AutoDiscoverGermlineSmallModel`,
+`AutoDiscoverTrioOrSomaticSmallModel`,
+`MaybeAutoDiscoverGermlineSmallModel`,
+`MaybeAutoDiscoverTrioOrSomaticSmallModel`. ~80 LOC inline; no new
+include beyond existing `<sys/stat.h>`.
+
 ### Root cause hypotheses (long-read divergence)
 
 The long-read modes show **larger drift from Docker than short-read**.
