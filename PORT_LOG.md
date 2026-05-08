@@ -2373,6 +2373,39 @@ parity claim still holds with current binary. Wall-time: ~1 s end-to-end.
 **8 modes at 100 % FILTER parity. Previously documented gaps for
 DeepSomatic tumor-only & FFPE are CLOSED.**
 
+### Update: Plus 3 T+N modes also at 100 %
+
+Per-mode T+N (HG002 chr20:10M-10.1M as tumor + HG003 chr20:10M-10.1M
+as normal — same fixture geometry as the cached Docker baselines):
+
+| Mode | Ours | Docker | Shared | FM |
+|---|---|---|---|---|
+| WES T+N | 693 | 693 | 693 | **0** |
+| FFPE WES T+N | 815 | 815 | 815 | **0** |
+| FFPE WGS T+N | 815 | 815 | 815 | **0** |
+
+**Final aggregate: 11 modes at 100 % FILTER parity vs Docker reference
+on chr20:10M-10.1M.**
+
+| # | Mode | Status |
+|---|---|---|
+| 1 | WGS Illumina (HG002 chr20) | ✅ 100 % FILTER parity |
+| 2 | DeepTrio WGS (chr20:10M-10.1M, child + p1 + p2) | ✅ 100 % |
+| 3 | DeepSomatic T+N WGS (chr20:10M-10.1M) | ✅ 100 % |
+| 4 | DeepSomatic T+N WES (chr20:10M-10.1M) | ✅ 100 % ← new |
+| 5 | DeepSomatic T+N FFPE WGS (chr20:10M-10.1M) | ✅ 100 % ← new |
+| 6 | DeepSomatic T+N FFPE WES (chr20:10M-10.1M) | ✅ 100 % ← new |
+| 7 | DeepSomatic WGS tumor-only | ✅ 100 % ← new |
+| 8 | DeepSomatic FFPE WGS tumor-only | ✅ 100 % ← new |
+| 9 | DeepSomatic WES tumor-only | ✅ 100 % ← new |
+| 10 | DeepSomatic FFPE WES tumor-only | ✅ 100 % ← new |
+| 11 | Pangenome (chr20:10M-10.1M) | ✅ 100 % |
+
+PacBio (chr20-full) and ONT (chr20:1-2M) have non-zero FM but with
+documented biological characterization (FN/FP analysis, comparative
+shared-noise analysis with Docker — see entries above). Both within
+release F1 gates.
+
 ## 2026-05-08 — Diagnostic: chr20:23.97-23.99M small_model homref-dispatch root cause
 
 Followed up on the chr20:23.97-23.99M PacBio hotspot (13 of 61 missed
