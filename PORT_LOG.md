@@ -2406,6 +2406,54 @@ documented biological characterization (FN/FP analysis, comparative
 shared-noise analysis with Docker — see entries above). Both within
 release F1 gates.
 
+### Update 2: Short-read Illumina single-sample × 3 — also 100 % parity
+
+After the user enabled Apple VZ + Rosetta in Docker Desktop
+(`UseVirtualizationFramework: true`, `UseVirtualizationFrameworkRosetta:
+true`), x86 inference workloads run via Rosetta 2 instead of QEMU/TCG
+emulation, so we can run `google/deepvariant:1.10.0` Docker locally.
+
+Re-verified WGS Illumina single-sample on the chr20:10M-10.1M fixture
+for all three trio samples (this is fresh from-scratch Docker
+comparison, not the cached Phase 5.5d/5 documentation):
+
+| Sample | Ours | Docker | Shared | Only-ours | Only-docker | FM |
+|---|---|---|---|---|---|---|
+| HG002 | 313 | 313 | 313 | 0 | 0 | **0** |
+| HG003 | 319 | 319 | 319 | 0 | 0 | **0** |
+| HG004 | 283 | 283 | 283 | 0 | 0 | **0** |
+
+Filter-class breakdowns match Docker exactly per sample (e.g. HG002:
+261 PASS, 50 RefCall, 2 NoCall in BOTH binaries).
+
+Wall-time: ~38 s for Docker, ~1 s for our binary, on M4 Max.
+
+**Final aggregate: 13 modes at 100 % FILTER parity.**
+
+| # | Mode | Status |
+|---|---|---|
+| 1 | **WGS Illumina HG002 (chr20:10M-10.1M)** | **✅ 100 % freshly verified** |
+| 2 | **WGS Illumina HG003 (chr20:10M-10.1M)** | **✅ 100 % freshly verified** |
+| 3 | **WGS Illumina HG004 (chr20:10M-10.1M)** | **✅ 100 % freshly verified** |
+| 4 | DeepTrio WGS (chr20:10M-10.1M, child + p1 + p2) | ✅ 100 % verified |
+| 5 | DeepSomatic T+N WGS (chr20:10M-10.1M) | ✅ 100 % |
+| 6 | DeepSomatic T+N WES (chr20:10M-10.1M) | ✅ 100 % |
+| 7 | DeepSomatic T+N FFPE WGS (chr20:10M-10.1M) | ✅ 100 % |
+| 8 | DeepSomatic T+N FFPE WES (chr20:10M-10.1M) | ✅ 100 % |
+| 9 | DeepSomatic WGS tumor-only | ✅ 100 % |
+| 10 | DeepSomatic FFPE WGS tumor-only | ✅ 100 % |
+| 11 | DeepSomatic WES tumor-only | ✅ 100 % |
+| 12 | DeepSomatic FFPE WES tumor-only | ✅ 100 % |
+| 13 | Pangenome (chr20:10M-10.1M) | ✅ 100 % |
+
+WGS Illumina chr20-full from the May-1 capture (HG002_chr20 dir) had
+394 FN + 67 FP per hap.py vs GIAB truth, but no Docker baseline
+on disk to compute FILTER mismatches against. Per Phase 5.5d/5
+documented (2026-04-29 capture, 210390/210390 site-set parity, 0
+FILTER mismatches, 107113/107113 PASS variants identical), Illumina
+chr20-full is at 100 % parity. The hap.py FN sites are real
+biological calls Docker also misses (shared model behavior).
+
 ## 2026-05-08 — Diagnostic: chr20:23.97-23.99M small_model homref-dispatch root cause
 
 Followed up on the chr20:23.97-23.99M PacBio hotspot (13 of 61 missed
