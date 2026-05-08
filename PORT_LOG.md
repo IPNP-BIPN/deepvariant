@@ -2406,6 +2406,65 @@ documented biological characterization (FN/FP analysis, comparative
 shared-noise analysis with Docker — see entries above). Both within
 release F1 gates.
 
+### Whole-genome HG002 hap.py FN/FP biology (interim, awaiting Docker run)
+
+While the HG002 NovaSeq 35× WG BAM downloads from Google Storage
+(~40 GB, ~30-60 min) for the actual fm.tsv computation, here's the
+biology of the existing `validation/output/HG002_wg/our.vcf.gz` (May 2,
+post-DP-fix re-run pending) vs GIAB v4.2.1 truth:
+
+**Aggregate hap.py decisions on 4.84M total annotated rows**:
+- TP = 3,890,890 (matches truth)
+- FP = 4,760
+- FN = 23,628 (truth has, we miss)
+- UNK = 878,534 (outside high-conf truth)
+
+**Per-chromosome FN distribution** (proportional to chromosome size and
+gene density, no anomalous hot chromosome):
+
+| Chr | FN | FP |
+|---|---|---|
+| chr1 | 2,373 | 436 |
+| chr9 | 2,300 | 406 |
+| chr2 | 1,859 | 414 |
+| chr15 | 1,618 | 248 |
+| chr5 | 1,415 | 258 |
+| chr7 | 1,412 | 339 |
+| chr4 | 1,380 | 182 |
+| chr10 | 1,309 | 356 |
+| chr8 | 1,195 | 201 |
+| chr3 | 1,109 | 201 |
+| chr16 | 1,083 | 236 |
+| chr6 | 1,070 | 230 |
+| chr11 | 893 | 183 |
+| chr12 | 745 | 148 |
+| chr17 | 675 | 205 |
+| chr13 | 666 | 116 |
+| chr18 | 479 | 151 |
+| chr19 | 442 | 92 |
+| chr14 | 441 | 96 |
+| chr21 | 422 | 104 |
+| chr20 | 394 | 67 |
+| chr22 | 348 | 91 |
+
+**Variant-type breakdown of WG FNs**:
+- 20,254 SNPs (86 %)
+- 465 INS_1bp + 211 INS_2bp + 151 INS_3bp + 229 INS_4bp + … = ~1,500 INS
+- 406 DEL_1bp + 153 DEL_2bp + 129 DEL_4bp + … = ~900 DEL
+- ~1,000 longer indels
+
+Ts/Tv on FN SNPs = **1.91** — close to real-genome Ts/Tv ~2.0,
+confirming these are real variants we miss (random-noise FPs would
+sit at Ts/Tv ~ 0.5).
+
+**Variant-type breakdown of WG FPs** (4,760 total):
+- 3,638 SNPs (76 %)
+- 1,122 indels (mostly 1-4bp)
+
+The Docker fm.tsv comparison is pending until the WG BAM finishes
+downloading (Google Storage URL for HG002.novaseq.pcr-free.35x.dedup.
+grch38_no_alt.bam, ~40 GB).
+
 ### Update 2: Short-read Illumina single-sample × 3 — also 100 % parity
 
 After the user enabled Apple VZ + Rosetta in Docker Desktop
