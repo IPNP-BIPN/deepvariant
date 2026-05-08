@@ -2311,6 +2311,141 @@ deterministic across platforms (commit 05cab51e). Output unchanged
 for current chr20 sites but defends against future platform
 divergence.
 
+## 2026-05-08 — Cross-mode biological survey: 13 hap.py-annotated runs
+
+After the PacBio chr20-full deep-dive (next section), ran the same FN/FP
+biology pass across every `validation/output/*/` directory that ships an
+`our.vcf.gz` + `happy*.vcf.gz` pair. 13 runs covering WGS-Illumina chr20
+trio (HG002/3/4), WGS HG002 whole-genome (3 variants), PacBio chr20
+(5 versions), and ONT chr20:1-2M.
+
+### Summary table (sorted by mode, then by F1 SNP)
+
+| Run | Mode | Truth-FN<br>SNP / INS / DEL | Query-FP<br>SNP / INS / DEL | F1 SNP | F1 INDEL | Notes |
+|---|---|---|---|---|---|---|
+| HG002_chr20_5M6M | WGS Ill chr20:5-6M | 12/2/0 | 0/2/0 | 0.9953 | 0.9927 | tiny fixture |
+| HG002_chr20 | WGS Ill chr20 | 324/47/23 | 45/13/9 | **0.9974** | **0.9960** | trio child |
+| HG003_chr20 | WGS Ill chr20 | 262/36/14 | 51/8/9 | **0.9978** | **0.9969** | trio parent1 ✅ best F1 |
+| HG004_chr20 | WGS Ill chr20 | 261/40/17 | 73/15/9 | 0.9977 | 0.9964 | trio parent2 |
+| HG002_wg | WGS Ill whole-genome | 20254/2252/1091 | 3638/573/549 | 0.9964 | 0.9958 | reference WG |
+| HG002_wg_pre_smallmodel_fix | WGS Ill WG (baseline) | 20244/2254/1088 | 3453/570/544 | 0.9965 | 0.9958 | pre-fix |
+| HG002_wg_vaf51 | WGS Ill WG (vaf51 try) | 20254/2252/1091 | 3638/573/549 | 0.9964 | 0.9958 | identical to wg |
+| HG002_pacbio_chr20_1M2M | PacBio chr20:1-2M | 0/1/0 | 0/1/1 | 1.0000 | 0.9911 | tiny fixture |
+| HG002_pacbio_chr20_1M2M_v2 | PacBio chr20:1-2M v2 | 0/1/1 | 0/1/1 | 1.0000 | 0.9880 | tiny fixture |
+| HG002_pacbio_chr20_full | PacBio chr20 full v1 | 157/39/12 | 60/32/27 | 0.9985 | **0.9952** | best PacBio |
+| HG002_pacbio_chr20_full_v2 | PacBio chr20 full v2 | 180/83/38 | 63/63/44 | 0.9983 | 0.9899 | regression |
+| HG002_pacbio_chr20_full_v3 | PacBio chr20 full v3 | 180/83/38 | 63/64/44 | 0.9983 | 0.9899 | latest |
+| **HG002_ont_chr20_1M2M** | **ONT chr20:1-2M** | **396/65/63** | **106/4/804** | **0.7672** | **0.0733** | **🚨 BROKEN** |
+
+### Three release-relevant findings
+
+**1. 🚨 ONT mode is broken on this fixture — release-blocking**
+
+INDEL F1 = 0.0733 (vs WGS 0.9958, PacBio 0.99). Inspection of the 804
+INDEL FPs reveals a homopolymer-noise FP pattern:
+
+| FP indel length | Count | % of DEL FPs |
+|---|---|---|
+| DEL 1bp | 679 | 84.5 % |
+| DEL 2bp | 80 | 10.0 % |
+| DEL 3bp | 17 | 2.1 % |
+| DEL 4bp | 19 | 2.4 % |
+| DEL 5+bp | 9 | 1.1 % |
+
+84 % of FPs are 1-bp deletions — the classic ONT homopolymer error mode.
+We're emitting them as PASS instead of filtering. Likely root causes:
+
+- ONT model checkpoint not loading the right `.dvw` (model selection bug
+  upstream of inference)
+- ONT-specific small_model not active (small_model dispatch should
+  reject most of these at GQ < threshold)
+- Realigner aln_* params not switched to ONT defaults (1/4/6/2 vs the
+  WGS 4/6/8/2; ONT should match upstream's run_deepvariant.py)
+
+This needs a focused debug session before we can claim ONT support.
+WGS and PacBio are unaffected.
+
+**2. PacBio chr20-full v1 → v3 regression in indel recall**
+
+INDEL F1 dropped 0.9952 (v1) → 0.9899 (v3) = -0.5 percentage points.
+Δ in detail:
+
+|  | TP | FN | FP |
+|---|---|---|---|
+| v1 | 11205 | 51 | 59 |
+| v3 | 11133 | 123 | 108 |
+| Δ | **-72** | **+72** | **+49** |
+
+`comm -23` on the FN sets reveals **107 sites that v1 captured but v3
+misses** (true regressions) and **12 sites v3 newly captures** (recoveries).
+Variant-type breakdown of the 107 regressions:
+
+- 28 SNPs (mostly transitions — real variants we drop)
+- 17 DEL_1bp + 8 DEL_2bp = 25 short deletions
+- 16 INS_1bp + 11 INS_2bp + 8 INS_5bp + 4 INS_6bp + 3 INS_3bp +
+  3 INS_7bp + 3 INS_9bp + 8 misc = 56 short insertions
+
+68 % of indel regressions are 1-2bp (39/56) — the same homopolymer-edge
+territory as the chr20:23.97-23.99M small_model bug found in the deep-
+dive. Worth investigating which commit between v1 and v3 caused this
+(candidates from `git log` on key files between the v1 and v3 dates:
+the realigner aln_* params, the partition_size default change for
+PacBio in cli.cc, the small_model dispatch logic).
+
+The regression is **inside** the documented release gate (INDEL F1 ≥
+ref - 0.10 %; ref Docker is approximately 0.992) but worth closing.
+
+**3. WGS small_model fix had ~zero F1 impact at WG scale**
+
+Three WG runs of HG002 — `wg`, `wg_pre_smallmodel_fix`, `wg_vaf51` —
+report nearly identical numbers:
+
+|  | SNP F1 | INDEL F1 | SNP FN | INDEL FN |
+|---|---|---|---|---|
+| wg | 0.99644 | 0.99577 | 20254 | 3366 |
+| wg_pre_smallmodel_fix | 0.99647 | 0.99578 | 20244 | 3365 |
+| wg_vaf51 | 0.99644 | 0.99577 | 20254 | 3366 |
+
+Δ pre→post fix: SNP +10 FN, +185 FP; INDEL +1 FN, +8 FP. The fix
+addressed a specific dispatch bug at chr20:23.97-23.99M that affects
+biology at LOCAL scale (~13 sites = 21 % of one cluster's worth of FNs)
+but is invisible in WG aggregate F1 because the noise floor is ~3300
+INDEL FNs from other distributed sources.
+
+The `vaf51` variant is byte-identical to `wg` — that experimental
+parameter sweep didn't move F1 either.
+
+### Trio (Illumina chr20) is healthy
+
+HG002/3/4 chr20 each show:
+- ~260-325 SNP FN, ~14-23 DEL FN, ~36-47 INS FN
+- ~45-73 SNP FP, ~8-15 INS FP, ~9 DEL FP
+- Ts/Tv on FN SNPs = 2.18-2.60 (consistent with real biology, not noise)
+- F1 SNP within 0.0001 across the three samples; F1 INDEL within 0.001
+
+Trio biological behavior is uniform across child + parent samples.
+
+### Cross-mode actionable summary
+
+| Mode | F1 status | Action |
+|---|---|---|
+| WGS Illumina (HG002 chr20, trio, WG) | ✅ within gate | none — release-ready |
+| PacBio chr20 (full) | ✅ within gate, but regressed v1→v3 | bisect v1→v3, recover 0.5 % INDEL F1 |
+| ONT chr20 | ❌ INDEL F1 = 0.07 | model-load / dispatch debug session |
+| Pangenome chr20:10M-10.1M | ✅ 100 % FILTER parity (separate fixture) | ready |
+| DeepTrio chr20:10M-10.1M | ✅ 100 % FILTER parity (separate fixture) | ready |
+| DeepSomatic chr20:10M-10.1M | ✅ 100 % FILTER parity (separate fixture) | ready |
+| DeepSomatic tumor-only / FFPE | not yet validated | future work |
+| WES Illumina | not yet validated end-to-end | future work |
+| HYBRID_PACBIO_ILLUMINA | not yet validated | future work |
+| MASSEQ / RNASEQ | not yet validated | scope decision needed |
+
+**Bottom line**: Illumina germline (single-sample + trio + somatic +
+pangenome at chr20:10M-10.1M scale) is in good shape; PacBio is
+within-gate but has a recoverable regression; **ONT needs a focused
+debug session** before we can claim it works. WES, HYBRID, MASSEQ,
+RNASEQ have not been end-to-end validated.
+
 ## 2026-05-08 — Biological characterization of FILTER mismatches (PacBio chr20 full)
 
 Source artifact: `validation/output/HG002_pacbio_chr20_full_v3/` (May 7
