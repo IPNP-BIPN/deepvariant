@@ -579,3 +579,28 @@ target_link_libraries(deepvariant PRIVATE
   absl::log
   absl::log_initialize
 )
+
+# Multi-call binary symlinks — busybox-style. Same binary, dispatched by
+# basename(argv[0]) inside cli.cc::DetectMultiCall. Mirrors upstream's
+# three-binary convention (run_deepvariant / run_deeptrio / run_deepsomatic /
+# run_pangenome_aware_deepvariant) without the disk-bloat / version-skew
+# cost of three separate executables.
+#
+# After build: build-macos/bin/{deeptrio,deepsomatic,pangenome-aware-deepvariant}
+# all point at build-macos/bin/deepvariant.
+#
+# After `make install`: same layout under ${CMAKE_INSTALL_PREFIX}/bin/.
+# Homebrew formula will use `bin.install_symlink "deepvariant" => "deeptrio"`
+# (etc.) to mirror this in the final bottle.
+add_custom_command(TARGET deepvariant POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+          deepvariant
+          "$<TARGET_FILE_DIR:deepvariant>/deeptrio"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+          deepvariant
+          "$<TARGET_FILE_DIR:deepvariant>/deepsomatic"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+          deepvariant
+          "$<TARGET_FILE_DIR:deepvariant>/pangenome-aware-deepvariant"
+  COMMENT "Creating multi-call binary symlinks (deeptrio, deepsomatic, pangenome-aware-deepvariant)"
+  VERBATIM)
