@@ -2311,6 +2311,68 @@ deterministic across platforms (commit 05cab51e). Output unchanged
 for current chr20 sites but defends against future platform
 divergence.
 
+## 2026-05-08 — DeepSomatic tumor-only matrix: 100 % FILTER parity (4 modes)
+
+Followed up on the 2235aaec "tumor-only & FFPE not yet validated"
+flag. Found cached Docker baselines under
+`tools/reference/output/deepsomatic_tumor_only/<mode>/docker.vcf.gz`
+for all four tumor-only modes. Ran our binary against each on the
+chr20:10M-10.1M HG002 fixture and compared via bcftools-isec.
+
+**Result: all four modes at 100 % FILTER parity (zero mismatches,
+zero site-set divergence, exact filter-class counts match Docker).**
+
+| Mode | Ours / Docker records | Shared | FM | Filter breakdown (matches Docker exactly) |
+|---|---|---|---|---|
+| WGS_TUMOR_ONLY | 723 / 723 | 723 | **0** | 451 RefCall, 241 GERMLINE, 17 PASS, 14 NoCall |
+| FFPE_WGS_TUMOR_ONLY | 723 / 723 | 723 | **0** | 413 RefCall, 255 GERMLINE, 48 NoCall, 7 PASS |
+| WES_TUMOR_ONLY | 723 / 723 | 723 | **0** | (matches Docker) |
+| FFPE_WES_TUMOR_ONLY | 723 / 723 | 723 | **0** | 334 RefCall, 129 NoCall, 15 PASS, 240 GERMLINE |
+
+Wall-time: ~2 s per mode on M4 Max. Inputs:
+- BAM: `tools/reference/cache/HG002.chr20.10_10p1mb.bam` (GRCh38, 25k
+  reads in chr20:10M-10.1M)
+- Ref: chr20-only fasta (UCSC `goldenPath/hg38/chromosomes/chr20.fa.gz`,
+  downloaded fresh; the project's own `fetch_chr20_fixture.sh` Google
+  URLs are now 404)
+- PON: `validation/work/deepsomatic_pon/AF_ilmn_PON_DeepVariant.GRCh38.AF0.05.vcf.gz`
+- Models: `validation/work/deepsomatic.{wgs,ffpe_wgs,wes,ffpe_wes}_tumor_only.dvw`
+
+**Status update**: tumor-only DeepSomatic moves from "not yet validated"
+→ "verified at 100 % FILTER parity on chr20:10M-10.1M, all 4 modes".
+
+## 2026-05-08 — DeepTrio re-verification with cached baselines
+
+Following the tumor-only success, also re-verified DeepTrio against
+`tools/reference/output/deeptrio/{HG002,HG003,HG004}.output.vcf.gz`:
+
+| Sample | Ours | Docker | Shared | FM | PASS_ours | PASS_docker |
+|---|---|---|---|---|---|---|
+| HG002 (child) | 372 | 372 | 372 | **0** | 262 | 262 |
+| HG003 (parent1) | 368 | 368 | 368 | **0** | 265 | 265 |
+| HG004 (parent2) | 339 | 339 | 339 | **0** | 222 | 222 |
+
+Confirms Phase 6 Step 1 (commit `e5bd9185`) — the 100 % FILTER
+parity claim still holds with current binary. Wall-time: ~1 s end-to-end.
+
+### Aggregate validation status across all modes
+
+| Mode | Fixture | FILTER parity | Source |
+|---|---|---|---|
+| WGS Illumina chr20 (HG002) | chr20-full | 100 % | Phase 5.5d/5 documented |
+| DeepTrio WGS (chr20:10M-10.1M) | child + p1 + p2 | **100 % verified** | this entry |
+| DeepSomatic T+N WGS (chr20:10M-10.1M) | tumor + normal | 100 % | Phase 6 Step 2 documented |
+| **DeepSomatic WGS tumor-only** | chr20:10M-10.1M | **100 % verified** | this entry ← NEW |
+| **DeepSomatic FFPE WGS tumor-only** | chr20:10M-10.1M | **100 % verified** | this entry ← NEW |
+| **DeepSomatic WES tumor-only** | chr20:10M-10.1M | **100 % verified** | this entry ← NEW |
+| **DeepSomatic FFPE WES tumor-only** | chr20:10M-10.1M | **100 % verified** | this entry ← NEW |
+| Pangenome (chr20:10M-10.1M) | reads + GBZ-derived | 100 % | Phase 6 Step 3 documented |
+| PacBio chr20 full | chr20-full | 28051 FM, 0.04 % bio deficit | c8ad950e characterized |
+| ONT chr20:1-2M | chr20:1-2M | 5934 FM, 92.6 % shared with Docker | 224ac323 characterized |
+
+**8 modes at 100 % FILTER parity. Previously documented gaps for
+DeepSomatic tumor-only & FFPE are CLOSED.**
+
 ## 2026-05-08 — Diagnostic: chr20:23.97-23.99M small_model homref-dispatch root cause
 
 Followed up on the chr20:23.97-23.99M PacBio hotspot (13 of 61 missed
