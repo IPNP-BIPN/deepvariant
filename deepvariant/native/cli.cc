@@ -1773,9 +1773,79 @@ int RunAllPangenome(int argc, char** argv) {
 
 }  // namespace deepvariant
 
-// PrintTopLevelHelp — single source of truth for the subcommand list.
-// Goes to stdout (it's information, not an error) so the user can pipe it.
+// MultiCallTool — what tool name the binary was invoked as. Set in main()
+// from basename(argv[0]). Drives the per-tool help text and dispatch path.
+//
+// Values:
+//   "deepvariant"                  — canonical binary, full subcommand suite
+//   "deeptrio"                     — multi-call alias → forces trio mode
+//   "deepsomatic"                  — multi-call alias → forces somatic mode
+//   "pangenome-aware-deepvariant"  — multi-call alias → forces pangenome mode
+//
+// Mirrors upstream Google's three-binary convention (`run_deepvariant`,
+// `run_deeptrio`, `run_deepsomatic`, `run_pangenome_aware_deepvariant`)
+// without the disk-bloat / version-skew cost of three separate executables:
+// classic Unix multi-call binary (busybox-style). Homebrew formula will
+// install `deepvariant` and three symlinks pointing at it.
+static std::string g_multicall_tool;  // empty until set in main()
+
+// PrintTopLevelHelp — top-level help for whichever tool the binary was
+// invoked as. Goes to stdout (it's information, not an error).
 static void PrintTopLevelHelp() {
+  if (g_multicall_tool == "deeptrio") {
+    std::printf(
+        "deeptrio — DeepTrio (child + parent1 + parent2) on Apple Silicon\n"
+        "\n"
+        "Usage: deeptrio --reads=<child.BAM> --reads_parent1=<BAM> --reads_parent2=<BAM> \\\n"
+        "                --ref=<FASTA> --output_vcf=<child.VCF> \\\n"
+        "                --output_vcf_parent1=<VCF> --output_vcf_parent2=<VCF> \\\n"
+        "                [--model_type=WGS|PACBIO|ONT] [--regions=chr20]\n"
+        "\n"
+        "Note: the child sample uses the unsuffixed --reads / --output_vcf flags;\n"
+        "parent samples use --reads_parent{1,2} / --output_vcf_parent{1,2}. The\n"
+        "presence of --reads_parent1 is what triggers trio dispatch.\n"
+        "\n"
+        "Get all flags:           deeptrio --helpfull\n"
+        "Search by name/keyword:  deeptrio --help=<substr>\n"
+        "\n"
+        "Equivalent canonical form: deepvariant trio <flags...>\n");
+    return;
+  }
+  if (g_multicall_tool == "deepsomatic") {
+    std::printf(
+        "deepsomatic — DeepSomatic (tumor + optional normal) on Apple Silicon\n"
+        "\n"
+        "Usage: deepsomatic --reads_tumor=<BAM> [--reads_normal=<BAM>] \\\n"
+        "                   --ref=<FASTA> --output_vcf=<VCF> \\\n"
+        "                   [--model_type=WGS|PACBIO|ONT|FFPE_WGS|...] [--regions=chr20]\n"
+        "\n"
+        "Tumor-only:  omit --reads_normal (the model dispatch is automatic).\n"
+        "\n"
+        "Get all flags:           deepsomatic --helpfull\n"
+        "Search by name/keyword:  deepsomatic --help=<substr>\n"
+        "\n"
+        "Equivalent canonical form: deepvariant somatic <flags...>\n");
+    return;
+  }
+  if (g_multicall_tool == "pangenome-aware-deepvariant") {
+    std::printf(
+        "pangenome-aware-deepvariant — Pangenome-aware DV on Apple Silicon\n"
+        "\n"
+        "Usage: pangenome-aware-deepvariant --reads=<BAM> --reads_pangenome=<BAM> \\\n"
+        "                                   --ref=<FASTA> --output_vcf=<VCF> \\\n"
+        "                                   [--regions=chr20]\n"
+        "\n"
+        "The pangenome BAM is a GBZ-derived synthetic-haplotype BAM produced by\n"
+        "the upstream Docker preprocessing step. GBZ at runtime is out of scope\n"
+        "for v2; convert GBZ→BAM once via the documented Docker pipeline.\n"
+        "\n"
+        "Get all flags:           pangenome-aware-deepvariant --helpfull\n"
+        "Search by name/keyword:  pangenome-aware-deepvariant --help=<substr>\n"
+        "\n"
+        "Equivalent canonical form: deepvariant pangenome <flags...>\n");
+    return;
+  }
+  // Default: canonical `deepvariant` binary — full subcommand suite.
   std::printf(
       "deepvariant — Apple Silicon native port (v2)\n"
       "\n"
@@ -1792,13 +1862,53 @@ static void PrintTopLevelHelp() {
       "  call_variants       examples → CVO via Inception-v3 / small_model\n"
       "  postprocess_variants  CVO → final VCF (+ optional gVCF)\n"
       "\n"
+      "Multi-call shortcuts (Homebrew-installed symlinks; same binary, no\n"
+      "version skew vs the canonical form):\n"
+      "  deeptrio                       → deepvariant trio\n"
+      "  deepsomatic                    → deepvariant somatic\n"
+      "  pangenome-aware-deepvariant    → deepvariant pangenome\n"
+      "\n"
       "Get per-subcommand flag help:  deepvariant <subcommand> --help\n");
+}
+
+// DetectMultiCall — return the subcommand name to inject when the binary
+// is invoked under one of its multi-call basenames. Empty string for the
+// canonical `deepvariant` invocation (or any unrecognized basename).
+static std::string DetectMultiCall(const char* argv0) {
+  // basename(): take the substring after the last '/'.
+  std::string base(argv0);
+  const auto slash = base.find_last_of('/');
+  if (slash != std::string::npos) base = base.substr(slash + 1);
+  // Tolerate a `.exe` suffix (no-op on macOS but cheap and harmless).
+  constexpr absl::string_view kExe = ".exe";
+  if (base.size() > kExe.size() &&
+      base.substr(base.size() - kExe.size()) == kExe) {
+    base.resize(base.size() - kExe.size());
+  }
+  if (base == "deeptrio") return "trio";
+  if (base == "deepsomatic") return "somatic";
+  if (base == "pangenome-aware-deepvariant") return "pangenome";
+  return "";  // canonical or unknown → no rewrite
 }
 
 int main(int argc, char** argv) {
   absl::InitializeLog();
   // Default log level: send INFO to stderr.
   absl::SetStderrThreshold(absl::LogSeverity::kInfo);
+
+  // Multi-call dispatch — busybox-style. If the binary was invoked as
+  // `deeptrio`, `deepsomatic`, or `pangenome-aware-deepvariant` (via a
+  // Homebrew-installed symlink), inject the corresponding subcommand and
+  // record the tool name globally so help text and SetProgramUsageMessage
+  // address the right tool.
+  const std::string injected = DetectMultiCall(argv[0]);
+  if (!injected.empty()) {
+    if      (injected == "trio")      g_multicall_tool = "deeptrio";
+    else if (injected == "somatic")   g_multicall_tool = "deepsomatic";
+    else if (injected == "pangenome") g_multicall_tool = "pangenome-aware-deepvariant";
+  } else {
+    g_multicall_tool = "deepvariant";
+  }
 
   // Make `--help` (no args) print our flags. Abseil's default `--help`
   // matches flags whose source-file path contains the program basename,
@@ -1820,17 +1930,40 @@ int main(int argc, char** argv) {
     return absl::StrContains(path, "deepvariant/native/");
   };
   absl::SetFlagsUsageConfig(usage_config);
-  absl::SetProgramUsageMessage(
-      "deepvariant — Apple Silicon native port (v2)\n"
+  // Per-tool usage message — printed by absl::ParseCommandLine when the
+  // user passes --help. We hold the storage in a function-local static so
+  // it outlives the call (Abseil stores a string_view internally).
+  static const std::string usage_msg = absl::StrCat(
+      g_multicall_tool, " — Apple Silicon native port (v2)\n"
       "\n"
-      "Usage: deepvariant <subcommand> [flags]\n"
-      "Subcommands: run | trio | somatic | pangenome | make_examples |\n"
-      "             call_variants | postprocess_variants\n"
-      "\n"
-      "Get the full flag list:    deepvariant <subcommand> --helpfull\n"
-      "Get a subcommand's flags:  deepvariant <subcommand> --help\n"
-      "Search by name/keyword:    deepvariant <subcommand> --help=<substr>");
+      "Get the full flag list:    ", g_multicall_tool, " --helpfull\n",
+      "Get the main flags:        ", g_multicall_tool, " --help\n",
+      "Search by name/keyword:    ", g_multicall_tool, " --help=<substr>");
+  absl::SetProgramUsageMessage(usage_msg);
 
+  // Multi-call binary path: dispatch directly to the injected mode.
+  // The runner's own absl::ParseCommandLine handles --help / --helpfull /
+  // --help=<substr>. We still intercept top-level help words here so the
+  // user sees a per-tool synopsis (PrintTopLevelHelp branches on
+  // g_multicall_tool) before being told to use --helpfull for the full
+  // flag list.
+  if (!injected.empty()) {
+    if (argc >= 2) {
+      const std::string a1(argv[1]);
+      if (a1 == "-h" || a1 == "--help" || a1 == "help") {
+        PrintTopLevelHelp();
+        return 0;
+      }
+    }
+    if (injected == "trio")      return deepvariant::RunAllTrio(argc, argv);
+    if (injected == "somatic")   return deepvariant::RunAllSomatic(argc, argv);
+    if (injected == "pangenome") return deepvariant::RunAllPangenome(argc, argv);
+    // (Defensive — DetectMultiCall only returns the three names above.)
+    LOG(ERROR) << "Unknown multi-call alias: " << injected;
+    return 1;
+  }
+
+  // Canonical `deepvariant` invocation — subcommand-style dispatch.
   if (argc < 2) {
     PrintTopLevelHelp();
     return 0;  // No-arg invocation is informational, not an error.
