@@ -11,10 +11,13 @@
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
 #include "absl/flags/reflection.h"
+#include "absl/flags/usage.h"
+#include "absl/flags/usage_config.h"
 #include <sys/sysctl.h>
 #include "absl/log/globals.h"
 #include "absl/log/initialize.h"
 #include "absl/log/log.h"
+#include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 
@@ -1796,6 +1799,37 @@ int main(int argc, char** argv) {
   absl::InitializeLog();
   // Default log level: send INFO to stderr.
   absl::SetStderrThreshold(absl::LogSeverity::kInfo);
+
+  // Make `--help` (no args) print our flags. Abseil's default `--help`
+  // matches flags whose source-file path contains the program basename,
+  // which here is `deepvariant` — but our flags live in files like
+  // `deepvariant/native/cli.cc`, `make_examples_main.cc`, etc., none of
+  // which match "deepvariant" as a whole filename. The default behavior
+  // is therefore "No flags matched". Override:
+  //   - contains_helpshort_flags / contains_help_flags: match any file
+  //     under `deepvariant/native/` so plain `--help` shows our ~80
+  //     flags grouped by source file (and excludes absl/grpc internals).
+  //   - SetProgramUsageMessage: silences the noisy
+  //     "Warning: SetProgramUsageMessage() never called" emitted by
+  //     ParseCommandLine, and tells the user how to drill in further.
+  absl::FlagsUsageConfig usage_config;
+  usage_config.contains_helpshort_flags = [](absl::string_view path) {
+    return absl::StrContains(path, "deepvariant/native/");
+  };
+  usage_config.contains_help_flags = [](absl::string_view path) {
+    return absl::StrContains(path, "deepvariant/native/");
+  };
+  absl::SetFlagsUsageConfig(usage_config);
+  absl::SetProgramUsageMessage(
+      "deepvariant — Apple Silicon native port (v2)\n"
+      "\n"
+      "Usage: deepvariant <subcommand> [flags]\n"
+      "Subcommands: run | trio | somatic | pangenome | make_examples |\n"
+      "             call_variants | postprocess_variants\n"
+      "\n"
+      "Get the full flag list:    deepvariant <subcommand> --helpfull\n"
+      "Get a subcommand's flags:  deepvariant <subcommand> --help\n"
+      "Search by name/keyword:    deepvariant <subcommand> --help=<substr>");
 
   if (argc < 2) {
     PrintTopLevelHelp();
