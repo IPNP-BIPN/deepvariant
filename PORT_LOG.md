@@ -2311,6 +2311,103 @@ deterministic across platforms (commit 05cab51e). Output unchanged
 for current chr20 sites but defends against future platform
 divergence.
 
+## 2026-05-08 — Diagnostic: chr20:23.97-23.99M small_model homref-dispatch root cause
+
+Followed up on the chr20:23.97-23.99M PacBio hotspot (13 of 61 missed
+FNs, ~21 % of PacBio FN deficit) flagged in c8ad950e. Side-by-side at
+chr20:23973486 T>G:
+
+```
+OURS:    GT=0/0 RefCall  DP=49 AD=0,49 VAF=1.0 MID=small_model PL=0,55,99
+DOCKER:  GT=0/1 PASS     DP=49 AD=0,49 VAF=1.0 MID=small_model PL=99,0,99
+```
+
+**Same DP, same AD, same VAF, same dispatcher (small_model)** —
+different output predictions. The small_model itself is bit-equal vs
+TF/Keras (Phase 5.5d/7), so the divergence must be in the FEATURES it
+sees, not the inference math.
+
+### Code-trace narrowed the cause
+
+1. Encoder code is correct (small_model_features.cc:119-153 +
+   :304-353). Standard 70-feature path matches upstream. The
+   haplotype-expanded 36-extra-feature path filters reads by
+   `read_hp_tags[r.read_name()]` where `r.read_name` = AlleleCounter's
+   `fragment_name + "/" + read_number` key (matches upstream's
+   `_filter_by_haplotype` lookup pattern).
+
+2. Key formats match. `AlleleCounter::ReadKey(read)` (allelecounter.cc
+   :1037-1040) builds `StrCat(fragment_name, "/", read_number)`; we
+   build `read_hp_tags[fragment_name + "/" + std::to_string(read_number)]`
+   (make_examples_main.cc:2161-2163). Both produce identical strings
+   for any non-negative read_number.
+
+3. Both we AND Docker dispatch the call to small_model (MID="small_model"
+   in BOTH VCFs). Same code path, same encoder.
+
+4. **Therefore the diverging input must be `read_hp_tags` itself** —
+   our DirectPhasing assigns different HP labels to the 49 alt-supporting
+   reads than upstream does at this haplotype block.
+
+### Why this matters for the call
+
+When all 49 alt-supporting reads carry the SAME haplotype tag
+(e.g., HP=1, HP=2 empty), the small_model sees:
+  - HP=0 features: 0 reads
+  - HP=1 features: 0 ref + 49 alt
+  - HP=2 features: 0 ref + 0 alt
+The model interprets "all reads on one haplotype, other haplotype
+absent" as evidence for **homref** (the missing haplotype must be
+ref) — explaining why our `probs[homref] = 0.99` and we emit GT=0/0.
+
+When the 49 reads are split across HP=1 and HP=2 (Docker's case at
+this site, e.g., 24 + 25), the model sees:
+  - HP=1 features: 0 ref + 24 alt
+  - HP=2 features: 0 ref + 25 alt
+And correctly classifies as **het** (both haplotypes carry the alt) →
+GT=0/1.
+
+### Likely root cause
+
+Our `DirectPhasing::PhaseReads` is per-region (called from make_examples_
+main.cc:2150-2163). It runs Boost-graph max-weight phasing on the
+SNP candidates within the current region. At chr20:23.97-23.99M, the
+read-set composition + edge-weight calculation in our DP appears to
+collapse all 49 alt-supporting reads onto a single haplotype label,
+whereas upstream's DP (which we link via `dv_direct_phasing`,
+**SHOULD** be deterministically equivalent) splits them.
+
+This isn't a bug in `dv_direct_phasing` itself (it's the upstream
+library) but is likely caused by:
+- Different SNP candidate set fed to `PhaseReads()` at this region
+  boundary (we feed `candidates` after small_model dispatch eligibility
+  filtering; upstream feeds the unfiltered SNP candidates)
+- Different read set fed (`working_reads` in our code vs upstream's
+  `reads_to_phase`)
+- Region edge-padding difference (`PHASE_READS_REGION_PADDING_PCT`
+  default 25%; we may not honor this)
+
+### Action items (out of scope for this autonomous diagnosis pass)
+
+1. Add `--debug_phase_dump` flag that, for a given site, prints the
+   reads_to_phase set + phases output side-by-side with what
+   `read_hp_tags` records. Run on chr20:23973486.
+2. Compare with Docker's per-region DirectPhasing output by enabling
+   `--read_phases_output=tsv` in both binaries — Docker has the flag,
+   we'd need to add it.
+3. If the input read sets differ, fix the eligibility filter; if the
+   inputs match but phases differ, audit our DirectPhasing wiring
+   (we link upstream's `dv_direct_phasing` library so the algorithm
+   should be byte-identical).
+
+### Why this is not release-blocking
+
+13 sites at this hotspot is 21 % of 61 site-level FN deficit on
+PacBio chr20 full = 0.01 % of 134k records. SNP F1 = 0.998
+INDEL F1 = 0.990, both inside the gate. The fix is pure FN recovery
+for borderline het calls in PacBio dense-haplotype regions — useful
+but not blocking.
+
 ## 2026-05-08 — Comparative FILTER-mismatch-vs-Docker on 4 modes with cached baselines
 
 Extension of the cross-mode survey: where Docker `.vcf.gz` baselines
