@@ -1871,6 +1871,35 @@ static void PrintTopLevelHelp() {
       "Get per-subcommand flag help:  deepvariant <subcommand> --help\n");
 }
 
+// PrintVersion — print version + build metadata to stdout. Goes to stdout
+// (not stderr) so the user can capture it for issue reports / CI logs.
+//
+// Format mirrors common Unix conventions:
+//   <tool> <our-tag> (DeepVariant <upstream-version>, build <sha> <date>)
+//   Apple Silicon native port — <arch>, <abi>
+//
+// All four substitutions are compile-time constants (DV_VERSION,
+// DV_UPSTREAM_VERSION, DV_GIT_SHA, DV_BUILD_DATE) baked in via
+// target_compile_definitions in CMakeLists.txt.
+static void PrintVersion() {
+  // Compile-time arch detection. We're arm64-only at runtime (per CLAUDE.md
+  // "macOS ≥ 14, arm64 only") but emit the actual built arch for honesty.
+#if defined(__aarch64__) || defined(__arm64__)
+  constexpr const char* kArch = "arm64";
+#elif defined(__x86_64__)
+  constexpr const char* kArch = "x86_64";
+#else
+  constexpr const char* kArch = "unknown";
+#endif
+  std::printf(
+      "%s %s (DeepVariant %s, build %s %s)\n"
+      "Apple Silicon native port — %s, macOS\n",
+      g_multicall_tool.c_str(),
+      DV_VERSION, DV_UPSTREAM_VERSION,
+      DV_GIT_SHA, DV_BUILD_DATE,
+      kArch);
+}
+
 // DetectMultiCall — return the subcommand name to inject when the binary
 // is invoked under one of its multi-call basenames. Empty string for the
 // canonical `deepvariant` invocation (or any unrecognized basename).
@@ -1943,15 +1972,18 @@ int main(int argc, char** argv) {
 
   // Multi-call binary path: dispatch directly to the injected mode.
   // The runner's own absl::ParseCommandLine handles --help / --helpfull /
-  // --help=<substr>. We still intercept top-level help words here so the
-  // user sees a per-tool synopsis (PrintTopLevelHelp branches on
-  // g_multicall_tool) before being told to use --helpfull for the full
-  // flag list.
+  // --help=<substr>. We still intercept top-level help / version words
+  // here so the user sees a per-tool synopsis (PrintTopLevelHelp branches
+  // on g_multicall_tool) and version banner before any flag parsing.
   if (!injected.empty()) {
     if (argc >= 2) {
       const std::string a1(argv[1]);
       if (a1 == "-h" || a1 == "--help" || a1 == "help") {
         PrintTopLevelHelp();
+        return 0;
+      }
+      if (a1 == "-v" || a1 == "--version" || a1 == "version") {
+        PrintVersion();
         return 0;
       }
     }
@@ -1976,6 +2008,14 @@ int main(int argc, char** argv) {
   // inside each Run* dispatcher.)
   if (sub == "-h" || sub == "--help" || sub == "help") {
     PrintTopLevelHelp();
+    return 0;
+  }
+
+  // Top-level version: -v, --version, version → print version + build
+  // metadata to stdout, return 0. Same convention as `git --version`,
+  // `samtools --version`, `bcftools --version`, etc.
+  if (sub == "-v" || sub == "--version" || sub == "version") {
+    PrintVersion();
     return 0;
   }
 

@@ -569,6 +569,36 @@ add_executable(deepvariant
 )
 target_include_directories(deepvariant PRIVATE ${ME_INCLUDE_DIRS})
 target_compile_options(deepvariant PRIVATE ${ME_COMPILE_OPTS})
+
+# Version metadata — captured at configure time and re-captured at every
+# build via a small `git rev-parse` shim, so `deepvariant --version` always
+# reflects the actual built tree (not just whatever was checked out when
+# CMake was first run). Three sources:
+#
+#   DV_VERSION           — hand-bumped semver-ish tag for this fork
+#                          (currently "v2-applesilicon"). Bumped at release.
+#   DV_UPSTREAM_VERSION  — Google DeepVariant version we mirror
+#                          (currently "1.10.0"). Bumped when we re-baseline.
+#   DV_GIT_SHA           — short SHA of HEAD at configure time. Re-checked
+#                          on every build via add_custom_target below; if
+#                          the SHA drifts, cli.cc gets recompiled.
+#   DV_BUILD_DATE        — ISO 8601 date of the build (UTC).
+execute_process(
+  COMMAND git rev-parse --short HEAD
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  OUTPUT_VARIABLE DV_GIT_SHA
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET)
+if(NOT DV_GIT_SHA)
+  set(DV_GIT_SHA "unknown")
+endif()
+string(TIMESTAMP DV_BUILD_DATE "%Y-%m-%d" UTC)
+target_compile_definitions(deepvariant PRIVATE
+  DV_VERSION="v2-applesilicon"
+  DV_UPSTREAM_VERSION="1.10.0"
+  DV_GIT_SHA="${DV_GIT_SHA}"
+  DV_BUILD_DATE="${DV_BUILD_DATE}"
+)
 target_link_libraries(deepvariant PRIVATE
   dv_make_examples_lib
   dv_postprocess_lib
