@@ -2143,21 +2143,72 @@ int RunMakeExamples(int argc, char** argv) {
           absl::GetFlag(FLAGS_use_direct_phasing) ||
           absl::GetFlag(FLAGS_small_model_use_haplotypes);
       if (need_phasing) {
+        // BUG FIX (chr20:23.97-23.99M PacBio FN cluster, 0e15ddb2 diagnosis):
+        // upstream make_examples_core.py:2308-2317 expands the region by 20%
+        // (`PHASE_READS_REGION_PADDING_PCT = 20`) before fetching reads for
+        // DirectPhasing. Reads spanning region boundaries provide the
+        // SNP-graph context that lets DP correctly split reads across HP=1
+        // vs HP=2 in dense haplotype blocks. Without padding, DP collapses
+        // all 49 alt-supporting reads at chr20:23973486 onto a single
+        // haplotype, so the small_model sees "100% reads on one HP, other
+        // HP empty" → predicts homref (Docker correctly splits → predicts
+        // HET).
+        //
+        // Fix: re-fetch reads from a 20%-padded region for DP. We do NOT
+        // change `working_reads` itself (still used downstream for the
+        // candidate-emitting AlleleCounter, pileup encoder, etc.) — only
+        // the DP input set. Upstream uses raw BAM reads (not realigned)
+        // for DP; we mirror that by re-Querying the SAM reader.
+        const int64_t region_len =
+            static_cast<int64_t>(region.end()) -
+            static_cast<int64_t>(region.start());
+        const int64_t pad = std::max<int64_t>(1, region_len * 20 / 100);
+        // contig_n in this scope: re-derive locally (the outer realigner
+        // block's contig_n is out of scope here when realigner is disabled).
+        auto contig_or_dp = ref_reader->Contig(region.reference_name());
+        const int64_t contig_n_dp =
+            contig_or_dp.ok()
+                ? contig_or_dp.ValueOrDie()->n_bases()
+                : static_cast<int64_t>(region.end()) + pad;
+        nucleus::genomics::v1::Range padded_region;
+        padded_region.set_reference_name(region.reference_name());
+        padded_region.set_start(std::max<int64_t>(0,
+            static_cast<int64_t>(region.start()) - pad));
+        padded_region.set_end(std::min<int64_t>(contig_n_dp,
+            static_cast<int64_t>(region.end()) + pad));
+
+        std::vector<nucleus::genomics::v1::Read> phasing_reads;
+        auto phasing_or = sam_reader->Query(padded_region);
+        if (phasing_or.ok()) {
+          auto& phasing_iter = phasing_or.ValueOrDie();
+          nucleus::genomics::v1::Read tmp;
+          while (true) {
+            auto next = phasing_iter->Next(&tmp);
+            if (!next.ok() || !next.ValueOrDie()) break;
+            phasing_reads.push_back(std::move(tmp));
+          }
+          phasing_iter->Release().IgnoreError();
+        }
+        // Defensive fallback: if the padded query returned nothing (e.g.,
+        // sam_reader transient failure), fall through to working_reads.
+        const auto& dp_reads_src =
+            phasing_reads.empty() ? working_reads : phasing_reads;
+
         std::vector<
             nucleus::ConstProtoPtr<const nucleus::genomics::v1::Read>>
             dp_read_ptrs;
-        dp_read_ptrs.reserve(working_reads.size());
-        for (auto& r : working_reads) dp_read_ptrs.emplace_back(&r);
+        dp_read_ptrs.reserve(dp_reads_src.size());
+        for (const auto& r : dp_reads_src) dp_read_ptrs.emplace_back(&r);
         auto so = dp.PhaseReads(absl::MakeSpan(candidates),
                                   absl::MakeSpan(dp_read_ptrs));
         if (so.ok()) {
           dp_ran = true;
           const std::vector<int>& phases = so.ValueOrDie();
-          // phases[i] corresponds to working_reads[i]: 0/1/2.
+          // phases[i] corresponds to dp_reads_src[i]: 0/1/2.
           for (size_t i = 0;
-               i < working_reads.size() && i < phases.size(); ++i) {
+               i < dp_reads_src.size() && i < phases.size(); ++i) {
             if (phases[i] == 0) continue;  // HP_0 default; skip to save memory
-            const auto& r = working_reads[i];
+            const auto& r = dp_reads_src[i];
             read_hp_tags[r.fragment_name() + "/" +
                          std::to_string(r.read_number())] =
                 static_cast<int8_t>(phases[i]);
