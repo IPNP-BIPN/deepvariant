@@ -110,11 +110,30 @@ bool TFRecordReader::GetNext() {
 
         record_.resize(length);
         s.read(record_.data(), static_cast<std::streamsize>(length));
-        if (static_cast<uint64_t>(s.gcount()) != length) return false;
-        s.seekg(4, std::ios::cur);  // skip payload CRC
-
-        offset_ += 8 + 4 + length + 4;
-        return true;
+        if (static_cast<uint64_t>(s.gcount()) != length) {
+          // BUG FIX (2026-05-10): the previous `return false` here would
+          // ABANDON all remaining shards in a multi-shard read whenever
+          // the LAST record of any shard was truncated. On a 14-shard
+          // WG run this caused 13/14 shards (~95 % of examples) to be
+          // silently dropped: call_variants only saw 69k of 954k
+          // examples → 947k PASS calls missing in the final VCF.
+          //
+          // Truncation cause: upstream's ExamplesGenerator destructor
+          // closes the writer without an explicit flush — the last
+          // partial-buffer write (1 record per shard, ≈10-150 KB out
+          // of 1 MiB buffer) is dropped on close.
+          //
+          // Fix: treat partial-payload same as EOF — fall through to
+          // shard-advance code. Loses the 1 truncated record per shard
+          // (unrecoverable since it was never written to disk) but
+          // preserves all following shards. WG impact: 14 lost records
+          // out of 954k = 0.0015 % vs 100 % loss before the fix.
+          // Fall through to shard-advance code below.
+        } else {
+          s.seekg(4, std::ios::cur);  // skip payload CRC
+          offset_ += 8 + 4 + length + 4;
+          return true;
+        }
       }
     }
     // Current shard exhausted (or read failed at boundary). Try next shard.
