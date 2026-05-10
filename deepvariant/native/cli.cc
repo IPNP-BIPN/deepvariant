@@ -20,10 +20,19 @@
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 
 // `run` subcommand flags. Reuse flags declared in the subcommand files
 // (--reads, --ref, --regions, --batch_size, --num_shards, etc.) to avoid
 // duplicate symbols at link time.
+ABSL_FLAG(bool, include_alt_contigs, false,
+          "If true, process alt/random/decoy/unplaced contigs (chr*_random, "
+          "chrUn_*, etc.) in addition to canonical chromosomes. Default false "
+          "to match google/deepvariant Docker behavior, which emits records "
+          "only on chr1..22, chrX, chrY, chrM. Without this filter, our binary "
+          "emits ~138k alt-contig records that Docker doesn't, breaking "
+          "FILTER parity at WG scale.");
+
 ABSL_FLAG(std::string, model_type, "WGS",
           "Model type: WGS, WES, PACBIO, ONT, HYBRID_PACBIO_ILLUMINA");
 ABSL_FLAG(std::string, output_vcf, "", "Output VCF path (run mode).");
@@ -174,6 +183,69 @@ int EffectiveNumShards() {
   // 0 (default) and 1 (=no sharding) both fall back to auto-detect.
   if (explicit_n > 1) return explicit_n;
   return AutoNumShards();
+}
+
+// IsCanonicalContig — return true if the contig name matches a canonical
+// chromosome: chr1..22, chrX, chrY, chrM, chrMT (or the no-prefix forms
+// 1..22, X, Y, M, MT). Reject anything with `_` (alt/random/decoy/unplaced)
+// or anything that's not numeric / X / Y / M[T].
+//
+// Docker's run_deepvariant emits records only on canonical contigs,
+// even when the BAM has reads on alt-contigs (verified empirically:
+// HG002 BAM has 1.5M reads on chrUn_KI270438v1 but Docker emits 0
+// records there). This helper drives our default filter to match.
+bool IsCanonicalContig(absl::string_view name) {
+  if (name.empty()) return false;
+  // Reject anything with underscore (alt/random/decoy/unplaced).
+  if (name.find('_') != absl::string_view::npos) return false;
+  // Strip optional `chr` prefix.
+  absl::string_view bare = name;
+  if (bare.size() > 3 && bare.substr(0, 3) == "chr") bare.remove_prefix(3);
+  // Sex chroms / mito.
+  if (bare == "X" || bare == "Y" || bare == "M" || bare == "MT") return true;
+  // Numeric 1..22.
+  if (bare.empty()) return false;
+  for (char c : bare) {
+    if (c < '0' || c > '9') return false;
+  }
+  int n = 0;
+  if (!absl::SimpleAtoi(bare, &n)) return false;
+  return n >= 1 && n <= 22;
+}
+
+// DefaultCanonicalRegions — when --regions is empty AND
+// --include_alt_contigs=false, return a comma-separated list of all
+// canonical contigs from the reference's .fai index. Matches Docker's
+// implicit canonical-only filter.
+//
+// Returns empty string on any failure (missing .fai, no canonical
+// contigs found, etc.); caller falls through to the no-regions path
+// in that case.
+std::string DefaultCanonicalRegions(const std::string& ref_path) {
+  const std::string fai_path = absl::StrCat(ref_path, ".fai");
+  std::ifstream fai(fai_path);
+  if (!fai) return "";
+  std::vector<std::string> canonical;
+  std::string line;
+  while (std::getline(fai, line)) {
+    const auto tab = line.find('\t');
+    if (tab == std::string::npos) continue;
+    const std::string name = line.substr(0, tab);
+    if (IsCanonicalContig(name)) canonical.push_back(name);
+  }
+  if (canonical.empty()) return "";
+  return absl::StrJoin(canonical, ",");
+}
+
+// EffectiveRegions — resolve the regions string to use for make_examples.
+//   - If --regions is non-empty: pass through (user explicitly chose).
+//   - Else if --include_alt_contigs=true: pass through empty (process all).
+//   - Else: build canonical list from reference .fai (matches Docker).
+std::string EffectiveRegions(const std::string& user_regions,
+                              const std::string& ref_path) {
+  if (!user_regions.empty()) return user_regions;
+  if (absl::GetFlag(FLAGS_include_alt_contigs)) return "";
+  return DefaultCanonicalRegions(ref_path);
 }
 
 // Auto-detect a sensible default for --batch_size based on physical
@@ -776,7 +848,8 @@ int RunAll(int argc, char** argv) {
   const std::string reads_flag = absl::GetFlag(FLAGS_reads);
   const std::string ref_flag = absl::GetFlag(FLAGS_ref);
   const std::string output_vcf_flag = absl::GetFlag(FLAGS_output_vcf);
-  const std::string regions_flag = absl::GetFlag(FLAGS_regions);
+  const std::string user_regions = absl::GetFlag(FLAGS_regions);
+  const std::string regions_flag = EffectiveRegions(user_regions, ref_flag);
   const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
   const int num_shards = EffectiveNumShards();
 
@@ -1025,7 +1098,8 @@ int RunAllTrio(int argc, char** argv) {
   { std::system(absl::StrCat("mkdir -p '",
       absl::GetFlag(FLAGS_intermediate_results_dir), "'").c_str()); }
   const std::string ref_flag = absl::GetFlag(FLAGS_ref);
-  const std::string regions_flag = absl::GetFlag(FLAGS_regions);
+  const std::string user_regions = absl::GetFlag(FLAGS_regions);
+  const std::string regions_flag = EffectiveRegions(user_regions, ref_flag);
   const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
   const int num_shards = EffectiveNumShards();
   const int n_threads = std::max(1, num_shards);
@@ -1366,7 +1440,8 @@ int RunAllSomatic(int argc, char** argv) {
   { std::system(absl::StrCat("mkdir -p '",
       absl::GetFlag(FLAGS_intermediate_results_dir), "'").c_str()); }
   const std::string ref_flag = absl::GetFlag(FLAGS_ref);
-  const std::string regions_flag = absl::GetFlag(FLAGS_regions);
+  const std::string user_regions = absl::GetFlag(FLAGS_regions);
+  const std::string regions_flag = EffectiveRegions(user_regions, ref_flag);
   const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
   const int num_shards = EffectiveNumShards();
   const int n_threads = std::max(1, num_shards);
@@ -1590,7 +1665,8 @@ int RunAllPangenome(int argc, char** argv) {
   { std::system(absl::StrCat("mkdir -p '",
       absl::GetFlag(FLAGS_intermediate_results_dir), "'").c_str()); }
   const std::string ref_flag = absl::GetFlag(FLAGS_ref);
-  const std::string regions_flag = absl::GetFlag(FLAGS_regions);
+  const std::string user_regions = absl::GetFlag(FLAGS_regions);
+  const std::string regions_flag = EffectiveRegions(user_regions, ref_flag);
   const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
   const int num_shards = EffectiveNumShards();
   const int n_threads = std::max(1, num_shards);
