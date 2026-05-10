@@ -195,6 +195,24 @@ struct TFRecordWriter::Impl {
 
   bool FlushBuf() {
     if (!ok || buf_used == 0) return ok;
+    // BUG FIX (2026-05-10): F_NOCACHE on macOS silently truncates writes
+    // that are not multiples of the disk's sector size. Empirically a
+    // 155 KiB partial last record at end-of-file got truncated to
+    // 139 KiB (= 34 × 4 KiB rounded down) — the kernel writes only the
+    // sector-aligned prefix and discards the tail without an error
+    // return. This caused 1 record per shard to be lost on close, then
+    // the previous TFRecordReader bug (return false on truncated tail)
+    // amplified it to 95 % data loss in multi-shard reads.
+    //
+    // Fix: only the partial-buffer flush (`buf_used < buf.size()`) hits
+    // the alignment problem. For full 1-MiB buffer flushes we keep
+    // F_NOCACHE on (avoiding macOS Jetsam from dirty-page accounting at
+    // WG scale, per the implementation note above). For partial flushes
+    // we re-enable the buffered path so the kernel can write any byte
+    // count cleanly.
+    const bool partial = buf_used < buf.size();
+    if (partial && fd >= 0) ::fcntl(fd, F_NOCACHE, 0);
+
     const char* p = buf.data();
     size_t left = buf_used;
     while (left > 0) {
@@ -204,6 +222,9 @@ struct TFRecordWriter::Impl {
       left -= static_cast<size_t>(n);
     }
     buf_used = 0;
+
+    // Re-enable F_NOCACHE for any subsequent full-buffer flushes.
+    if (partial && fd >= 0) ::fcntl(fd, F_NOCACHE, 1);
     return true;
   }
 
