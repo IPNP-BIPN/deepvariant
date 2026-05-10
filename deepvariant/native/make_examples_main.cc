@@ -1501,20 +1501,15 @@ int RunMakeExamples(int argc, char** argv) {
         }
         reads_iter->Release().IgnoreError();
         if (max_rpp > 0 && raw_reads.size() > static_cast<size_t>(max_rpp)) {
-          // Shard-count-independence guard: stable-sort by (POS,
-          // fragment_name, read_number) before reservoir sampling. See
-          // the long comment at the single-sample worker site for
-          // rationale; trio path mirrors that fix exactly.
-          std::stable_sort(raw_reads.begin(), raw_reads.end(),
-                           [](const nucleus::genomics::v1::Read& a,
-                              const nucleus::genomics::v1::Read& b) {
-                             const int64_t pa = a.alignment().position().position();
-                             const int64_t pb = b.alignment().position().position();
-                             if (pa != pb) return pa < pb;
-                             const int cmp = a.fragment_name().compare(b.fragment_name());
-                             if (cmp != 0) return cmp < 0;
-                             return a.read_number() < b.read_number();
-                           });
+          // BUG FIX (2026-05-10): the previous stable_sort by
+          // (POS, fragment_name, read_number) was added in Phase 5.5d/10
+          // as a "shard-count-independence guard", but it CHANGED the
+          // input order to reservoir sampling vs Docker. Docker reads
+          // BAM-naturally ordered (POS only, secondary by file offset),
+          // and our sort by (POS, fragment_name, read_number) reorders
+          // same-POS reads → reservoir picks different reads → ±1-4 read
+          // DP differences at WG scale on ~79 % of FILTER-mismatch sites.
+          // Removed for full Docker compatibility (user directive 2026-05-10).
           ::deepvariant::npr::NumpyMt19937 region_rng(opts.random_seed());
           auto sampled = ::deepvariant::npr::ReservoirSamplePtrs(
               raw_reads, max_rpp, region_rng);
@@ -1954,17 +1949,26 @@ int RunMakeExamples(int argc, char** argv) {
     const int max_rpp = static_cast<int>(opts.max_reads_per_partition());
     if (max_rpp > 0 && reads.size() > static_cast<size_t>(max_rpp)) {
       const size_t orig_n = reads.size();
-      // Defensive stable sort by (POS, fragment_name, read_number).
-      std::stable_sort(reads.begin(), reads.end(),
-                       [](const nucleus::genomics::v1::Read& a,
-                          const nucleus::genomics::v1::Read& b) {
-                         const int64_t pa = a.alignment().position().position();
-                         const int64_t pb = b.alignment().position().position();
-                         if (pa != pb) return pa < pb;
-                         const int cmp = a.fragment_name().compare(b.fragment_name());
-                         if (cmp != 0) return cmp < 0;
-                         return a.read_number() < b.read_number();
-                       });
+      // BUG FIX (2026-05-10): the previous stable_sort by
+      // (POS, fragment_name, read_number) here was added in Phase 5.5d/10
+      // as a "shard-count-independence guard", but it CHANGED the
+      // input order to reservoir sampling vs Docker. Docker reads BAM
+      // in natural order (POS only, secondary by file offset, NOT by
+      // fragment_name/read_number), and our sort reordered same-POS
+      // reads → reservoir picks different reads → ±1-4 read DP
+      // differences at WG scale on ~79 % of FILTER-mismatch sites
+      // (HG002 WG: 4,146 FM, of which ~3,200 trace to this sort).
+      //
+      // BAM is coordinate-sorted at the file level, and htslib's
+      // SamReader::Query() iterates within a region in the BAM's
+      // natural order — same as pysam.AlignmentFile.fetch which
+      // Docker uses. So removing the sort makes our reservoir input
+      // bit-identical to Docker's at the read level.
+      //
+      // The "shard-count independence" rationale doesn't apply here
+      // anyway: each region is processed by a single thread that owns
+      // its own SamReader, so the read-load order is deterministic
+      // per region regardless of thread count.
       ::deepvariant::npr::NumpyMt19937 region_rng(opts.random_seed());
       auto sampled =
           ::deepvariant::npr::ReservoirSamplePtrs(reads, max_rpp, region_rng);
