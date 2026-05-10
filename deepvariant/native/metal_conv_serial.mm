@@ -2,10 +2,15 @@
 
 #include "deepvariant/native/metal_conv_serial.h"
 
+#include <cstdlib>
+#include <mutex>
+
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
 #include "absl/log/log.h"
+
+#include "deepvariant/native/metal_conv_kahan.h"  // Path B: Kahan delegation
 
 namespace deepvariant {
 
@@ -156,6 +161,44 @@ std::unique_ptr<MetalConvSerial> MetalConvSerial::Create() {
   }
 }
 
+// Path B (2026-05-10): when DV_METAL_KAHAN=1 is set, delegate ALL
+// MetalConvSerial::Encode calls to a singleton MetalConvKahan instance.
+// MetalConvKahan implements the SAME ConvDesc + buffer contract as
+// MetalConvSerial but accumulates with Kahan-Babuška compensated
+// summation (per-thread, sequential), achieving O(ε²·|sum|) reduction
+// error vs O(ε·|sum|) for basic FMA. This brings our reduction
+// numerically closer to Eigen-x86's chunked-FMA path that Docker uses,
+// with the goal of eliminating the residual ~0.02 % FP32 drift at the
+// GQ=20 boundary that flips FILTER classes.
+//
+// Singleton pattern: lazy-init on first call (after env-var check),
+// shared across all dispatch sites in the inference path. No API
+// changes anywhere — the swap is transparent.
+namespace {
+std::once_flag g_kahan_init;
+std::unique_ptr<MetalConvKahan> g_kahan;
+bool g_kahan_enabled = false;
+
+bool KahanEnabled() {
+  std::call_once(g_kahan_init, []() {
+    const char* env = std::getenv("DV_METAL_KAHAN");
+    if (env && env[0] == '1') {
+      auto k = MetalConvKahan::Create();
+      if (k) {
+        g_kahan = std::move(k);
+        g_kahan_enabled = true;
+        LOG(INFO) << "MetalConvSerial: DV_METAL_KAHAN=1 — delegating all "
+                     "Conv2D to MetalConvKahan (compensated summation)";
+      } else {
+        LOG(WARNING) << "DV_METAL_KAHAN=1 set but MetalConvKahan::Create "
+                        "failed — falling back to basic serial FMA";
+      }
+    }
+  });
+  return g_kahan_enabled;
+}
+}  // namespace
+
 bool MetalConvSerial::Encode(id<MTLCommandBuffer> cmd_buf,
                               id<MTLBuffer> src, id<MTLBuffer> W,
                               id<MTLBuffer> bias, id<MTLBuffer> dst,
@@ -163,6 +206,11 @@ bool MetalConvSerial::Encode(id<MTLCommandBuffer> cmd_buf,
   if (!cmd_buf || !src || !W || !bias || !dst) {
     LOG(ERROR) << "MetalConvSerial::Encode: nil buffer";
     return false;
+  }
+
+  // Path B delegation — transparent to all call sites.
+  if (KahanEnabled()) {
+    return g_kahan->Encode(cmd_buf, src, W, bias, dst, d);
   }
 
   ConvParamsGpu params{};
