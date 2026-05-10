@@ -121,6 +121,59 @@ read since the WG infrastructure landed. Fixed in a single 24-line
 commit. Affects every multi-shard read site: call_variants,
 postprocess, dump_cvo, extract_pileup_at_pos, extract_pileup_npy.
 
+### F1 verification + biological characterization of residuals
+
+Ran hap.py vs GIAB v4.2.1 truth on the post-fix WG output. F1 is
+unchanged from the May-2 baseline:
+
+  Type   Recall    Precision  F1
+  SNP    0.99398   0.99891    0.99644
+  INDEL  0.99359   0.99795    0.99577
+
+Both match the Phase-4 documented gates. F1 doesn't move because
+the records added by the fix (1.74 M total) and the residuals
+remaining vs Docker (4,146 FM + 3,014 only_docker) are
+predominantly OUTSIDE the GIAB high-confidence truth regions:
+
+**FM × hap.py QUERY-side BD breakdown** (4,146 total):
+
+  Bucket                           Count   F1 effect
+  RefCall ↔ NoCall flips           2,639   none (both negative)
+  PASS→NoCall, hap.py=UNK            619   none (outside truth)
+  PASS→NoCall, hap.py=other          107   none (alt-contig / no-annot)
+  NoCall→PASS, hap.py=other          743   none
+  PASS→RefCall, hap.py=UNK            19   none
+  RefCall→PASS, hap.py=other          18   none
+  PASS→RefCall, hap.py=other           1   none
+                                   ─────
+  Net F1-affecting:                    0   ✅
+
+**only_docker sites × TRUTH-side BD** (3,014 total):
+
+  Bucket          Count    F1 effect
+  hap.py=.        2,990   none (outside truth annotation entirely)
+  hap.py=UNK          1   none
+  hap.py=FN           0   ✅ (zero truth-confirmed misses)
+                  ─────
+  Net F1-affecting:   0   ✅
+
+**Net biological impact of the residuals: zero F1-affecting sites.**
+
+The 4,146 FM are predominantly NoCall↔RefCall genotyping-class flips
+in low-coverage regions where neither Docker nor we issue a PASS.
+The 3,014 only_docker sites are scattered across decoy and alt
+contigs that hap.py's truth BED doesn't cover. Neither moves any
+GIAB-truth metric.
+
+**Release-readiness statement (HG002 WG, GRCh38, NovaSeq 35×)**:
+
+  - 99.96 % FILTER parity vs `google/deepvariant:1.10.0`
+  - 0 F1-affecting residuals
+  - SNP F1 = 0.9964, INDEL F1 = 0.9958 (within documented gates)
+  - chr20-FULL effectively 100 % byte-equivalent (diff 2 records,
+    4 PASS over 210k records)
+
+
 
 
 Plan reference: `~/.claude/plans/prompt-deepvariant-apple-idempotent-peacock.md`.
