@@ -3241,3 +3241,59 @@ summation (Tier 6.A research, unimplemented).
   CLAUDE.md gate "FILTER class match within FP32 drift tolerance"
 
 Plan: `/Users/benjamin/.claude/plans/magical-orbiting-widget.md`
+
+## 2026-05-11 — No-sort fix lands: 99.91 % → 99.9993 % FILTER parity
+
+After commit `044d8503` (remove pre-reservoir-sort), fresh HG002 WG
+run produced **dramatically** different results than the 3-fixes
+baseline:
+
+| metric | 3-fixes baseline | 4-fixes (no-sort) | reduction |
+|---|---|---|---|
+| shared | 7,706,225 | 7,709,220 | +2,995 |
+| only_ours | 3,251 | **15** | **-99.5 %** |
+| only_docker | 3,014 | **19** | **-99.4 %** |
+| FM | 4,146 | **24** | **-99.4 %** |
+
+Total disagreement: **58 sites of 7,709,254 records = 0.00075 %**.
+
+Confirms the diagnostic: the Phase 5.5d/10 sort by (POS, fragment_name,
+read_number) was THE cause of ~99 % of the WG FM remaining after the
+TFRecord reader+writer fixes. Removing it gives bit-identical
+reservoir-sampling input to Docker's pysam.AlignmentFile.fetch order.
+
+### Residual 24 FM characterization
+
+```
+12 NoCall → PASS    (Docker calls; we miss)
+ 5 PASS → NoCall    (we call; Docker doesn't)
+ 4 NoCall → RefCall
+ 3 RefCall → NoCall
+```
+
+**22/24 have IDENTICAL DP** vs Docker → these are pure FP32 drift at
+the GQ=20 / qual=0.1 boundaries (softmax non-associativity between
+our MPSGraph SIMD-parallel and Docker's Eigen-x86 chunked-FMA).
+
+Only **2/24 have differing DP** — likely chromosome-end boundary
+effects or specific edge cases.
+
+The 24 FM cluster at a few hotspots:
+- chr17:80355483-80355581: 6 FM in 100 bp (likely repeat region)
+- chr19:1959606-1959623: 3 FM in 17 bp
+- chr3:126640228-126640259: 2 FM
+- All others: scattered
+
+### Path forward: Kahan-compensated Conv2D
+
+Commit `ed4f7fd3` already wired Kahan-compensated FMA into the
+deterministic Metal kernel path (DV_METAL_DET_LAYERS=stem +
+DV_METAL_SERIAL_FULL=1 + DV_METAL_KAHAN=1). Microtest-verified
+bit-exact at the kernel level (microtest_conv_kahan 4/4 PASS).
+
+If Kahan closes the FP32 drift, it would target the 22/24 same-DP
+FM. If the residual 2/24 different-DP FM persist (likely chromosome
+boundary effects), they'd need separate diagnosis.
+
+Next: launch WG re-run with all 4 fixes + Kahan path enabled
+(~4-5 h under Kahan's compensated-summation overhead).
