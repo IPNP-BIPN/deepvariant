@@ -59,6 +59,8 @@ target_include_directories(dv_metal_conv_serial PUBLIC
   "${ABSL_PREFIX}/include"
 )
 target_link_libraries(dv_metal_conv_serial PUBLIC
+  dv_metal_conv_kahan       # Path B: MetalConvSerial::Encode delegates to
+                            # MetalConvKahan when DV_METAL_KAHAN=1 is set.
   absl::log
   "-framework Metal"
   "-framework Foundation"
