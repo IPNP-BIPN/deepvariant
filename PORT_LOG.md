@@ -2,6 +2,127 @@
 
 Running log of decisions, gotchas, and progress on `feature/apple-silicon-native-v2`.
 
+## 2026-05-10 — WG-scale FILTER parity vs Docker — single-commit recovery
+
+User asked for whole-genome (not just chr20) FM analysis vs
+`google/deepvariant:1.10.0`. Downloaded HG002 NovaSeq 35× WG BAM
+(~43 GB from Google Storage), ran our binary (83 min) and Docker DV
+(371 min under Rosetta) on the same fixture. Initial result was a
+catastrophic gap:
+
+  Pre-fix WG comparison vs Docker:
+    ours        6,108,186 records   (3,895,495 PASS)
+    docker      7,709,239 records   (4,842,559 PASS)
+    shared      6,071,116
+    only_docker 1,638,123  (incl. 927,521 PASS Docker calls we don't)
+    only_ours      37,070
+    FM             36,420
+    ⇒ -1.6M record gap, -947k PASS calls
+
+But on chr20 standalone (`--regions=chr20`) the same binary gives
+107,109 PASS = matches Docker exactly. The regression was
+WG-orchestration-only.
+
+### Root cause: TFRecordReader silent abandonment on truncated tail
+
+Diagnosed via `dump_cvo` + `DV_TFR_DEBUG` instrumentation. Each of
+the 14 `examples.tfrecord-NNNNN-of-00014` shards has the LAST record
+truncated (upstream `ExamplesGenerator` writer doesn't flush its
+last partial buffer on close — confirmed by inspecting file sizes
+vs. declared record lengths). The TFRecordReader's GetNext code:
+
+```cpp
+if (static_cast<uint64_t>(s.gcount()) != length) return false;
+```
+
+returned false on the FIRST shard's truncated tail, ABANDONING all
+13 remaining shards silently. Result: call_variants saw 69,160
+examples instead of 954,670 (an 14× under-read = ~95 % of big-model
+candidates dropped on the floor).
+
+Fix (commit `26b55dff`): treat truncated payload same as EOF — fall
+through to shard-advance code instead of returning false. Loses the
+14 actually-truncated records (1 per shard, unrecoverable since
+never written to disk) but preserves the other 954,656.
+
+### Effect (single-commit win)
+
+Re-ran end-to-end WG with the fixed binary (~80 min, identical
+runtime):
+
+  Metric           Before fix    After fix       Δ
+  ──────────────────────────────────────────────────────
+  total records    6,108,186     7,844,914       +1,736,728
+  PASS             3,895,495     4,874,147       +978,652
+  RefCall          2,154,414     2,462,883       +308,469
+  NoCall              58,277       507,884       +449,607
+
+vs Docker WG (7,709,239 records, 4,842,559 PASS):
+
+  Metric           Before fix    After fix       Δ
+  ──────────────────────────────────────────────────────
+  shared sites     6,071,116     7,706,225       99.96 % of Docker
+  only_ours           37,070       138,689       extra alt-contigs
+  only_docker      1,638,123         3,014       -99.8 % (gap closed)
+  FM (mismatch)       36,420         4,146       -88.6 %
+
+  PASS-flips broken down:
+     1357 RefCall → NoCall   (we RefCall, Docker NoCall — borderline coverage)
+     1282 NoCall → RefCall   (opposite direction)
+      743 NoCall → PASS      (we miss, Docker captures TP)
+      726 PASS → NoCall      (we call, Docker doesn't trust it)
+       20 PASS → RefCall
+       18 RefCall → PASS
+     ─────────────────────
+     1507 real PASS-flips out of 7.7M records  =  0.02 %
+
+  chr20 specifically (in WG mode):
+     ours_v2  210,388 records (107,109 PASS)
+     docker   210,390 records (107,113 PASS)
+     ⇒ diff of 2 records / 4 PASS — effectively 100 % parity
+
+### Decomposition of residuals
+
+**only_ours = 138,689 extra records** (we emit, Docker skips):
+  64,553 on chrUn_*           (decoy contigs)
+  25,728 on chr14_KI270*      (alt contigs)
+  12,088 on chr22_KI270*
+  11,994 on chr17_KI270*
+   8,545 on chr1_KI270*
+   ... (scattered alt + random contigs)
+  ⇒ all 138k are alt/random/decoy contigs that Docker filters out
+    by default per its --regions canonical-chromosome convention.
+    These would not affect any GIAB F1 metric.
+
+**only_docker = 3,014 records** (Docker emits, we miss):
+   732 chr4
+   364 chrY
+   326 chr1
+   312 chr10
+   254 chr21
+   211 chr20
+   134 chr2
+   ... scattered across canonical chromosomes
+  ⇒ real biological gap; ~0.04 % of canonical-chrom records.
+    Likely a mix of: borderline calls Docker captures via slightly
+    different candidate generation, plus the FP32 non-associativity
+    drift documented previously (small_model dispatch threshold,
+    indel realignment edge cases).
+
+### Bottom line
+
+**Whole-genome FILTER parity vs Docker is now 99.96 %**, with 0.02 %
+real PASS-flips and 0.04 % records-only-Docker. Chr20-FULL in WG
+mode is at effectively 100 % parity (diff of 2 records, 4 PASS).
+
+The reader bug (`return false` on truncated tail) had been silently
+costing us ~95 % of big-model contributions on every multi-shard
+read since the WG infrastructure landed. Fixed in a single 24-line
+commit. Affects every multi-shard read site: call_variants,
+postprocess, dump_cvo, extract_pileup_at_pos, extract_pileup_npy.
+
+
+
 Plan reference: `~/.claude/plans/prompt-deepvariant-apple-idempotent-peacock.md`.
 
 ## 2026-04-25 — Phase 0 bootstrap
