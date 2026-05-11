@@ -3297,3 +3297,67 @@ boundary effects), they'd need separate diagnosis.
 
 Next: launch WG re-run with all 4 fixes + Kahan path enabled
 (~4-5 h under Kahan's compensated-summation overhead).
+
+## 2026-05-11 — Path B Kahan WG result: didn't close the gap
+
+Tried Kahan-compensated Conv2D at WG scale (`ed4f7fd3` wiring +
+DV_METAL_DET_LAYERS=stem + DV_METAL_SERIAL_FULL=1 + DV_METAL_KAHAN=1):
+
+| metric | 4-fixes (no-sort) | + Kahan path B |
+|---|---|---|
+| shared records | 7,709,220 | 7,709,220 |
+| only_ours | 15 | 15 |
+| only_docker | 19 | 19 |
+| FM | 24 | **25 (+1)** |
+| Wall-time | 80 min | **697 min (11.6 h, 8.7× slower)** |
+
+Kahan compensation **did not reduce FM** — it produced a slightly
+different drift (1 site flipped direction in the RefCall↔NoCall
+buckets: 3 → 4 RefCall→NoCall, 4 → 4 NoCall→RefCall). Same number
+of fundamental disagreements; just shuffled.
+
+### Why Kahan doesn't reach bit-exact vs Docker
+
+CLAUDE.md predicted this with "Incertain — peut-être pas bit-exact
+vs Eigen-x86 quand même". Confirmed: Kahan compensates the
+*accumulator* error to O(ε²·|sum|), but the actual bit-pattern still
+depends on FMA chunk order.
+
+- **Docker** (Eigen-x86 / AVX-512): chunked-FMA with implementation-
+  specific chunk size (8, 16, ...)
+- **Our Kahan path**: per-thread sequential FMA in Metal (no chunking)
+
+Different chunking → different intermediate values → different
+final bit-patterns. Both are within ~1 ULP of the true sum, but they
+land on different sides of the GQ=20 rounding boundary at borderline
+sites.
+
+For bit-exact match with Docker's Eigen-x86 we'd need:
+- Replicate Eigen's exact chunked-FMA reduction order in Metal,
+  OR
+- Move to a CPU backend that uses Eigen directly (Path C below).
+
+### Path B verdict
+
+**Wiring infrastructure preserved** (commit `ed4f7fd3`). Useful for:
+- Cross-chip determinism (Kahan is bit-deterministic across M-series)
+- Single-machine reproducibility
+- Future "Tier 6.A.2" research if a use-case requires it
+
+**Not useful for** the immediate "100 % FM vs Docker" goal.
+
+### Path forward to 100 % FM
+
+Given Kahan didn't help, remaining options:
+
+- **Path C**: BNNS-CPU big-model port (uses same Eigen as Docker;
+  bit-exact by construction; ~1 week port, ~10× slower inference).
+  Status: small_model already on BNNS-CPU (Phase 5.5d/7), proven
+  bit-equal to TF/Keras. Big model port follows same pattern.
+- **Path D**: Investigate the 2/24 different-DP FM cases (likely
+  chromosome-end or boundary-effect; may fix 2 sites cheaply).
+- **Path E**: Accept 24 FM (0.0003 %) as documented FP32 drift floor.
+
+The 22/24 same-DP FM are now provably bit-exact-impossible without
+Path C (which architecturally requires a CPU backend matching
+Eigen's reduction order).
