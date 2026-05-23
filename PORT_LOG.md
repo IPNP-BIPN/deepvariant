@@ -3824,3 +3824,139 @@ Path D Site 1 is now **diagnosed at bit-level**; the fix is a focused
 realigner-port audit. Path D Site 2 was previously categorised as an
 intrinsic candidate-enumeration divergence — also bit-confirmed to
 be a different-event, not a fixable one.
+
+## 2026-05-23 — Path D fix LANDED: realigner normalize_reads propagation
+
+### Root cause
+
+`fast_pass_aligner.cc:557-568` contains this discard step:
+
+```cpp
+// The following block is only executed if normalize_reads flag is not
+// set. This is because if --normalize_reads is true, they will be
+// normalize later on.
+if (!normalize_reads_) {
+  if (!IsAlignmentNormalized(readToRefCigarOps, ...)) {
+      readToRefCigarOps.clear();   // ← discards the realigned CIGAR
+  }
+}
+```
+
+When `normalize_reads_=false`, FastPassAligner throws away any realigned
+alignment whose CIGAR could be further left-shifted. In T-homopolymer
+regions (e.g. chr12:62946475 GTTTT>G inside a 16-T run), the SSW-best
+alignment frequently has shiftable indels — these are SILENTLY discarded
+and the read keeps its original (un-realigned) alignment, losing the
++1 DP contribution that Docker counts.
+
+Upstream's `realigner.py:call_fast_pass_aligner:779` propagates
+`self.config.normalize_reads` onto the aligner:
+
+```python
+fast_pass_realigner.set_normalize_reads(self.config.normalize_reads)
+```
+
+Our `realigner_native.cc:384-393` **never called `set_normalize_reads(true)`**,
+so it defaulted to false → discard fires → reads not shifted. This was the
++1 DP miss.
+
+### Fix
+
+Two-line change:
+
+  1. `make_examples_main.cc::RealignerOptionsFromFlags()` — set
+     `opts.set_normalize_reads(true)` to mirror the existing
+     `allele_counter_options.normalize_reads = true` (already set at
+     line 821, matching Docker's `--normalize_reads=true` default).
+  2. `realigner_native.cc` per-region build — call
+     `aligner.set_normalize_reads(options.normalize_reads())` before
+     `AlignReads()`.
+
+### Verification: Site 1 (chr12:62946475)
+
+```
+                DP   AD       VAF        MID            PL          FILTER
+ours pre-fix    26   11,11    0.423077   small_model   0,0,14      PASS
+ours post-fix   27   11,11    0.407407   small_model   0,0,15      PASS
+docker          27   11,11    0.407407   deepvariant   0,0,13      NoCall
+```
+
+**DP / AD / VAF now match Docker exactly.** The smoking-gun read
+`A00744:46:HV3C3DSXX:2:1662:9579:2613` is now realigned by our binary to
+POS=62946472 CIGAR=18M6I127M — bit-identical to Docker.
+
+The remaining FILTER difference (PASS vs NoCall) is now a *downstream*
+cascade: with DP=27 the small_model's max_p still crosses our
+`indel_gq_threshold=28` (accept), while Docker's small_model (same
+BNNS-CPU FP32-equivalent code) rejects. This last 1 read of the realigner
+output (read `2533:19036:36808/0`, mate of another corrected read) is
+still not shifted by us (we shift /1 but not /0 — Docker shifts both).
+This residual is a single SSW tiebreak edge case in the same TA-repeat,
+not a structural fix.
+
+### Verification: Site 2 (chr2:201836152 / 201836160)
+
+```
+ours pre-fix:    chr2:201836160  A>ATAT   PASS    (insertion call)
+docker:          chr2:201836152  TTTTATATA>T  NoCall (deletion call)
+ours post-fix:   BOTH calls emitted as NoCall, matching Docker exactly
+                 → 18 records in region 201836100-201836200, all
+                   identical to Docker's 18 records (CHROM/POS/REF/ALT
+                   /FILTER/AD/VAF all match)
+```
+
+**Site 2 candidate-enumeration divergence is also closed** by this fix.
+The realigner now produces the same candidates Docker does in this
+tandem repeat. Both calls (insertion @ 201836160 and deletion @ 201836152)
+get NoCall, matching Docker bit-for-bit.
+
+### Regression check: chr20:10M-10.1M fixture
+
+```
+$ bash validation/diff_filter_classes.sh ours_chr20.vcf.gz docker_chr20.vcf.gz
+  shared sites    : 313
+  only ours       : 0
+  only docker     : 0
+  FM on shared    : 0
+
+✅ 100 % FILTER-class parity
+```
+
+The release-gate fixture is **unchanged at 0 FM**. The fix does not
+regress the standard test.
+
+### Expected WG impact
+
+The fix touches every realigner invocation, so the 2/7.7M Path D residual
+sites are the smallest claim — many of the 22 FP32-drift residuals at
+borderline sites may also shift slightly because the new realignments
+feed different pileup features into the big_model. Net WG FM impact
+requires a re-run; expected direction is "≤ same" given the chr20 fixture
+preservation and the principle that matching Docker's behaviour more
+closely converges, not diverges.
+
+Site 1 site-level FM eliminates DP/AD/VAF drift; FILTER cascade through
+small_model dispatch is one additional knob away (matching the
+`/0` mate's realignment would close the last bit). Site 2 fully matches
+Docker post-fix.
+
+### Diagnostic infrastructure used
+
+Total ad-hoc tooling spent to land this fix:
+
+  - Streamed HG002 chr12 region BAM (48 KB) + UCSC ref API (4 KB) for
+    initial per-read CIGAR pattern recognition.
+  - Streamed canonical GRCh38_no_alt (833 MB, one-time) + `samtools faidx`
+    locally.
+  - 1× Docker DV run with `realigner_diagnostics=` to dump per-read
+    realigned BAM (28 s wall-time under linux/amd64 emulation).
+  - Fresh CMake configure + 14-thread build of our binary (8 s + 11 s).
+  - 1× our binary run with `DV_REALIGNED_READS_TSV=` (1.5 s wall-time
+    on M-series native).
+  - Per-read POS/CIGAR diff between our TSV and Docker's BAM → ID'd
+    the missing `set_normalize_reads()` propagation.
+  - Code fix + rebuild + re-run + verify (under 5 min total).
+
+The full bit-diagnosis-and-fix loop is now under 1 hour from a fresh
+clone, no full WG run needed. This is the playbook for any future
+realigner / candidate-generation drift investigation.

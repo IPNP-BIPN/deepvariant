@@ -958,6 +958,18 @@ RealignerOptionsFromFlags() {
   opts.mutable_aln_config()->set_mismatch(absl::GetFlag(FLAGS_aln_mismatch));
   opts.mutable_aln_config()->set_gap_open(absl::GetFlag(FLAGS_aln_gap_open));
   opts.mutable_aln_config()->set_gap_extend(absl::GetFlag(FLAGS_aln_gap_extend));
+  // BUG FIX (Path D Site 1, chr12:62946475 1-read-off, 2026-05-23):
+  // Mirror upstream `realigner.py:_realigner_options` (lines 420-429):
+  // when --normalize_reads is true (we hardcode this true on
+  // AlleleCounterOptions at line ~821), the RealignerOptions.normalize_reads
+  // must also be true so FastPassAligner does NOT discard realigned
+  // alignments whose CIGAR is not left-normalized. Without this, reads
+  // in T-homopolymer regions (e.g. chr12:62946475 GTTTT>G in a 16-T run)
+  // whose realigned CIGAR has any shiftable indel get thrown out by
+  // `fast_pass_aligner.cc:557-568 IsAlignmentNormalized()` check,
+  // leaving them at their original POS — losing the +1 DP contribution
+  // that Docker counts (DP=27 vs ours DP=26 at this site WG-wide).
+  opts.set_normalize_reads(true);
   if (absl::GetFlag(FLAGS_dbg_disable_graph_pruning)) {
     // Match upstream make_examples_core.py: dbg_disable_graph_pruning=true
     // dispatches to PruneLite() (debruijn_graph.cc:257-258), which only

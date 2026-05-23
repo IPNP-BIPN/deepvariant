@@ -387,6 +387,14 @@ std::vector<nucleus::genomics::v1::Read> RealignReadsForRegion(
         region_reads[0].aligned_sequence().size()));
     aln_cfg.set_force_alignment(false);
     aligner.set_options(aln_cfg);
+    // BUG FIX (Path D Site 1, 2026-05-23): mirror upstream
+    // realigner.py:call_fast_pass_aligner:779 which propagates
+    // RealignerOptions.normalize_reads onto the FastPassAligner. Without
+    // this, fast_pass_aligner.cc:557-568 discards any realigned alignment
+    // whose CIGAR is not already left-normalized — silently dropping
+    // valid shifts in T-homopolymer regions and leaving the read at its
+    // original POS (the +1 DP / 1-read-off WG residual at chr12:62946475).
+    aligner.set_normalize_reads(options.normalize_reads());
     aligner.set_reference(ref_seq);
     aligner.set_ref_start(chrom, static_cast<uint64_t>(ref_start));
     aligner.set_ref_prefix_len(static_cast<int>(ref_pre.size()));
