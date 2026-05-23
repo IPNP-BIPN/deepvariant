@@ -3960,3 +3960,102 @@ Total ad-hoc tooling spent to land this fix:
 The full bit-diagnosis-and-fix loop is now under 1 hour from a fresh
 clone, no full WG run needed. This is the playbook for any future
 realigner / candidate-generation drift investigation.
+
+## 2026-05-23 — Path D fix: chr20-full validation (87 % FM reduction)
+
+Re-ran both binaries on chr20 full to measure the fix's wider impact.
+
+### Setup
+
+  - **BAM**: full chr20 streamed from canonical HG002 Google bucket
+    (1.0 GB, 19.5 M reads, ~70 s download).
+  - **Ref**: same `GRCh38_no_alt.fa` we used for Site-1 diagnosis.
+  - **OUR binary**: post-fix native arm64 (`feature/apple-silicon-native-v2`
+    head `96629a42`), `--num_shards=14` on M-series.
+  - **Docker**: `google/deepvariant:1.10.0`, `--platform linux/amd64`
+    emulation, `--num_shards=4` (bigger doesn't help under emulation).
+
+### Wall-time
+
+| binary  | wall-time | speedup vs Docker-emulated |
+|---------|-----------|-----------------------------|
+| ours    | **2:43**  | 1.0× (baseline)             |
+| docker  | 17:55     | 6.6× slower than ours       |
+
+(Docker is running under Rosetta-in-VM emulation, not native Linux x86,
+so this is not a comparison to a Linux server — but it shows the
+emulation tax + the native arm64 binary's wallclock advantage.)
+
+### FILTER-class diff: ours vs Docker baseline
+
+```
+$ bash validation/diff_filter_classes.sh ours_chr20.vcf.gz docker_chr20.vcf.gz
+  shared sites    : 210,057
+  only ours       : 562
+  only docker     : 333
+  FM on shared    : 56
+
+  transition histogram (FILTER-class flips on shared sites):
+    20  RefCall → NoCall
+    17  NoCall  → RefCall
+     9  PASS    → NoCall
+     9  NoCall  → PASS
+     1  PASS    → RefCall
+```
+
+**Pre-fix baseline (CLAUDE.md release-gates table):**
+  - chr20 full: 428 / 210,179 FM = 0.20 %
+  - 406 / 428 (95 %) clustered at chr20:28-31 Mb pericentromere
+    (documented FP32 drift hotspot)
+
+**Post-fix:**
+  - chr20 full: **56 / 210,057 FM = 0.027 %**
+  - **87 % FM reduction** (428 → 56)
+  - Pericentromere (28-31 Mb) bin now holds only 17/56 (30 %) of FM
+    — distribution is now uniform-ish across chr20
+
+### F1 vs GIAB v4.2.1 truth
+
+```
+SNP    ours F1=0.997402   docker F1=0.997402   Δ=+0.000000
+       ours Recall=0.995444  Precision=0.999367
+     docker Recall=0.995444  Precision=0.999367
+
+INDEL  ours F1=0.995985   docker F1=0.995985   Δ=+0.000000
+       ours Recall=0.993870  Precision=0.998109
+     docker Recall=0.993870  Precision=0.998109
+```
+
+**TP / FP / FN / Recall / Precision all bit-identical to Docker.** The
+56 remaining FM are all in regions hap.py classifies as UNK (outside
+GIAB high-confidence intervals) — they don't affect F1 even though
+they're FILTER-class flips.
+
+### Net impact on release gates (CLAUDE.md update candidates)
+
+| Gate                                | Pre-fix         | Post-fix          | Δ          |
+|-------------------------------------|-----------------|-------------------|------------|
+| SNP F1 vs Docker (chr20)            | 0.997402        | 0.997402          | 0          |
+| INDEL F1 vs Docker (chr20)          | 0.995985        | 0.995985          | 0          |
+| FILTER parity chr20:10M-10.1M       | 0 FM            | **0 FM**          | 0          |
+| FILTER parity chr20 full            | 428 / 210,179   | **56 / 210,057**  | **−87 %**  |
+| FILTER parity HG002 WG (estimate)   | 24 / 7.7M       | TBD (proportional ≈ 3-5 / 7.7M expected) | ↓ |
+
+The chr20-full release gate (≤ 0.25 % FM) was previously at 0.20 %;
+post-fix it sits at 0.027 % — a full order of magnitude under the
+ship gate.
+
+### One-line summary
+
+A 2-line `set_normalize_reads(true)` propagation fix in
+`realigner_native.cc` + `make_examples_main.cc` drops chr20-full FM
+by 87 % (428 → 56) while preserving F1 bit-for-bit. The fix mirrors
+upstream `realigner.py:call_fast_pass_aligner:779` and matches the
+existing `allele_counter_options.normalize_reads=true` that we
+already set at `make_examples_main.cc:821`.
+
+Path D Site 1 (chr12:62946475 DP off-by-1) and Site 2
+(chr2:201836152/160 candidate divergence) both close at the
+realigner-output level. The remaining FILTER mismatch at Site 1
+cascades through small_model dispatch, not the realigner — that is a
+separate edge case touching one more mate alignment.
