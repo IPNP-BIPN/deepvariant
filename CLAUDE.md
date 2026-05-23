@@ -19,7 +19,7 @@ Running log: `PORT_LOG.md`.
 - **Speedup ≥ 2.5×** vs published Linux x86 reference (`call_variants` stage, Phase 0 gate).
 - **FILTER-class parity gate (Homebrew-ship gate, revised 2026-05-06):** Two tiers:
   1. **0 FM on chr20:10M-10.1M fixture** — standard 313-site test region. This gate IS met. Confirmed 2026-05-06 with current codebase + WGS small model.
-  2. **≤ 0.25 % FM on full chr20** — current measurement 428/210,179 = 0.20 %. 406/428 (95 %) come from MPSGraph FP32 non-associativity in the pericentromeric zone (chr20:28-31Mb), which is the explicitly documented "fundamentally unachievable on Apple GPU" category. The remaining 22 FM (5 %) are pericentromeric pileup edge cases. The 0.25 % threshold accepts this unavoidable drift; `DV_METAL_SERIAL_FULL=1` closes the FP32 gap at 3× wall-time cost. F1 is unaffected (SNP 0.997402 / INDEL 0.995985). Original gate set 2026-04-28 as "100 % parity on chr20 full"; revised 2026-05-06 — see PORT_LOG for full root-cause analysis.
+  2. **≤ 0.25 % FM on full chr20** — current measurement (post Path D realigner fix, 2026-05-23) **56/210,057 = 0.027 %**, an order of magnitude under the gate. Pre-fix was 428/210,179 = 0.20 % (95 % clustered at pericentromere from FP32 drift); the realigner `set_normalize_reads(true)` propagation fix (PORT_LOG 2026-05-23) reduced FM by 87 % and de-clustered the distribution. F1 unchanged (SNP 0.997402 / INDEL 0.995985, bit-identical to Docker). Original gate set 2026-04-28 as "100 % parity on chr20 full"; revised 2026-05-06; further improved 2026-05-23 — see PORT_LOG for full root-cause + chr20-validation analyses.
 
 ## Working rules
 
@@ -66,7 +66,7 @@ If any of the following happen, stop, write a report in `PORT_LOG.md`, and surfa
 | SNP F1 vs Docker (HG002 WG) | ≥ Docker − 0.05 % | ✅ **Δ = 0** (0.996440 = Docker, commit f9364c2d) |
 | INDEL F1 vs Docker (HG002 WG) | ≥ Docker − 0.10 % | ✅ **Δ = 0** (0.995766 = Docker, commit f9364c2d) |
 | FILTER parity: chr20:10M-10.1M | 0 FM | ✅ **0 FM** (313/313 shared, re-confirmed 2026-05-06) |
-| FILTER parity: full chr20 | ≤ 0.25 % FM | ✅ **0.20 %** (428/210,179, all FP32-drift) |
+| FILTER parity: full chr20 | ≤ 0.25 % FM | ✅ **0.027 %** (56/210,057, post Path D realigner fix 2026-05-23; was 0.20 % pre-fix) |
 | GPU truly engaged | powermetrics > 0 | ✅ (verified Phase 5.5a) |
 | Wall-time speedup vs Docker/Rosetta | ≥ 2.5× | ⚠️ **1.84× at WG** (Docker is running under Rosetta, not native Linux — compare to Linux x86 is TBD) |
 | All 23 pipeline modes run | no crash | ✅ (proxy-tested 2026-05-06) |
