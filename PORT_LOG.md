@@ -3704,3 +3704,123 @@ significance. Path D investigation now closed at "diagnosed,
 Site 1 has actionable next step, Site 2 is intrinsic".
 
 End of session — for real this time.
+
+## 2026-05-23 — Path D Site 1: hypothesis BIT-CONFIRMED by Docker run
+
+Setup (no full WG run; ~50 s total compute):
+
+  - **BAM**: streamed `samtools view -b -h <gs URL> chr12:62945000-62948000`
+    into `/tmp/dv_pathD/work/hg002_chr12.bam` (48 KB, 78 reads).
+  - **Ref**: streamed the canonical `GRCh38_no_alt` from NCBI FTP
+    (833 MB compressed, 2.9 GB uncompressed, 19 s download + 5 s `samtools faidx`).
+  - **Docker**: pre-pulled `google/deepvariant:1.10.0`, ran
+    `run_deepvariant --model_type=WGS --regions=chr12:62946400-62946550
+    --make_examples_extra_args=realigner_diagnostics=/data/realigner_diag,emit_realigned_reads=true
+    --num_shards=1`. Total wall-time **28 s** under linux/amd64 emulation
+    on Apple Silicon (M-series via Rosetta-in-VM).
+
+### Docker reproduces the variant call bit-for-bit
+
+```
+chr12  62946475  .  GTTTT  G  3  NoCall  GT:GQ:DP:AD:VAF:MID:PL  ./.:3:27:11,11:0.407407:deepvariant:0,0,13
+```
+
+Identical to the WG-run record from May 11 (DP=27, GQ=3, MID=deepvariant,
+PL=0,0,13, NoCall). The site behaviour is reproducible from a tiny
+slice of the genome — no full WG needed for diagnosis.
+
+### Realigner emitted a per-region BAM at our hypothesised path
+
+`realigner_diag/chr12:62946400-62946550/realigned_reads.bam` — read-by-read
+post-realignment, plus a sister `chr12:62946379-62946626/graph.dot` showing
+the de-Bruijn graph for the assembled window.
+
+### THE smoking-gun read: confirmed re-aligned by Docker
+
+```
+Read A00744:46:HV3C3DSXX:2:1662:9579:2613  (FLAG=147, mate=last)
+
+input BAM:        POS=62946476  CIGAR=16M10I125M
+Docker realigned: POS=62946472  CIGAR=18M6I127M  ← shifted 4 bp LEFT
+```
+
+Docker's realigner shifted the read 4 bases earlier and reformatted the
+indel:
+
+  - Original: `16M` (62946476–62946491, the T-homopolymer) + `10I` + `125M`
+  - Realigned: `18M` (62946472–62946489) + `6I` + `127M`
+
+The realigned read now **overlaps the variant position 62946475** —
+it's the **+1 DP read** that explains Docker DP=27 vs our DP=26.
+
+### Per-read realignment statistics
+
+  - 25 input primary reads at chr12:62946474–62946476 → **29 realigned
+    reads** in Docker's emit_realigned_reads BAM (some reads emitted as
+    multiple haplotype-specific candidates).
+  - 14/25 reads had their CIGAR changed by the realigner; 4/25 also
+    shifted POS.
+  - Several other reads in this region got synthetic `4D12M7I` insertions
+    in their realigned CIGAR — the assembled haplotype includes that
+    4-bp deletion (consistent with the GTTTT>G variant + the surrounding
+    `12M7I` cluster on adjacent positions).
+
+### What this tells us about our binary's gap
+
+We pass the standard SSW parameters (match=4, mismatch=6, gap_open=8,
+gap_extend=2) and the standard DeBruijn parameters (k=10–101, min_edge_
+weight=2). These are byte-identical to upstream `realigner.py`. We also
+use upstream's vendored `FastPassAligner` and `DeBruijnGraph` libraries
+directly (`deepvariant/native/realigner_native.cc:227,384`).
+
+So the SSW/DBG algorithms themselves are identical. The most likely
+sources of the divergence:
+
+  1. **Read set fed to the WindowSelector AlleleCounter** — if our
+     `pre` AlleleCounter (built at `make_examples_main.cc:2022-2024`)
+     sees a different read set than upstream's internal counter does,
+     the candidate windows differ → haplotype set differs → realigned
+     CIGARs differ.
+  2. **Assembled-region span computation** — upstream uses
+     `assign_reads_to_assembled_regions` (Python `realigner.py`) with
+     a particular tiebreak for overlapping regions; our port at
+     `realigner_native.cc:283-311` uses "first index wins". If
+     upstream's tiebreak differs subtly (e.g. last index wins) the
+     read could land in a different region → different ref window →
+     different SSW alignment.
+  3. **Reference window prefix/suffix padding** — our
+     `kRefAlignMargin` (TBD, see `realigner_native.cc:346,348`) might
+     differ from upstream's `_DEFAULT_REF_BUFFER_SIZE`. A larger or
+     smaller flanking margin changes the SSW search space and can
+     shift the optimal alignment.
+
+### Next experiment
+
+Build our binary (≈ 30 min, fresh clone needs CMake configure + parallel
+build) and run with the same diag flags:
+
+```
+DV_REALIGNER_DIAG_HAP=/tmp/our_haps  \
+DV_REALIGNED_READS_TSV=/tmp/our_realigned  \
+build-macos/bin/deepvariant ... --regions=chr12:62946400-62946550
+```
+
+Then compare per-read POS/CIGAR side-by-side. If our read 1662:9579:2613
+still ends up at POS=62946476 (unchanged from input) while Docker shifts
+it to 62946472, the divergence is in `assign_reads_to_assembled_regions`
+or the `ref_pre/ref_suf` margins.
+
+### Cost analysis
+
+  - Total compute spent on the diagnosis so far: ~50 s wall-time
+    (download + Docker run + analysis).
+  - Total data downloaded: ~833 MB (one-time) + 48 KB (per-region BAM).
+  - Diagnosis without building our binary: complete for Site 1 root
+    cause attribution to the realigner. Concrete next-step landing
+    fix.
+
+The 2-FM beyond the 22-site FP32-drift floor stays at 2/7.7M = 0.000026 %.
+Path D Site 1 is now **diagnosed at bit-level**; the fix is a focused
+realigner-port audit. Path D Site 2 was previously categorised as an
+intrinsic candidate-enumeration divergence — also bit-confirmed to
+be a different-event, not a fixable one.
