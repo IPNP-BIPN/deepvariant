@@ -3416,3 +3416,140 @@ Path C remains future work if a downstream use-case ever requires
 bit-exact GPU↔Docker (currently no such case identified).
 
 End of session.
+
+## 2026-05-23 — Path D investigation: the 2/24 different-DP FM sites
+
+Picked up Path D from the prior session: investigate whether the 2/24
+WG FM sites with non-matching DP are tractable separately from the
+22/24 pure FP32-drift residuals. The 2 sites were re-derived from
+prior-session transcript artefacts (`/tmp/biocheck/wg_v4_unsort/`
+since wiped):
+
+### Site 1 — chr12:62946475 GTTTT>G (4-bp deletion)
+
+```
+ours:   chr12  62946475  .  GTTTT  G  3.5  PASS    GT:GQ:DP:AD:VAF:MID:PL  0/1:3:26:11,11:0.423077:small_model:0,0,14
+docker: chr12  62946475  .  GTTTT  G  3    NoCall  GT:GQ:DP:AD:VAF:MID:PL  ./.:3:27:11,11:0.407407:deepvariant:0,0,13
+```
+
+Same alleles, same AD (11,11), GQ=3 in both — but **DP=26 vs 27** and
+**MID=small_model vs deepvariant**.
+
+**Cascade trace (code-only, not bench-confirmed):**
+
+1. AlleleCounter sees 1 fewer read at this position (the "other"
+   category: `DP - AD_ref - AD_alt = 26 - 22 = 4` ours vs `5` Docker).
+   The missing read is neither ref nor alt — probably an "N" call,
+   secondary alignment, or duplicate that one binary filters and the
+   other doesn't.
+2. Different DP → different small_model features (DP feeds into the
+   51-feature VAF-context vector populated by
+   `PopulateVafContext()` in `make_examples_main.cc`).
+3. Different features → different small_model `max_p`.
+4. At `make_examples_main.cc:2298`, `accept = (gq >= indel_gq_threshold)`
+   flips: ours `max_p` crosses the threshold (accept → emit small_model
+   CVO), Docker's doesn't (reject → falls through to big model).
+5. Big-model inference is more conservative on this borderline
+   indel → Docker's GT-argmax picks homref (PL[0]==PL[1]==0 tie
+   resolved toward index 0) → `compute_filter_fields` →
+   `uncall_homref_gt_if_lowqual` (GQ=3 < 20) → NoCall.
+6. Our small_model emits het (PL[0]==PL[1]==0 same tie, but the
+   small_model's argmax happens to pick index 1) → PASS at QUAL=3.5
+   (above default `qual_filter=1.0`).
+
+**Root cause:** 1-read DP miscount at the AlleleCounter stage, which
+is `third_party/nucleus/util/allelecounter.cc` (vendored upstream
+code). Confirmed not a recent regression — same AlleleCounter binary
+that already passes 7.7M-3 sites and is bit-equal to upstream on the
+chr20:10M-10.1M fixture (313/313). Per-position read-level audit at
+chr12:62946475 needed to identify which specific read differs and
+whether ours or Docker is "correct" (could be a baseQ-at-boundary or
+soft-clip edge case).
+
+### Site 2 — chr2:201836160 A>ATAT  vs  chr2:201836152 TTTTATATA>T
+
+```
+ours:   chr2  201836160  .  A         ATAT  5.8  PASS    GT:GQ:DP:AD:VAF:MID:PL  0/1:6:19:12,7:0.368421:deepvariant:4,0,22
+docker: chr2  201836152  .  TTTTATATA T     0.8  NoCall  GT:GQ:DP:AD:VAF:MID:PL  ./.:8:17:15,2:0.117647:deepvariant:0,7,23
+```
+
+Completely different variants — not a normalization-only artefact:
+
+- Ours: insertion at 201836160 (insert `TAT`), AD=12,7 (7/19 alt-supporting)
+- Docker: deletion at 201836152 (delete `TTTATATA`, 8 bp), AD=15,2 (2/17 alt-supporting)
+- Position offset: 8 bp
+- Reference around this position is a TA/AT tandem repeat — multiple
+  parsimony solutions can explain the same observed reads.
+
+**Cascade trace:**
+
+1. AlleleCounter (and possibly the realigner) emits different
+   candidate alleles at this region between the two binaries.
+   Ours sees an insertion, Docker sees a deletion 8 bp upstream.
+   This is an honest divergence in candidate enumeration, not a
+   variant-normalization difference at the postprocess stage —
+   `SimplifyVariantAlleles()` (postfix-strip) wouldn't equate them.
+2. With different candidates, the pileup-image inference produces
+   different probs → different FILTER per-site.
+3. The hap.py FM count flags this as a mismatch because both sites
+   are in the same comparison interval, but the variants themselves
+   are not the same. Neither matches the GIAB truth set (truth set
+   probably has no variant here — both DP=17–19 with VAF ≤ 0.42 are
+   borderline-noise in a low-complexity repeat).
+4. We emit FP (PASS at QUAL=5.8); Docker correctly NoCalls.
+
+**Root cause:** different read→allele assignment in the tandem-repeat
+region. Likely sub-causes (one or both):
+  - Realigner haplotype assembly produces a slightly different
+    consensus through the repeat → different per-read CIGARs after
+    realignment → different alt-allele observed.
+  - `allele_counter_options.normalize_reads=true` (we set it at
+    `make_examples_main.cc:821`, mirroring Docker) left-aligns indels
+    per read before counting, but the exact left-alignment trajectory
+    through a TA repeat is sensitive to read endpoint placement —
+    a read terminating 1 bp earlier can land on a different left-
+    aligned position.
+
+### Why neither was fixed this session
+
+Both root causes live at the AlleleCounter / Realigner layer (per-read
+behaviour in a single short region). Diagnosing requires:
+
+1. Built `deepvariant` binary on this machine (~30 min from a clean
+   state — CMake + Metal kernels rebuild).
+2. HG002 PCR-free 35× Illumina BAM (~50 GB, FTP from GIAB).
+3. GRCh38 reference (~3 GB).
+4. Per-site re-run with `DV_REALIGNED_READS_TSV=…` (already wired in
+   `make_examples_main.cc:2031`) to dump per-read CIGAR after the
+   realigner.
+5. Diff our `realigned_reads.tsv` for chr12:62946400-62946550 and
+   chr2:201836100-201836250 against `--emit_realigned_reads`
+   from Docker's run.
+6. The differing read(s) point to which AlleleCounter / Realigner
+   knob (mapq, baseq cutoffs, soft-clip handling, normalize-reads
+   left-alignment) is off by 1.
+
+This is ~½ day of focused work given the infrastructure prep, not a
+quick code fix. The 2 sites add 2 / 7.7M = 0.000026 % to FM beyond
+the 22-site drift floor — investigating them is documentation /
+validation work, not release-blocking.
+
+### Impact on the release gates
+
+The CLAUDE.md release gates remain fully met (Δ F1 = 0, FILTER
+parity ≥ 99.9993 %, 0 FM on chr20:10M-10.1M, ≤ 0.25 % on chr20-full).
+The 2 different-DP sites are subsumed by the 24-FM drift-floor
+documentation and do not move any gate.
+
+### Conclusion: Path D parked, not closed
+
+Path D remains a theoretically tractable +2-FM improvement, but
+requires the validation harness re-stand-up (HG002 BAM + GRCh38 +
+local build + per-read CIGAR dump) before further code change. The
+PORT_LOG entry above is the diagnostic baseline if a future session
+or downstream user revisits.
+
+Current recommended path remains **E (ship)**: documented FP32 drift
+floor at 99.9993 % WG FILTER parity, all release gates met.
+
+End of session.
