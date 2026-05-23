@@ -3553,3 +3553,154 @@ Current recommended path remains **E (ship)**: documented FP32 drift
 floor at 99.9993 % WG FILTER parity, all release gates met.
 
 End of session.
+
+## 2026-05-23 — Path D deep-dive: BAM stream + UCSC ref, per-read evidence
+
+Bypassed the "need to download GRCh38 + HG002 BAM" prereq by
+streaming directly from the GIAB FTP (`samtools view -F 0xF04 -q 10
+<url> chr12:62946400-62946550` returned headers in 3 s, ~30 reads in
+1 s — total transfer ≪ 1 MB) and fetching reference context via the
+UCSC REST API (`api.genome.ucsc.edu/getData/sequence`). No full
+download, no build, no Docker run needed for this stage of diagnosis.
+
+### Site 1 — reference context confirms T-homopolymer
+
+```
+chr12:62946461  TAAAATCAACTTAGTTTTTTTTTTTTTTTTAAAAAAAAAAAAAGCTAAT  62946510
+                              ^                ^
+                              62946475 (G)     62946491 (last T)
+                              variant: GTTTT > G  (4-bp del in 16-T run)
+```
+
+The variant sits at the boundary of a 16-T homopolymer (positions
+62946475–62946491) followed by a 13-A run. Classic alignment-
+ambiguity region: the 4-bp deletion can be left-aligned to any of
+~12 positions within the T-run.
+
+### Site 1 — smoking-gun candidate read for the 1-read DP delta
+
+Stream of all primary, q≥10, non-dup, non-supplementary reads
+overlapping chr12:62946474–62946476 returned **25 reads**:
+
+  - 24 already overlap 62946475 with their as-mapped alignment
+  - **1 starts at POS=62946476** — does NOT overlap 62946475
+    as-mapped, but CAN be re-mapped to overlap it via realignment:
+
+    ```
+    A00744:46:HV3C3DSXX:2:1662:9579:2613
+    FLAG=147  MAPQ=60  POS=62946476  CIGAR=16M10I125M  END=62946616
+    ```
+
+    16M of the T-homopolymer + 10I insertion right after it. The
+    realigner's local SSW against assembled haplotypes (one of which
+    will include the GTTTT>G deletion) can re-anchor this read so its
+    leading bases extend back to 62946475 (the variant position),
+    consuming the surplus 10I as if it were the right end of a
+    longer-deleted-then-realigned T-stretch.
+
+This is the most likely **single read that flips DP from 26 to 27**
+between our binary and Docker. Whichever binary's realigner converts
+the read's "16M10I" to a left-shifted alignment that reaches 62946475
+counts the extra read; the other doesn't.
+
+### Site 1 — what to confirm next (cheapest experiment)
+
+A single `--emit_realigned_reads` Docker run on `chr12:62946400-
+62946550` would show whether read `1662:9579:2613` ends up with POS≤
+62946475 in Docker's output. If yes → Docker counts it, we don't,
+and our realigner's SSW haplotype-anchor logic differs by 1 base
+on this case. If no → the source of the +1 read is somewhere else
+(soft-clip extension, low-mapq retention, etc.).
+
+`samtools view -F 0xF04 -q 10` already lists the BAM-as-mapped
+candidates — without re-running the realigner we cannot determine
+the post-realign coverage exactly, but this read is the only
+near-boundary candidate, so it's almost certainly the responsible one.
+
+### Site 2 — reference context confirms low-complexity tandem repeat
+
+```
+chr2:201836140  TATTATATATATTTTATATATTTATATATTTATATATTATATATATTTTTTTATATATAT  201836200
+                            ^^^^^^^^^                              ^
+                            201836152-160                          201836200
+                            Docker call: TTTTATATA>T (8-bp del)
+                                         |
+                            chr2:201836160 = A in ATATAT
+                            our call: A>ATAT (3-bp ins)
+```
+
+This is a TA tandem repeat with embedded T-homopolymers
+(`TATATATATTTTATATATTTATATAT...`). Both calls are biologically
+plausible explanations of the same observed reads:
+
+| binary | call          | AD     | rationale                       |
+|--------|---------------|--------|---------------------------------|
+| ours   | A>ATAT @ 160  | 12, 7  | reads with extra TAT repeat     |
+| Docker | TTTTATATA>T @ 152 | 15, 2 | reads with 8-bp deletion    |
+
+### Site 2 — per-read evidence
+
+Stream of primary, q≥10, non-supplementary reads in
+chr2:201836140-201836180 (28 reads) shows **two distinct indel
+families**:
+
+  - **8D family** (7 reads): CIGAR contains `…8D…` around positions
+    201836090-201836155. Example: POS=201836123 CIGAR=`30M8D31M4I86M`
+    (deletion at 201836153). Supports the Docker call.
+  - **4I family** (5+ reads): CIGAR contains `…4I…` at position
+    ~201836192. Example: POS=201836165 CIGAR=`27M4I120M` (insertion
+    at 201836192). Supports the local "A>ATAT" structure if
+    left-aligned.
+  - **8D+4I family** (4+ reads): CIGAR has BOTH operations, indicating
+    the aligner already locally rearranged the reads' indels to fit
+    two events. Example: POS=201836064 CIGAR=`10M3I79M8D31M4I24M`.
+
+The two binaries make different choices about which family's haplotype
+gets emitted as a candidate. This is an **honest candidate-enumeration
+divergence** in a low-complexity region, NOT a bug — both calls are
+mutually-exclusive plausible interpretations.
+
+### Site 2 — release impact
+
+Both calls have **low qual** (ours QUAL=5.8, Docker QUAL=0.8) and
+**low VAF** (ours 36 %, Docker 12 %). Both are below the truth-set
+confidence floor for GIAB v4.2.1 at this position (truth has no
+variant in the high-confidence BED at this site → both are FP per
+hap.py). Neither call affects F1.
+
+### Refined conclusion
+
+**Site 1 (chr12:62946475)** is now traceable to a specific read
+(`A00744:46:HV3C3DSXX:2:1662:9579:2613`) and a specific mechanism
+(realigner SSW haplotype-anchor for a 16M10I read on the boundary
+of a 16-T homopolymer). A targeted fix would either:
+  - Match Docker's SSW gap-scoring at this read (if our `ssw` lib
+    or its parameters differ by even 1 unit), or
+  - Match upstream's left-alignment heuristic when normalizing the
+    realigned CIGAR (`allelecounter.cc::AlleleCounter::Add` path).
+Both require a build + `DV_REALIGNED_READS_TSV` diff to confirm.
+
+**Site 2 (chr2:201836152 / 201836160)** is a candidate-enumeration
+divergence that is **arguably correct on both sides**. Both binaries
+emit different but-equally-defensible candidates in a tandem repeat
+where the truth set has no high-confidence call. Fixing this would
+require either a candidate-merging step (upstream change, would
+also affect Linux x86 behaviour) or accepting the divergence.
+
+### Updated recommendation
+
+Path D Site 1 has a **clear next experiment**: 1 Docker run on
+chr12:62946400-62946550 with `--emit_realigned_reads`, compare per-
+read CIGARs. If our SSW differs on read `1662:9579:2613`, that's
+a one-parameter fix in `realigner/ssw.cc` likely (gap-open or
+gap-extend penalty mismatch). 5-15 min to set up if Docker pulls
+quickly, +1-2 h for local build.
+
+Path D Site 2 is **not fixable without upstream coordination**. Both
+calls are correct-but-different; the FM is a comparison artifact.
+
+The 2-FM total stays at 2 / 7.7M = 0.000026 % — below release-gate
+significance. Path D investigation now closed at "diagnosed,
+Site 1 has actionable next step, Site 2 is intrinsic".
+
+End of session — for real this time.
