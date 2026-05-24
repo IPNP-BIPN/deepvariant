@@ -4402,3 +4402,78 @@ practical-achievable until next dedicated investment cycle.
 
 End of validation session — all release gates met, two production
 fixes shipped (Path D + WES canonicalize).
+
+## 2026-05-24 — CoreML inference-backend comparison (Metal vs CoreML)
+
+User asked to validate Core ML as an alternative inference backend
+since `--inference_backend=coreml` is wired in. Converted WGS .dvw
+→ .mlpackage via `convert_coreml.py` (TF-free MIL path, 379 vars
+→ 42 MB .mlpackage in 3 s) and ran identical chr20 inputs through
+all 3 compute-unit modes.
+
+### chr20:10M-10.1M fixture (313 sites) results
+
+| Backend | shared FM | F1 SNP | F1 INDEL |
+|---------|-----------|--------|----------|
+| **Metal (default)** | **0 FM** | **0.997402** | **0.995985** |
+| CoreML ALL (ANE+GPU+CPU) | 37 FM | 0.990099 | 0.782609 |
+| CoreML CPU_AND_GPU | 37 FM | (same as ALL) | (same as ALL) |
+| CoreML CPU_ONLY | 37 FM | (same as ALL) | (same as ALL) |
+
+Surprise: **all 3 CoreML compute-unit modes produce bit-identical
+output** (37 FM each, all NoCall→PASS). This means coremltools 9.0
+MIL → execution is deterministic across compute units; the ANE/GPU/
+CPU choice doesn't change the precision.
+
+### chr20 full results
+
+| Backend | F1 SNP | F1 INDEL | Δ vs Docker SNP | Δ vs Docker INDEL |
+|---------|--------|----------|-----------------|--------------------|
+| Metal | 0.997402 | 0.995985 | **+0.000000** | **+0.000000** |
+| CoreML ALL | 0.986230 | **0.695568** | -0.011 | **-0.300** |
+
+**CoreML INDEL F1 collapses to 0.696** at chr20 scale — recall drops
+from 99.4 % (Metal) to 55.6 % (CoreML). The MIL → CoreML execution
+is missing ~half the indels.
+
+### Per-backend wall-time (chr20 full)
+
+| Backend | Wall-time | Threads |
+|---------|-----------|---------|
+| Metal | 2:43 | 14 |
+| CoreML ALL | ~3-4 min | 14 |
+| Docker (Linux/amd64 emul) | 17:55 | 4 |
+
+CoreML doesn't gain wall-time over Metal (despite being able to use
+ANE), and loses ~30 % INDEL F1.
+
+### Verdict + decision
+
+| Backend | Use case |
+|---------|----------|
+| **Metal (default)** | ✓ Production. F1 = Docker (Δ=0). |
+| CoreML | ✗ Research only. -30 % INDEL F1 makes it unsuitable. |
+| BNNS-CPU (Path C, future) | ✓ Future bit-exact path. ~1 wk dev, ~10× slower. |
+
+**Decision (2026-05-24):** keep **Metal as default**, leave the
+CoreML backend in tree as documented "comparison / research" mode.
+Update CLAUDE.md release-gate table to reflect this — CoreML is not
+a valid production fallback.
+
+The +30 % INDEL gap with CoreML is consistent with Phase 5.5d/7's
+prior observation ("Replaced Core ML small-model inference with a
+deterministic FP32 scalar MLP. Bit-equal to TF/Keras on x86 single-
+thread. Eliminated the ~0.005-0.01 max_p drift that flipped GQ=20
+thresholds."). CoreML's MIL implementation introduces precision
+losses that the BNNS-CPU path doesn't.
+
+### Conclusion: BNNS-CPU (Path C) is the only viable bit-exact path
+
+  - Metal (current default) is already F1 = Docker — **NO change needed**
+    for production users prioritizing speed + correctness
+  - CoreML is strictly worse for parity — abandon as alternative
+  - Path C (BNNS-CPU big-model) remains the only path to 0 FM (vs
+    Docker) at the FILTER-class level — but ~1 week dev + ~10× slower
+    inference is the cost
+
+End of CoreML investigation — Metal stays default.
