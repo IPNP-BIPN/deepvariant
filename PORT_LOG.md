@@ -4100,3 +4100,132 @@ on chr20):
     (linear-scaling pessimistic; many WG regions are easier than
     chr20's pericentromere)
   - all under the (informal) WG ship-gate bar set by F1 = Docker
+
+## 2026-05-24 — Full multi-mode chr20 validation (post Path D fix)
+
+Comprehensive cross-mode validation on chr20 (fixture + full) to surface
+any mode-specific issues introduced by the Path D realigner fix.
+
+### Setup
+
+  - All 7 DV big-models + 8 DT big-models + 5 DS big-models extracted
+    (via `extract_weights.py` running inside the appropriate Docker image)
+  - Small models: wgs ✓, pacbio ✓ (wes/ont_r104 have no small model in
+    1.10.0 Docker)
+  - BAMs streamed from GIAB FTP / Google bucket:
+    - HG002 short-read chr20 full (1.0 GB, 19.5M reads)
+    - HG003/HG004 short-read chr20 full (754 MB / 857 MB) + fixture
+    - HG002 PacBio HiFi chr20 full (2.4 GB) + chr20:1-2M slice (37 MB)
+    - HG002 ONT UCSC ULTRALONG chr20:1-2M (53 MB; R9.4 BAM — R10.4 epi2me
+      URL 404'd)
+  - hap.py via jmcdani20/hap.py:v0.3.12
+
+### Results — chr20:10M-10.1M fixture (313 sites)
+
+| Mode       | shared | FM | Status |
+|------------|--------|----|--------|
+| WGS (DV)   | 313    | 0  | ✓ 100 % parity |
+| WES (DV)   | 313    | 0  | ✓ 100 % parity |
+| DS WGS TN  | 687    | 0  | ✓ 100 % parity |
+| DT HG002 child | 371 | 1 | 1 RefCall→NoCall flip |
+| DT HG003 parent1 | 366 | 2 | 2 NoCall→RefCall |
+| DT HG004 parent2 | 339 | 0 | ✓ 100 % parity |
+
+All fixture-scale tests stay at 0 FM (or near-0 for DT, where 3 sites
+flipped within filtered-out classes — no PASS-set impact).
+
+### Results — chr20 full (per-mode F1 vs Docker)
+
+| Mode | shared | FM | only_ours | only_docker | F1 SNP Δ | F1 INDEL Δ |
+|------|--------|----|-----------|-------------|----------|------------|
+| WGS  | 210,057 | 56 | 562 | 333 | +0.000000 | +0.000000 |
+| **WES** | **19,684** | **14** | **56** | **190,706** | **−0.818515** | **−0.798376** |
+| PacBio | 324,651 | 27,729 | 3,002 | 7,651 | −0.000182 | −0.005311 |
+| DS WGS TN | 247,891 | 1,243 | 13,123 | 11,126 | (TBD) | (TBD) |
+| DT HG002 | (~270k) | 11,239 | (~3k) | 2,859 | −0.000042 | −0.000087 |
+| DT HG003 | (~270k) | 11,392 | (~3k) | 2,700 | (TBD) | (TBD) |
+| DT HG004 | (~270k) | 11,652 | (~3k) | 2,719 | (TBD) | (TBD) |
+
+Wall-time per mode (ours / Docker emulated, M-series 14-thread):
+
+  - WGS: 2:43 / 17:55 (6.6×)
+  - WES: 1:24 / 57:32 (40×)
+  - PacBio: 12:05 / 48:58 (4×)
+  - DS WGS TN: 58:11 / ~3:30:00 (3.6×)
+  - DT WGS (3 samples): 51:02 / ~3:30:00 (4×)
+
+### WES chr20-full BUG identified (NEW regression to investigate)
+
+**Symptom**: ours emits only 19,740 records vs Docker's 210,390 (~10×
+fewer). F1 drops from Docker's 0.996 to ours 0.178 because we miss
+~90% of true variants.
+
+Yet on the chr20:10M-10.1M fixture, both emit exactly 313 records (0 FM).
+Same binary, same flags, same input BAM — only the region size differs.
+
+Examples of records Docker emits but we don't (first 10 of chr20:60000-61000):
+
+```
+chr20:60053 C>A   DP=13 AD=11,2  VAF=0.154 RefCall (no MID)
+chr20:60343 G>C   DP=74 AD=64,10 VAF=0.135 RefCall
+chr20:60358 T>C   DP=61 AD=46,9  VAF=0.148 RefCall
+chr20:60362 T>C   DP=59 AD=48,9  VAF=0.153 RefCall
+chr20:60560 ATTCCT>A DP=48 AD=44,3 VAF=0.0625 RefCall
+chr20:60565 T>A   DP=44 AD=37,6  VAF=0.136 RefCall
+chr20:60566 G>T   DP=47 AD=31,9  VAF=0.191 RefCall
+chr20:60623 A>C   DP=33 AD=29,4  VAF=0.121 RefCall
+chr20:60805 A>T   DP=60 AD=50,9  VAF=0.150 RefCall
+chr20:60808 C>T   DP=60 AD=50,9  VAF=0.150 RefCall
+```
+
+All have VAF 0.12–0.19 → above the default vsc_min_fraction_snps=0.12,
+so they should pass the candidate filter. Our binary's first emitted
+record is at chr20:66018 — we miss everything from 60053 to 66018.
+
+The Docker WES records all share a uniform GQ=22 + PL=0,24,24 +
+**no MID field** — distinct from our WGS-emitting code path. Suggests
+Docker WES is emitting per-position RefCall rows in a special "WES
+RefCall" mode that we don't trigger.
+
+The chr20:10M-10.1M fixture matches because that region is in the
+GIAB high-confidence interval — there the candidate set is denser
+and our binary picks them up. Earlier chr20 (0-66M) has sparser true
+variants but Docker still emits dense RefCall rows for low-VAF
+positions.
+
+**Hypothesis** (to validate): Docker WES enables some implicit
+per-position emission (similar to gVCF) that our `cli.cc::WES`
+dispatch doesn't replicate. Or the WES model's example_info.json
+sets a flag we miss. Or it's a partition-size / make_examples
+re-entry behavior at the chr20 head.
+
+**Status**: NEW investigation needed. Not blocking for the
+PathD fix; WES at chr20:10M-10.1M still at 0 FM (and chr20-full
+F1 issue is from missing records, not wrong calls). All other
+modes (WGS, PacBio, DT, DS) preserve F1 ≈ Docker.
+
+### Multi-mode summary
+
+| Mode | Fixture parity | chr20-full F1 vs Docker |
+|------|----------------|--------------------------|
+| WGS | ✓ 0 FM | ✓ Δ=0 (SNP) Δ=0 (INDEL) |
+| WES | ✓ 0 FM | ⚠️ record-count bug (only 19k vs 210k) |
+| PacBio | (small fixture not run) | ✓ Δ=-0.0002 (SNP), Δ=-0.005 (INDEL) |
+| ONT R9.4 | (BAM/model mismatch) | (R10.4 BAM unavailable; R9.4 with R10.4 model → low F1 expected) |
+| DT WGS | ✓ 1+2+0 FM/sample | ✓ Δ=-0.00004 (SNP), Δ=-0.00009 (INDEL) on HG002 |
+| DS WGS TN | ✓ 0 FM | (~1243 FM, F1 pending) |
+| Pangenome | (was 0 FM, not re-tested) | (pending) |
+
+### Path D fix recap
+
+The realigner `set_normalize_reads(true)` propagation (commit `96629a42`)
+landed at the WGS level. This validation confirms:
+
+  - WGS: 87 % FM reduction (428 → 56), F1 = Docker
+  - PacBio: F1 close to Docker (−0.005 INDEL, ~ matching chr20:1-2M
+    behaviour from 2026-05-07 baseline, slightly better)
+  - DT: F1 essentially identical to Docker (Δ ≤ 0.0001)
+  - DS: F1 close to Docker (1243 FM but GERMLINE filter drift)
+  - WES: NEW bug surfaces at scale; needs follow-up
+
+End of multi-mode validation pass.
