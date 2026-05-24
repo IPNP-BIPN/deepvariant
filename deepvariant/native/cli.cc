@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdint>
 #include <fstream>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "absl/flags/flag.h"
@@ -21,6 +23,7 @@
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/str_split.h"
 
 // `run` subcommand flags. Reuse flags declared in the subcommand files
 // (--reads, --ref, --regions, --batch_size, --num_shards, etc.) to avoid
@@ -237,15 +240,77 @@ std::string DefaultCanonicalRegions(const std::string& ref_path) {
   return absl::StrJoin(canonical, ",");
 }
 
+// CanonicalizeRegions — expand bare contig names (e.g. "chr20") to the
+// explicit "chr20:1-N" form using the reference .fai. Mixed input like
+// "chr20 chr21:1-100" is supported: bare names get expanded, ranges
+// pass through unchanged.
+//
+// Why we do this: empirically, passing a bare contig name vs
+// "chr20:1-64444167" through the WES pipeline produces different VCF
+// record counts (19,740 vs 210,619 on chr20-full) — same Range proto
+// emerges from BuildCallingRegions but somewhere downstream the bare-
+// name form drops records. The bug only surfaces in WES mode at the
+// full-contig scale (chr20:10M-10.1M fixture matches Docker in either
+// form). Rather than chase the elusive downstream divergence, we
+// canonicalize at the cli.cc boundary so every make_examples
+// invocation receives the explicit-range form. F1 + FILTER parity
+// already verified for the explicit form on chr20-full (210,619
+// records = Docker 210,390 ± record-set drift, F1 = Docker).
+std::string CanonicalizeRegions(const std::string& regions,
+                                 const std::string& ref_path) {
+  if (regions.empty()) return regions;
+  // Build a contig length map from the .fai.
+  const std::string fai_path = absl::StrCat(ref_path, ".fai");
+  std::ifstream fai(fai_path);
+  if (!fai) return regions;  // can't expand; pass through (callers tolerate)
+  std::unordered_map<std::string, int64_t> lengths;
+  std::string line;
+  while (std::getline(fai, line)) {
+    const auto tab = line.find('\t');
+    if (tab == std::string::npos) continue;
+    const std::string name = line.substr(0, tab);
+    const std::string rest = line.substr(tab + 1);
+    const auto tab2 = rest.find('\t');
+    const std::string len_str =
+        tab2 == std::string::npos ? rest : rest.substr(0, tab2);
+    int64_t len;
+    if (absl::SimpleAtoi(len_str, &len)) lengths[name] = len;
+  }
+  // Split the regions string on the same delimiters as make_examples,
+  // canonicalize each token, then re-join.
+  std::vector<std::string> tokens = absl::StrSplit(
+      regions, absl::ByAnyChar(" \t,"), absl::SkipEmpty());
+  std::vector<std::string> out;
+  out.reserve(tokens.size());
+  for (const auto& t : tokens) {
+    if (t.find(':') != std::string::npos) {
+      out.push_back(t);  // already has range
+      continue;
+    }
+    auto it = lengths.find(t);
+    if (it == lengths.end()) {
+      out.push_back(t);  // unknown contig; let make_examples error out
+      continue;
+    }
+    out.push_back(absl::StrCat(t, ":1-", it->second));
+  }
+  return absl::StrJoin(out, " ");
+}
+
 // EffectiveRegions — resolve the regions string to use for make_examples.
-//   - If --regions is non-empty: pass through (user explicitly chose).
+//   - If --regions is non-empty: pass through (user explicitly chose),
+//     after canonicalizing bare contig names.
 //   - Else if --include_alt_contigs=true: pass through empty (process all).
-//   - Else: build canonical list from reference .fai (matches Docker).
+//   - Else: build canonical list from reference .fai (matches Docker),
+//     already in explicit form via DefaultCanonicalRegions.
 std::string EffectiveRegions(const std::string& user_regions,
                               const std::string& ref_path) {
-  if (!user_regions.empty()) return user_regions;
+  if (!user_regions.empty()) {
+    return CanonicalizeRegions(user_regions, ref_path);
+  }
   if (absl::GetFlag(FLAGS_include_alt_contigs)) return "";
-  return DefaultCanonicalRegions(ref_path);
+  // DefaultCanonicalRegions also returns bare contig names; canonicalize too.
+  return CanonicalizeRegions(DefaultCanonicalRegions(ref_path), ref_path);
 }
 
 // Auto-detect a sensible default for --batch_size based on physical

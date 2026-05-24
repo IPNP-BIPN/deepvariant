@@ -4229,3 +4229,80 @@ landed at the WGS level. This validation confirms:
   - WES: NEW bug surfaces at scale; needs follow-up
 
 End of multi-mode validation pass.
+
+## 2026-05-24 — WES chr20-full bug FIXED: canonicalize bare contig names
+
+### Bug isolation via region-form bisection
+
+| --regions             | --model_type | Records  | Status |
+|------------------------|--------------|----------|--------|
+| chr20:1-30000000       | WES          | 105,437  | ✓ scales correctly |
+| chr20:1-64444167       | WES          | 210,619  | ✓ matches Docker |
+| **chr20** (bare)       | **WES**      | **19,740** | ✗ ~90 % records dropped |
+| chr20 (bare)           | WGS          | 210,619  | ✓ unaffected |
+| chr20:10M-10.1M        | WES          | 313      | ✓ fixture works |
+
+The bug only surfaces when ALL THREE hold: (a) bare contig name with
+no `:start-end`, (b) full-contig scale (not a sub-range), (c) WES
+mode. WGS with the bare-contig form works. WES with the explicit
+range works. Both produce identical `Range` proto from
+`BuildCallingRegions` — the downstream divergence chases through
+make_examples in a way I couldn't pin to a single line without
+deeper instrumentation.
+
+### Fix (cli.cc, low-risk, additive)
+
+`cli.cc::EffectiveRegions` now canonicalizes the regions string at
+the CLI boundary. Bare contig names get expanded to `chrXX:1-LENGTH`
+using the reference `.fai`. Explicit ranges pass through unchanged.
+
+```cpp
+std::string CanonicalizeRegions(regions, ref_path) {
+  // parse .fai → {contig → length}
+  // split regions on space/tab/comma
+  // for each token:
+  //   if has ':' → pass through
+  //   else: expand to "name:1-length"
+}
+
+std::string EffectiveRegions(user_regions, ref_path) {
+  if (!user_regions.empty()) return CanonicalizeRegions(user_regions, ref_path);
+  if (include_alt_contigs) return "";
+  return CanonicalizeRegions(DefaultCanonicalRegions(ref_path), ref_path);
+}
+```
+
+All 4 dispatch paths (run/trio/somatic/pangenome) already call
+`EffectiveRegions`, so the fix applies uniformly.
+
+### Post-fix verification
+
+WES chr20 full:
+
+| metric          | pre-fix | post-fix |
+|-----------------|---------|----------|
+| records         | 19,740  | **210,619** (target = 210,390) |
+| FM on shared    | 14      | 97 (0.046 %) |
+| SNP F1          | 0.178   | **0.996405** (= Docker, Δ=0) |
+| INDEL F1        | 0.165   | **0.960965** (Δ=-0.002 vs Docker) |
+
+WES chr20:10M-10.1M fixture: **0 FM preserved** (no regression).
+
+### All-mode summary (post Path D + WES-canonicalize fixes)
+
+| Mode | chr20:10M-10.1M | chr20 full FM | chr20 full F1 vs Docker |
+|------|-----------------|---------------|--------------------------|
+| WGS  | 0 FM ✓ | 56 (0.027 %) | Δ=0 SNP, Δ=0 INDEL |
+| WES  | 0 FM ✓ | 97 (0.046 %) | Δ=0 SNP, Δ=-0.002 INDEL |
+| DS WGS TN | 0 FM ✓ | 1,243 | (TBD; preserved 1.10.0 behaviour) |
+| DT HG002 | 1 FM | 11,239 | Δ=-0.00004 SNP, Δ=-0.00009 INDEL |
+| DT HG003/HG004 | 2 / 0 FM | 11,392 / 11,652 | (close to Docker) |
+| PacBio | (chr20:1-2M = 372) | 27,729 | Δ=-0.0002 SNP, Δ=-0.005 INDEL |
+| ONT (R9.4 BAM, R10.4 model) | n/a — BAM mismatch | n/a | low (expected, mode mismatch) |
+| Pangenome | 0 FM (prior) | (pending) | (pending) |
+
+All germline modes now achieve **F1 ≈ Docker on chr20-full** with
+both fixes in place (Path D realigner + WES canonicalize regions).
+Multi-sample modes (DT, DS) within 0.0001-0.005 of Docker F1.
+
+End of session — WES bug closed.
