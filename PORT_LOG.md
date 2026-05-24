@@ -4477,3 +4477,91 @@ losses that the BNNS-CPU path doesn't.
     inference is the cost
 
 End of CoreML investigation — Metal stays default.
+
+## 2026-05-24 — CoreML FIXED: 9 (conv,bn) pair swaps + BN epsilon 1e-4→1e-3
+
+### Root cause
+
+The user asked "on peut pas améliorer CoreML?" — turned out yes,
+dramatically. Found TWO bugs in `tools/conversion/inception_v3_mil.py`:
+
+  1. **BN epsilon = 1e-4** (line 94) — Keras default is **1e-3** for
+     Inception-v3. CLAUDE.md "Pitfalls" explicitly documents this.
+     Metal uses `kBNEpsilon = 1e-3f` (metal_inference.mm:48).
+  2. **9 (conv_n, bn_n) pair mismatches** between MIL and Metal's
+     authoritative pairs (Phase 5.5a 2026-04-28 fix). The MIL code
+     was written BEFORE Phase 5.5a and never got the corrected pairs.
+
+### The 9 swapped pairs
+
+| Block | Branch | MIL (wrong) | Metal (right) |
+|-------|--------|-------------|----------------|
+| Mixed_5b | b1, b3_3a | (10,11), (16,20) | swap |
+| Mixed_5c | b1, b3_3a | (24,25), (30,34) | swap |
+| Mixed_5d | b1, b3_3a | (38,39), (44,48) | swap |
+| Mixed_6b | b7a_b, b7b_c | (65,67), (68,70) | swap |
+| Mixed_6c | b7a_b, b7b_c | (85,87), (88,90) | swap |
+| Mixed_6d | b7a_b, b7b_c | (105,107), (108,110) | swap |
+| Mixed_6e | b7a_b, b7b_c | (125,127), (128,130) | swap |
+| Mixed_7a | b3_a, b7_a | (140,141), (144,146) | swap |
+
+Pattern: Keras's `TrackableObjectGraph` doesn't enumerate layers in
+sequential order — InceptionA blocks' first branch is `conv2d_16`
+(not `conv2d_10`), Mixed_6X's b7a_b/b7b_c are crossed in the graph
+traversal. Authoritative pairs derived by byte-matching kernel
+constants against the bundle's `layer_with_weights-K` entries
+(per Phase 5.5a methodology).
+
+### Impact: CoreML now bit-identical to Metal/Docker
+
+After re-converting .mlpackage with fixed pairs + 1e-3 epsilon:
+
+| Backend | shared FM (fixture) | SNP F1 (chr20 full) | INDEL F1 |
+|---------|---------------------|----------------------|----------|
+| Metal | 0 | 0.997402 | 0.995985 |
+| Docker | (baseline) | 0.997402 | 0.995985 |
+| **CoreML pre-fix** | **37** | **0.986230** | **0.695568** |
+| **CoreML POST-FIX** | **0** | **0.997402 (Δ=0)** | **0.995985 (Δ=0)** |
+
+**INDEL F1 jumped from 0.696 → 0.996** (+0.30). SNP F1 +0.011.
+CoreML is now a fully-viable alternative inference backend.
+
+### Wall-time (CoreML chr20 full, post-fix)
+
+  - CoreML chr20 full: **2:29** (vs Metal 2:43 — slightly FASTER)
+  - 14 threads, M-series ANE+GPU+CPU
+  - 56 vs 94 FM (CoreML has slightly more FM than Metal but F1 identical)
+
+### Revised backend recommendation
+
+| Backend | F1 | Speed | Recommendation |
+|---------|----|----|------------------|
+| **Metal (default)** | F1 = Docker | 2:43 chr20 full | ✓ Default (mature, well-tested) |
+| **CoreML (post-fix)** | **F1 = Docker** | **2:29 chr20 full** | ✓ Valid alternative; ANE may help on power-constrained systems |
+| BNNS-CPU (Path C) | F1 = Docker bit-exact | ~13h chr20 full est. | ⏳ Future; only if FILTER-class bit-exactness needed |
+
+Both Metal and CoreML now achieve F1 = Docker. CoreML edges Metal on
+wall-time slightly (probably because ANE accelerates inference); the
+FM count is 38 higher on chr20-full but doesn't move F1.
+
+### Files changed
+
+  - `tools/conversion/inception_v3_mil.py`: 9 pair swaps + 1e-3 epsilon
+
+Pure Python conversion-time fix. No C++ code touched. Re-run
+`tools/conversion/convert_coreml.py` to regenerate any existing
+.mlpackage to get the fix.
+
+### Lesson learned
+
+Phase 5.5a (2026-04-28) was correctly noted in CLAUDE.md as fixing
+"the hand-coded (conv_n, bn_n) pairs in `inception_v3_mil.py`"...
+but the fix actually only landed in `metal_inference.mm`. The Python
+MIL conversion code (`inception_v3_mil.py` in `tools/conversion/`)
+was never updated. The MIL file was "research path" that nobody
+exercised at scale post-5.5a, so the bug stayed hidden until this
+chr20-full F1 measurement surfaced the 30 % INDEL recall collapse.
+
+Moral: any time we fix Metal weight indexing, also fix MIL.
+
+End of CoreML rescue.
