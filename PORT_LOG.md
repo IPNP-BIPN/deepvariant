@@ -4565,3 +4565,30 @@ chr20-full F1 measurement surfaced the 30 % INDEL recall collapse.
 Moral: any time we fix Metal weight indexing, also fix MIL.
 
 End of CoreML rescue.
+
+## 2026-05-24 — Phase B: chr20-full WGS backend matrix (5 backends)
+
+User asked "tout les test GIAB je veux la total" — full validation across
+modes × backends × samples × WG. Plan in
+`~/.claude/plans/continu-pour-tout-les-rustling-adleman.md`.
+
+Phase B (chr20-full, backend matrix on WGS HG002):
+
+| Backend | Wall-time | FM | F1 SNP | F1 INDEL | Verdict |
+|---------|-----------|----|----|---|--------|
+| metal (default) | 2:43 | 56 | 0.997402 = Docker | 0.995985 = Docker | ✓ Production |
+| metal + DV_METAL_SERIAL_FULL=1 | 2:35 | 56 (identical to default) | (same) | (same) | ✓ Same as default — env var has no effect on the default GPU path on M4 Max |
+| metal + DV_METAL_KAHAN=1 | crashed | — | — | — | ✗ std::bad_alloc OOM at chr20-full scale |
+| coreml ALL (post-fix) | 2:29 | 94 | 0.997402 = Docker | 0.995985 = Docker | ✓ Production-viable |
+| ane_speculate | crashed | — | — | — | ✗ std::bad_alloc OOM at chr20-full scale |
+
+**3 of 5 backends survive at chr20-full scale**: Metal, Metal+SERIAL_FULL,
+CoreML. The 2 crashes (KAHAN + ANE_speculate) hit OOM during inference —
+both are documented in CLAUDE.md as research / opt-in paths that haven't
+been stress-tested at WG scale. The crashes confirm: do NOT promote these
+to default.
+
+The 3 surviving backends are now down-selected for Phase C (WG runs).
+Metal stays the primary default; CoreML is a viable alternative offering
+same F1 with slightly different FM (94 vs 56 — extra drift in UNK zones,
+doesn't move F1).
