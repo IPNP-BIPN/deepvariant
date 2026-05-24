@@ -91,7 +91,12 @@ def _cbr(
     )
     x = mb.batch_norm(
         x=x, mean=mean, variance=var, gamma=gamma, beta=beta,
-        epsilon=1e-4, name=f"{name}_bn",
+        # Keras BatchNormalization default epsilon is 1e-3 (NOT 1e-4).
+        # Inception-v3 SavedModels are trained with epsilon=1e-3.
+        # See metal_inference.mm::kBNEpsilon and CLAUDE.md "Pitfalls".
+        # Wrong epsilon → subtle scale mismatch on channels with small
+        # variance → INDEL F1 collapse.
+        epsilon=1e-3, name=f"{name}_bn",
     )
     return mb.relu(x=x, name=f"{name}_r")
 
@@ -112,11 +117,17 @@ def _avg_cbr(x, bundle, conv_n: int, bn_n: int, name: str) -> object:
 # ---------------------------------------------------------------------------
 
 def _mixed_5b(x, bundle) -> object:
-    """Mixed_5b: layers 10-23, 192→256."""
-    b1 = _cbr(x, bundle, 10, 11, name="5b_1")
+    """Mixed_5b: layers 10-23, 192→256.
+
+    BUG FIX (2026-05-24): b1 ↔ b3_3a pairs were swapped — wrong
+    layer-with-weights indices for the branch1x1 conv vs the
+    branch3x3dbl reduce conv. Authoritative pairs from
+    metal_inference.mm:Mixed_5b (Phase 5.5a 2026-04-28 fix).
+    """
+    b1 = _cbr(x, bundle, 16, 20, name="5b_1")    # was (10,11)
     b5 = _cbr(x, bundle, 12, 14, name="5b_5a")
     b5 = _cbr(b5, bundle, 17, 21, [1, 1], "same", "5b_5b")
-    b3 = _cbr(x, bundle, 16, 20, name="5b_3a")
+    b3 = _cbr(x, bundle, 10, 11, name="5b_3a")   # was (16,20)
     b3 = _cbr(b3, bundle, 13, 15, name="5b_3b")
     b3 = _cbr(b3, bundle, 18, 22, name="5b_3c")
     bp = _avg_cbr(x, bundle, 19, 23, "5b_p")
@@ -124,11 +135,11 @@ def _mixed_5b(x, bundle) -> object:
 
 
 def _mixed_5c(x, bundle) -> object:
-    """Mixed_5c: layers 24-37, 256→288."""
-    b1 = _cbr(x, bundle, 24, 25, name="5c_1")
+    """Mixed_5c: layers 24-37, 256→288. Same swap as Mixed_5b."""
+    b1 = _cbr(x, bundle, 30, 34, name="5c_1")    # was (24,25)
     b5 = _cbr(x, bundle, 26, 28, name="5c_5a")
     b5 = _cbr(b5, bundle, 31, 35, [1, 1], "same", "5c_5b")
-    b3 = _cbr(x, bundle, 30, 34, name="5c_3a")
+    b3 = _cbr(x, bundle, 24, 25, name="5c_3a")   # was (30,34)
     b3 = _cbr(b3, bundle, 27, 29, name="5c_3b")
     b3 = _cbr(b3, bundle, 32, 36, name="5c_3c")
     bp = _avg_cbr(x, bundle, 33, 37, "5c_p")
@@ -136,11 +147,11 @@ def _mixed_5c(x, bundle) -> object:
 
 
 def _mixed_5d(x, bundle) -> object:
-    """Mixed_5d: layers 38-51, 288→288."""
-    b1 = _cbr(x, bundle, 38, 39, name="5d_1")
+    """Mixed_5d: layers 38-51, 288→288. Same swap as Mixed_5b."""
+    b1 = _cbr(x, bundle, 44, 48, name="5d_1")    # was (38,39)
     b5 = _cbr(x, bundle, 40, 42, name="5d_5a")
     b5 = _cbr(b5, bundle, 45, 49, [1, 1], "same", "5d_5b")
-    b3 = _cbr(x, bundle, 44, 48, name="5d_3a")
+    b3 = _cbr(x, bundle, 38, 39, name="5d_3a")   # was (44,48)
     b3 = _cbr(b3, bundle, 41, 43, name="5d_3b")
     b3 = _cbr(b3, bundle, 46, 50, name="5d_3c")
     bp = _avg_cbr(x, bundle, 47, 51, "5d_p")
@@ -172,14 +183,19 @@ def _mixed_6a(x, bundle) -> object:
 # ---------------------------------------------------------------------------
 
 def _mixed_6b(x, bundle) -> object:
-    """Mixed_6b: layers 60-79, 768→768 (128-ch factorized)."""
+    """Mixed_6b: layers 60-79, 768→768 (128-ch factorized).
+
+    BUG FIX (2026-05-24): b7a_b ↔ b7b_c pairs were swapped — wrong
+    layer-with-weights indices for the b7a 1×7 conv vs b7b 1×7 conv.
+    Authoritative pairs from metal_inference.mm:Mixed_6b.
+    """
     b1 = _cbr(x, bundle, 72, 76, name="6b_1")
     b7a = _cbr(x, bundle, 64, 66, name="6b_7aa")
-    b7a = _cbr(b7a, bundle, 65, 67, name="6b_7ab")
+    b7a = _cbr(b7a, bundle, 68, 70, name="6b_7ab")   # was (65,67)
     b7a = _cbr(b7a, bundle, 73, 77, name="6b_7ac")
     b7b = _cbr(x, bundle, 60, 61, name="6b_7ba")
     b7b = _cbr(b7b, bundle, 62, 63, name="6b_7bb")
-    b7b = _cbr(b7b, bundle, 68, 70, name="6b_7bc")
+    b7b = _cbr(b7b, bundle, 65, 67, name="6b_7bc")   # was (68,70)
     b7b = _cbr(b7b, bundle, 69, 71, name="6b_7bd")
     b7b = _cbr(b7b, bundle, 74, 78, name="6b_7be")
     bp = _avg_cbr(x, bundle, 75, 79, "6b_p")
@@ -187,14 +203,14 @@ def _mixed_6b(x, bundle) -> object:
 
 
 def _mixed_6c(x, bundle) -> object:
-    """Mixed_6c: layers 80-99, 768→768 (160-ch factorized)."""
+    """Mixed_6c: layers 80-99, 768→768 (160-ch factorized). Same swap as 6b."""
     b1 = _cbr(x, bundle, 92, 96, name="6c_1")
     b7a = _cbr(x, bundle, 84, 86, name="6c_7aa")
-    b7a = _cbr(b7a, bundle, 85, 87, name="6c_7ab")
+    b7a = _cbr(b7a, bundle, 88, 90, name="6c_7ab")   # was (85,87)
     b7a = _cbr(b7a, bundle, 93, 97, name="6c_7ac")
     b7b = _cbr(x, bundle, 80, 81, name="6c_7ba")
     b7b = _cbr(b7b, bundle, 82, 83, name="6c_7bb")
-    b7b = _cbr(b7b, bundle, 88, 90, name="6c_7bc")
+    b7b = _cbr(b7b, bundle, 85, 87, name="6c_7bc")   # was (88,90)
     b7b = _cbr(b7b, bundle, 89, 91, name="6c_7bd")
     b7b = _cbr(b7b, bundle, 94, 98, name="6c_7be")
     bp = _avg_cbr(x, bundle, 95, 99, "6c_p")
@@ -202,14 +218,14 @@ def _mixed_6c(x, bundle) -> object:
 
 
 def _mixed_6d(x, bundle) -> object:
-    """Mixed_6d: layers 100-119, 768→768 (160-ch factorized)."""
+    """Mixed_6d: layers 100-119, 768→768 (160-ch factorized). Same swap as 6b."""
     b1 = _cbr(x, bundle, 112, 116, name="6d_1")
     b7a = _cbr(x, bundle, 104, 106, name="6d_7aa")
-    b7a = _cbr(b7a, bundle, 105, 107, name="6d_7ab")
+    b7a = _cbr(b7a, bundle, 108, 110, name="6d_7ab")  # was (105,107)
     b7a = _cbr(b7a, bundle, 113, 117, name="6d_7ac")
     b7b = _cbr(x, bundle, 100, 101, name="6d_7ba")
     b7b = _cbr(b7b, bundle, 102, 103, name="6d_7bb")
-    b7b = _cbr(b7b, bundle, 108, 110, name="6d_7bc")
+    b7b = _cbr(b7b, bundle, 105, 107, name="6d_7bc")  # was (108,110)
     b7b = _cbr(b7b, bundle, 109, 111, name="6d_7bd")
     b7b = _cbr(b7b, bundle, 114, 118, name="6d_7be")
     bp = _avg_cbr(x, bundle, 115, 119, "6d_p")
@@ -217,14 +233,14 @@ def _mixed_6d(x, bundle) -> object:
 
 
 def _mixed_6e(x, bundle) -> object:
-    """Mixed_6e: layers 120-139, 768→768 (192-ch factorized)."""
+    """Mixed_6e: layers 120-139, 768→768 (192-ch factorized). Same swap as 6b."""
     b1 = _cbr(x, bundle, 132, 136, name="6e_1")
     b7a = _cbr(x, bundle, 124, 126, name="6e_7aa")
-    b7a = _cbr(b7a, bundle, 125, 127, name="6e_7ab")
+    b7a = _cbr(b7a, bundle, 128, 130, name="6e_7ab")  # was (125,127)
     b7a = _cbr(b7a, bundle, 133, 137, name="6e_7ac")
     b7b = _cbr(x, bundle, 120, 121, name="6e_7ba")
     b7b = _cbr(b7b, bundle, 122, 123, name="6e_7bb")
-    b7b = _cbr(b7b, bundle, 128, 130, name="6e_7bc")
+    b7b = _cbr(b7b, bundle, 125, 127, name="6e_7bc")  # was (128,130)
     b7b = _cbr(b7b, bundle, 129, 131, name="6e_7bd")
     b7b = _cbr(b7b, bundle, 134, 138, name="6e_7be")
     bp = _avg_cbr(x, bundle, 135, 139, "6e_p")
@@ -237,10 +253,15 @@ def _mixed_6e(x, bundle) -> object:
 # ---------------------------------------------------------------------------
 
 def _mixed_7a(x, bundle) -> object:
-    """Mixed_7a (Reduction-B): layers 140-151, 768→1280."""
-    b3 = _cbr(x, bundle, 140, 141, name="7a_3a")
+    """Mixed_7a (Reduction-B): layers 140-151, 768→1280.
+
+    BUG FIX (2026-05-24): b3_a ↔ b7_a swapped — wrong indices for the
+    branch3x3 reduce conv vs branch7x7 reduce conv. Authoritative
+    pairs from metal_inference.mm:Mixed_7a.
+    """
+    b3 = _cbr(x, bundle, 144, 146, name="7a_3a")   # was (140,141)
     b3 = _cbr(b3, bundle, 148, 150, [2, 2], "valid", "7a_3b")
-    b7 = _cbr(x, bundle, 144, 146, name="7a_7a")
+    b7 = _cbr(x, bundle, 140, 141, name="7a_7a")   # was (144,146)
     b7 = _cbr(b7, bundle, 142, 143, name="7a_7b")
     b7 = _cbr(b7, bundle, 145, 147, name="7a_7c")
     b7 = _cbr(b7, bundle, 149, 151, [2, 2], "valid", "7a_7d")
