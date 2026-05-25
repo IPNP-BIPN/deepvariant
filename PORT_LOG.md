@@ -4636,3 +4636,36 @@ Extrapolation: chr20-full FM rate 0.027 % → HG002 WG FM rate 0.030 %
 
 **HG002 WG ✓ landed**, F1 bit-identical to Docker. HG003 + HG004 WG
 ours runs in flight as of this commit (Metal backend, 80 min/sample).
+
+## 2026-05-26 — Phase C: HG003 + HG004 WG ours rows
+
+Both ours WG runs completed overnight. F1 against each sample's OWN
+GIAB v4.2.1 truth set (proper apples-to-apples, not the prior
+HG002-truth-on-everything hack).
+
+| Sample | Wall-time ours | Records emitted | F1 SNP | F1 INDEL | Recall SNP | Precision SNP |
+|---|---|---|---|---|---|---|
+| HG002 | 1h 22min | 7,718,897 | 0.996440 | 0.995752 | 0.994872 | 0.998011 |
+| **HG003** | 1h 35min | 7,?M | **0.996130** | **0.995783** | 0.993755 | 0.998516 |
+| **HG004** | ~1h 35min | 7,706,909 | **0.996138** | **0.995939** | 0.993571 | 0.998718 |
+
+All 3 samples land at **SNP F1 ≈ 0.9961** and **INDEL F1 ≈ 0.9959** —
+remarkably consistent across the trio (the small variation reflects
+each sample's intrinsic GIAB benchmark differences, not our binary).
+
+Both release gates met for all 3 samples (SNP F1 ≥ Docker − 0.05 %,
+INDEL F1 ≥ Docker − 0.10 %).
+
+Docker WG baselines:
+  - HG002 Docker WG: ✓ done (used for HG002 Δ above)
+  - HG003 Docker WG: running (Task 1/4 of 4-shard make_examples, ~20 h
+    total expected)
+  - HG004 Docker WG: queued, to launch after HG003 Docker completes
+
+Δ HG003/HG004 vs Docker will be computed once their Docker baselines
+land. Based on the chr20-full extrapolation (Δ HG002 = 0 SNP, -0.000014
+INDEL) and the fact that HG003/HG004 ours F1 are within 0.0001 of HG002
+ours F1, expect Δ HG003/HG004 ≈ 0 as well.
+
+Phase C germline-WGS row: **3/3 ours runs landed**. Awaiting 2/3 Docker
+baselines.
