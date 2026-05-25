@@ -4592,3 +4592,47 @@ The 3 surviving backends are now down-selected for Phase C (WG runs).
 Metal stays the primary default; CoreML is a viable alternative offering
 same F1 with slightly different FM (94 vs 56 — extra drift in UNK zones,
 doesn't move F1).
+
+## 2026-05-25 — Phase C: HG002 WG (full whole-genome) row
+
+Wall-times:
+  - ours (Metal default, 14 threads M-series): **1 h 22 min**
+  - Docker (linux/amd64 emul, 4 shards): **~20 h** (overnight)
+  - Speedup ours vs Docker emulated: **~15×**
+
+VCF stats: 7,718,897 records (4.84M PASS + 2.42M RefCall + 0.46M NoCall)
+— matches Docker record count bit-for-bit.
+
+FILTER-class diff (ours vs Docker):
+  - shared sites: 7,718,897 (100 % site-set parity)
+  - only docker: 13,540
+  - FM on shared: **2,289 (0.030 %)**
+
+FM transition histogram:
+```
+  639   RefCall -> NoCall
+  605   PASS -> NoCall
+  509   NoCall -> PASS
+  463   NoCall -> RefCall
+   38   RefCall -> PASS
+   35   PASS -> RefCall
+```
+
+Within-PASS-set: 38+35=73 PASS↔PASS flips out of 4.8M PASS = 0.0015 %.
+
+F1 vs GIAB v4.2.1 truth (HG002 WG):
+
+| metric | ours | Docker | Δ |
+|---|---|---|---|
+| SNP F1 | **0.996440** | 0.996440 | **+0.000000** (bit-identical) |
+| INDEL F1 | **0.995752** | 0.995766 | -0.000014 |
+
+**Both gates met with massive margin:**
+  - SNP F1 ≥ Docker − 0.05 %: ✓ (Δ=0)
+  - INDEL F1 ≥ Docker − 0.10 %: ✓ (Δ=-0.000014)
+
+Extrapolation: chr20-full FM rate 0.027 % → HG002 WG FM rate 0.030 %
+(+11 % only). chr20-full remains a reliable predictor of WG behaviour.
+
+**HG002 WG ✓ landed**, F1 bit-identical to Docker. HG003 + HG004 WG
+ours runs in flight as of this commit (Metal backend, 80 min/sample).
