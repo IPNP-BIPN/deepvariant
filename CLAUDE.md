@@ -269,6 +269,21 @@ Final state: 322/322 shared, 247/247 PASS, 67/67 RefCall, 8/8 NoCall,
 (14 threads, auto-detected). Pangenome joins WGS, DeepTrio, DeepSomatic
 at 100% Docker FILTER parity on chr20:10M-10.1M.
 
+> **CORRECTION (2026-06-21, pre-PR re-regression):** the "322/322 / 100%
+> parity" above was a harness artifact — it did not hold against an
+> *independently-generated* upstream Docker(BAM) reference (the v9 binary
+> reproduces the same divergence as HEAD, so it was never a regression).
+> Root cause: cli.cc hardcoded `--partition_size=25000` for pangenome
+> (Step 3-v8), which over-downsamples reads (reservoir
+> `max_reads_per_partition=1500` applied per 25 kb chunk vs Docker's
+> default 1 kb), dropping low-coverage candidate clusters (e.g. the A>G run
+> at chr20:10029223-10029235). Fixed by reverting pangenome `partition_size`
+> to the Docker default **1000**. True chr20:10M-10.1M parity is now
+> **309 shared, 0 FM, PASS 257 = 257, 0 GT-diff, 1 residual non-PASS
+> RefCall** (chr20:10029259). See PORT_LOG 2026-06-21 for the full bisect.
+> The Step 3-v8 claim that "25000 matches upstream" was wrong — upstream
+> uses 1000 and forcing 25000 in Docker errors.
+
 Reference captures:
 
 - Docker(GBZ direct)         : 327 sites (ground truth)
@@ -334,6 +349,7 @@ Probable remaining root causes for the 60 only_ours / 70 only_docker /
 - **Metal compute is not bitwise reproducible** across some ops/reboots. Validate via softmax tolerance (≤1e-3) + argmax agreement (100 %), not bit-equality. The strict-FILTER gate works because thresholds (PASS / RefCall / NoCall / LowQual) sit far enough from typical softmax noise that ≤ 1e-5 drift doesn't flip class.
 - **`std::shuffle` is implementation-defined** — libc++ (Apple Clang) and libstdc++ (GCC, Docker) produce DIFFERENT sequences for the same `mt19937_64` seed/state. This is the cause of the 1.13 % FILTER drift vs Docker on chr20: `pileup_image_native.cc::DownsampleReadIndices` shuffles read indices to subsample when coverage > 95, and our shuffle picks different reads than Docker's even when both use the same seed (2101079370). Fix: port libstdc++'s exact algorithm into `deepvariant/native/libstdcxx_shuffle.h` (paired Fisher–Yates + Lemire 128-bit uniform_int) and route `pileup_image_native.cc:162` through it. **Don't use `std::shuffle` anywhere where Docker reproducibility is required** — same applies to `std::sample`, `std::uniform_int_distribution<>` (Lemire vs rejection differs), and any other algorithm whose stdlib implementation is unspecified by the standard.
 - **NumPy 1.24's `np.random.RandomState.randint` uses bitmask-rejection**, NOT Lemire. The Lemire path is in the new `Generator.integers` API. For Docker reproducibility through any `RandomState.randint(0, n)` call (used by upstream `make_examples_core.py:reservoir_sample` and elsewhere), match the legacy code path: `mask = next_pow2(n-1) - 1; do { v = next_uint32() & mask; } while (v > n - 1); return v;`. See `deepvariant/native/numpy_mt19937.h::NumpyRandomIntervalU32` and `numpy/random/src/distributions/distributions.c::random_interval` for the exact algorithm.
+- **Reservoir sampling must use Docker's `partition_size` granularity (1000 bp), not the region-chunk size.** Native applies `max_reads_per_partition`-capped reservoir sampling per region chunk (`make_examples_main.cc:1515`). If a mode sets `partition_size` larger than Docker's (e.g. the old pangenome `partition_size=25000`), the per-chunk downsampling rate diverges from Docker's per-1kb rate and silently drops low-coverage candidates inside high-coverage windows (a dense SNP cluster's ~12 reads get reduced to ~1 → candidate vanishes). Root-caused 2026-06-21 at chr20:10029223-10029235; pangenome `partition_size` reverted 25000 → 1000. Upstream pangenome does NOT pass `--partition_size` (uses default 1000); forcing 25000 in Docker errors ("--partition_size and --max_reads_per_partition must be set together"). Don't raise `partition_size` for any reservoir-sampled path expecting Docker parity.
 - **`build-prereq.sh` is Linux-only.** v2 ships `scripts/build-prereq-macos.sh`.
 - **8.5 GB of model artifacts** can't fit in a single Homebrew bottle alongside the binary. Split into `deepvariant-models` formula.
 - **Xcode CLT is enough — no full Xcode required.** Ship `.mlpackage` uncompiled; runtime compiles on first load via `MLModel compileModelAtURL:error:`. Avoid `xcrun coremlcompiler` (full Xcode only).

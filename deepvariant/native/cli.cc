@@ -1835,12 +1835,19 @@ int RunAllPangenome(int argc, char** argv) {
     me_args.push_back("--aln_gap_open=10");
     me_args.push_back("--aln_gap_extend=1");
     me_args.push_back("--dbg_disable_graph_pruning=true");
-    // Pangenome's run_pangenome_aware_deepvariant.py invokes
-    // make_examples with --partition_size=25000 (vs our default 1000).
-    // Larger partitions match Docker's per-partition AlleleCounter
-    // semantics (some reads spanning partition boundaries get
-    // processed differently). Empirically tested on chr20:10M-10.1M.
-    me_args.push_back("--partition_size=25000");
+    // Pangenome uses the DEFAULT partition_size=1000 (matching upstream:
+    // run_pangenome_aware_deepvariant.py does NOT pass --partition_size, and
+    // forcing 25000 in Docker errors because make_examples requires
+    // --partition_size and --max_reads_per_partition to be set together).
+    // Earlier we hardcoded 25000 (Phase 6 Step 3-v8) believing it matched
+    // Docker, but that was wrong: with 25kb partitions, the per-partition
+    // reservoir sampling (max_reads_per_partition=1500) aggressively
+    // downsamples reads in high-coverage windows, dropping the few alt reads
+    // at low-coverage candidate clusters (e.g. chr20:10029223-10029235, a run
+    // of A>G SNPs with ~10-12 supporting reads each that Docker calls PASS but
+    // 25kb-partition reservoir sampling reduced to ~1, killing the candidate).
+    // partition_size=1000 mirrors Docker's per-1kb reservoir granularity.
+    me_args.push_back("--partition_size=1000");
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
