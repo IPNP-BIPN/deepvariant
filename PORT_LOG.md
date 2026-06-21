@@ -4669,3 +4669,84 @@ ours F1, expect Δ HG003/HG004 ≈ 0 as well.
 
 Phase C germline-WGS row: **3/3 ours runs landed**. Awaiting 2/3 Docker
 baselines.
+
+## 2026-06-21 — Pre-PR re-regression of all tools + pangenome partition_size root-cause fix
+
+Before opening the `feature/apple-silicon-native-v2 → r1.10` PR, re-ran the
+chr20:10M-10.1M FILTER-parity gate for DeepTrio, DeepSomatic, and
+Pangenome-aware DV against freshly-extracted bundles + freshly-generated
+Docker references, because the trio/somatic/pangenome validations (all
+2026-04-30) predate several shared make_examples/postprocess infra changes
+landed 2026-05-10 → 05-24 (reservoir-sort removal `044d8503`,
+canonical-contig filter `05ec75c9`, TFRecord F_NOCACHE fix `0aeb00c0`,
+realigner normalize_reads propagation `96629a42`, WES contig
+canonicalization `15a1c82b`). Rebuilt the binary clean at HEAD `e2f94d59`,
+re-extracted all bundles via Docker (deeptrio child/parent + small,
+deepsomatic.wgs_tumor_only + Illumina PON, pangenome.wgs, wgs), fetched the
+chr20 fixtures (HG002/3/4 quickstart BAMs + chr20 fasta extracted from the
+GRCh38 no_alt `.fa.gz`), and re-extracted the 8722-read pangenome BAM from
+`hprc-v1.1-mc-grch38.gbz`.
+
+Results (binary HEAD `e2f94d59`, vs `google/de{ep,}{variant,trio,somatic}:1.10.0`):
+
+- **DeepTrio WGS**: HG002 1 FM, HG003 2 FM, HG004 0 FM — all RefCall↔NoCall
+  FP32-drift flips, **PASS set + GT identical**. Reproduces the 2026-04-30
+  baseline exactly. No regression.
+- **DeepSomatic WGS tumor-only**: 723/723 shared, **0 FM, 0 GT-diff**. No
+  regression.
+- **Pangenome-aware DV WGS**: initially **254 shared / 53 only-ours / 55
+  only-docker / 1 FM** vs an independently-generated Docker(BAM) reference —
+  did NOT reproduce the documented "322/322". Root-caused (see below) and
+  fixed → **309 shared / 1 only-ours (a non-PASS RefCall) / 0 only-docker /
+  0 FM, PASS 257 = 257, 0 GT-diff on shared**.
+
+### Pangenome root cause — `partition_size=25000` over-downsamples reads
+
+The "322/322" pangenome parity (Phase 6 Step 3-v8/v9, commit `bae3fabc`) was
+NOT reproducible against an independently-generated upstream Docker
+reference: building the v9 binary and running it through the same harness
+produced the SAME 254/53/55 divergence as HEAD — i.e. **not a regression**,
+a long-standing native-vs-Docker difference masked by the original
+validation's non-independent Docker reference.
+
+Bisected the divergence to a dense A>G SNP cluster at
+chr20:10029223-10029235 (each ~10-12 supporting HG002 reads, called PASS by
+Docker, absent from our output). Ruled out by direct test: `partition_size`
+(my outer flag was silently ignored — cli.cc hardcoded it), realigner
+(disabled → no change), `normalize_reads`/`96629a42` (reverted → no change),
+supplementary-read filtering, and pangenome-read incorporation (the missed
+candidates come from the HG002 *reads* sample; the pangenome haplotypes
+match ref there). A single small region (chr20:10029000-10030000) recovered
+the cluster (4/4 PASS); any multi-chunk region lost it. `DBGCAND` tracing in
+`variant_calling_multisample.cc::CallVariantPosition` showed the reads-sample
+allele counts at the cluster **collapsing** in the multi-chunk case (G:11→G:1,
+A:9→A:2).
+
+Root cause: cli.cc `RunAllPangenome` hardcoded `--partition_size=25000`
+(Phase 6 Step 3-v8, believing it matched upstream). Native applies reservoir
+sampling (`max_reads_per_partition=1500`) per region-chunk; with 25 kb
+chunks, a high-coverage window downsamples ~5%, so a low-coverage candidate
+cluster's ~12 alt reads get reduced to ~1 → candidate dropped. Upstream
+Docker uses the **default `partition_size=1000`** (the pangenome run script
+does NOT pass `--partition_size`, and forcing 25000 in Docker errors:
+"--partition_size and --max_reads_per_partition must be set together"), so
+its per-1kb reservoir granularity keeps the cluster reads.
+
+Fix (1 line, `deepvariant/native/cli.cc`): pangenome `partition_size`
+25000 → 1000 (the Docker default). chr20:10M-10.1M pangenome parity
+254→**309 shared, 0 FM, PASS-identical**. Isolated to the pangenome
+dispatch; trio/somatic/WGS unaffected (separate partition settings).
+Residual: 1 non-PASS RefCall (chr20:10029259 G>C) we emit that Docker's
+pangenome does not — zero variant-call impact.
+
+**Doc correction:** the earlier "pangenome 322/322 / 100% Docker parity"
+(CLAUDE.md Phase 6 Step 3) was a harness artifact. True chr20:10M-10.1M
+parity vs an independent Docker(BAM) reference is **309 shared, 0 FM,
+PASS-identical, 1 residual RefCall** after the partition_size fix.
+
+**Pitfall recorded:** never apply reservoir sampling
+(`max_reads_per_partition`) over a region chunk larger than Docker's
+`partition_size` (1000 bp default) — the per-window downsampling rate then
+diverges from Docker and silently drops low-coverage candidates in
+high-coverage regions. Match Docker's partition granularity for any
+reservoir-sampled path.
