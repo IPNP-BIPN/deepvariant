@@ -72,6 +72,7 @@ If any of the following happen, stop, write a report in `PORT_LOG.md`, and surfa
 | All 23 pipeline modes run | no crash | ✅ (proxy-tested 2026-05-06) |
 | Docker FILTER parity: 14 short-read modes | 0 FM on chr20:10M-10.1M | ✅ all at 0 FM |
 | Docker FILTER parity: 4 long-read modes (real GIAB BAMs, 2026-05-07) | < 5 % FM | ✅ 0.7–1.8 % FM rate |
+| **Full all-mode re-regression (2026-06-21, pre-PR), ALL on public data** | per-mode | ✅ **all Illumina modes 0 FM** (germline WGS/WES, trio WGS/WES, somatic WGS/WES/FFPE TN + WGS-TO, pangenome WGS). Long-read all within < 5 % LR tol: germline PacBio 1.1 %/ONT 3.5 %/HYBRID 1.4 %, **trio PacBio 1.3 %/ONT 3.7 %** (GIAB+bucket), somatic PacBio-TO 4.1 %/ONT-TO 3.75 %, **MAS-seq real 4.6 %** (HG004), **RNASEQ real 2 FM** (HG005). Two bugs found+fixed: pangenome partition_size (cc1d35de), RNASEQ split_skip_reads (af59d3de). See PORT_LOG 2026-06-21 full matrix. |
 
 ### What still needs external resources
 

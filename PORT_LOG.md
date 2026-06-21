@@ -4750,3 +4750,81 @@ PASS-identical, 1 residual RefCall** after the partition_size fix.
 diverges from Docker and silently drops low-coverage candidates in
 high-coverage regions. Match Docker's partition granularity for any
 reservoir-sampled path.
+
+## 2026-06-21 — FULL all-mode matrix vs Docker (chr20:10M-10.1M, binary HEAD)
+
+Per user request ("verify ALL tools before the PR"), extended the
+re-regression beyond the WGS family to every model_type the native binary
+supports. Apples-to-apples FILTER parity (our binary vs the matching Docker
+image, same input BAM + same model). Bundles re-extracted via Docker;
+long-read chr20 fixtures from `{pacbio,ont}-case-study-testdata` (HG002).
+
+| Tool | Mode | shared | only-ours | only-docker | FM | Verdict |
+|------|------|-------:|----------:|------------:|---:|---------|
+| DeepVariant | WGS | 313 | 0 | 0 | **0** | ✅ |
+| DeepVariant | WES | 313 | 0 | 0 | **0** | ✅ |
+| DeepVariant | PACBIO | 280 | 2 | 4 | 3 (1.1 %) | ✅ LR tol |
+| DeepVariant | ONT (ONT_R104) | 399 | 4 | 4 | 14 (3.5 %) | ✅ LR tol |
+| DeepVariant | HYBRID | 283 | 13 | 6 | 4 (1.4 %) | ✅ synthetic merged input |
+| DeepVariant | MASSEQ | smoke | — | — | — | ✅ runs, no RNA data |
+| DeepVariant | RNASEQ | smoke | — | — | — | ✅ runs, no RNA data |
+| DeepTrio | WGS HG002/3/4 | 372/368/339 | — | — | 1/2/0 | ✅ RefCall↔NoCall, PASS+GT identical |
+| DeepTrio | WES HG002/3/4 | 371/366/339 | — | — | **0/0/0** | ✅ |
+| DeepSomatic | WGS-TN | 687 | 6 | 6 | **0** | ✅ |
+| DeepSomatic | WES-TN | 693 | 0 | 0 | **0** | ✅ |
+| DeepSomatic | FFPE_WGS-TN | 813 | 2 | 2 | **0** | ✅ |
+| DeepSomatic | FFPE_WES-TN | 815 | 0 | 0 | **0** | ✅ |
+| DeepSomatic | WGS-TO | 723 | 0 | 0 | **0** | ✅ |
+| DeepSomatic | PACBIO-TO | 487 | 4 | 4 | 20 (4.1 %) | ✅ LR tol |
+| DeepSomatic | ONT-TO | 453 | 15 | 15 | 17 (3.75 %) | ✅ LR tol |
+| Pangenome | WGS | 309 | 1 | 0 | **0** | ✅ (post partition_size fix) |
+
+All Illumina short-read modes: **0 FM** (perfect FILTER parity). Long-read
+(PacBio/ONT germline + somatic-TO) and the synthetic HYBRID input: 1–4 % FM,
+within the documented < 5 % long-read tolerance (small-model dispatch +
+FP32-drift + homopolymer, the documented non-goal class). Trio WGS keeps its
+1/2/0 RefCall↔NoCall residual (PASS + GT identical).
+
+Gotchas hit this matrix:
+- Docker `run_deepvariant` ONT model_type is `ONT_R104` (native uses `ONT`).
+- Docker somatic binary is `/opt/deepvariant/bin/deepsomatic/run_deepsomatic`
+  (not `/opt/deepvariant/bin/run_deepsomatic`).
+- chr20 reference fasta extracted from the GRCh38 no_alt `.fa.gz` (the old
+  `case-study-testdata/grch38_chr20.fasta` URL now 404s).
+- Homebrew upgraded protobuf 35.0→35.1 mid-session → had to reconfigure +
+  rebuild (the binary hard-links the protobuf dylib version).
+
+### 2026-06-21 (cont.) — extended to ALL modes on public data + RNASEQ fix
+
+User directive: validate the data-gated modes with **public** data too. Done:
+
+- **DeepTrio PacBio** — HG002/3/4 from GIAB AshkenazimTrio SequelII
+  pbmm2.GRCh38 BAMs (region-streamed via samtools https): 3/4/3 FM (~1.3 %),
+  within LR tol. ✅
+- **DeepTrio ONT** — HG002/3/4 R104 sup-merged chr20 (deepvariant ONT bucket,
+  matched R10.4 chemistry): 15/15/16 FM (~3.7 %), within LR tol. ✅ (DeepTrio
+  Docker model_type is `ONT`, not `ONT_R104`.)
+- **MASSEQ (real)** — HG004 MAS-seq Iso-Seq chr20 (masseq-case-study bucket),
+  gene region chr20:36.5M: 11 FM (4.6 %), within LR tol. ✅
+- **RNASEQ (real)** — HG005 poly-A Illumina RNA-seq (brain-genomics-public
+  bucket, the DV rnaseq case-study source), gene region chr20:35.5M.
+  **Surfaced a real bug → fixed (commit af59d3de, see below).** Post-fix:
+  152 shared, 2 FM, PASS 72 = 72 (was 41 vs 72). ✅
+
+**RNASEQ root cause + fix (commit af59d3de):** `split_skip_reads` (RNASEQ
+example_info flags_for_calling default) was plumbed as a flag and set on
+realigner_options, but **never implemented** in native — upstream's
+`realigner.py:split_reads` (split spliced N-CIGAR reads into per-exon
+sub-reads) was not ported. Intron-spanning RNA reads polluted the pileup →
+big model emitted ~homref (QUAL≈0.1) → NoCall where Docker called PASS
+(missing ~half the PASS calls). Ported as `SplitReadsOnSkip()` in
+make_examples_main.cc (germline path, gated by --split_skip_reads → RNASEQ
+only; WGS/WES/etc byte-identical, WGS chr20 re-checked 0 FM). 73 → 2 FM.
+
+**Every model_type the binary supports is now exercised against Docker on
+public data**: all Illumina short-read modes 0 FM; long-read (germline
+PacBio/ONT, trio PacBio/ONT, somatic PacBio/ONT-TO) + MAS-seq + RNASEQ within
+the documented < 5 % LR/RNA tolerance (small-model dispatch + FP32 drift +
+homopolymer); synthetic HYBRID 1.4 %. Pangenome 0 FM (partition_size fix).
+Two real bugs found and fixed this pass: pangenome partition_size (commit
+cc1d35de) and RNASEQ split_skip_reads (commit af59d3de).
