@@ -983,6 +983,88 @@ RealignerOptionsFromFlags() {
   return opts;
 }
 
+// Port of upstream realigner.py:split_reads (called from realign_reads when
+// --split_skip_reads is set, the RNA-seq default). Splits any read whose CIGAR
+// contains a SKIP (N) operation — i.e. a spliced RNA read spanning an intron —
+// into separate sub-reads, one per exonic segment, dropping the N gap. Each
+// segment ≥ _MIN_SPLIT_LEN (15) aligned bases is retained, with its own start
+// position and a `_p<part>` fragment-name suffix (mirrors copy_read). Without
+// this, intron-spanning reads inflate the pileup with phantom reference/deletion
+// evidence across the intron, degrading the pileup image so the big model emits
+// ~homref (QUAL≈0.1 → NoCall) where Docker calls PASS. The native realigner set
+// realigner_options.split_skip_reads=true but never acted on it; this restores
+// the behavior. Constants/op-sets mirror nucleus/util/cigar.py.
+static std::vector<nucleus::genomics::v1::Read> SplitReadsOnSkip(
+    const std::vector<nucleus::genomics::v1::Read>& reads) {
+  namespace ng = nucleus::genomics::v1;
+  using ng::CigarUnit;
+  constexpr int kMinSplitLen = 15;
+  auto is_ref_adv = [](int op) {
+    return op == CigarUnit::ALIGNMENT_MATCH || op == CigarUnit::SEQUENCE_MATCH ||
+           op == CigarUnit::DELETE || op == CigarUnit::SKIP ||
+           op == CigarUnit::SEQUENCE_MISMATCH;
+  };
+  auto is_read_adv = [](int op) {
+    return op == CigarUnit::ALIGNMENT_MATCH || op == CigarUnit::SEQUENCE_MATCH ||
+           op == CigarUnit::INSERT || op == CigarUnit::CLIP_SOFT ||
+           op == CigarUnit::SEQUENCE_MISMATCH;
+  };
+  std::vector<ng::Read> out;
+  out.reserve(reads.size());
+  for (const auto& read : reads) {
+    bool has_skip = false;
+    for (const auto& c : read.alignment().cigar())
+      if (c.operation() == CigarUnit::SKIP) { has_skip = true; break; }
+    if (!has_skip) { out.push_back(read); continue; }
+
+    int part = 0, read_start = 0, read_offset = 0, reference_offset = 0;
+    auto make_part = [&](int p) {
+      ng::Read nr;
+      nr.CopyFrom(read);
+      nr.clear_alignment();
+      nr.clear_aligned_sequence();
+      nr.clear_aligned_quality();
+      auto* pos = nr.mutable_alignment()->mutable_position();
+      pos->set_reference_name(read.alignment().position().reference_name());
+      pos->set_reverse_strand(read.alignment().position().reverse_strand());
+      nr.mutable_alignment()->set_mapping_quality(
+          read.alignment().mapping_quality());
+      nr.set_fragment_name(absl::StrCat(read.fragment_name(), "_p", p));
+      return nr;
+    };
+    ng::Read new_read = make_part(part);
+    const int ncig = read.alignment().cigar_size();
+    for (int n = 0; n < ncig; ++n) {
+      const auto& cig = read.alignment().cigar(n);
+      const bool on_last = (n + 1 == ncig);
+      const int op = cig.operation();
+      if (is_ref_adv(op)) {
+        if (new_read.alignment().position().position() == 0) {
+          new_read.mutable_alignment()->mutable_position()->set_position(
+              read.alignment().position().position() + reference_offset);
+        }
+        reference_offset += cig.operation_length();
+      }
+      if (is_read_adv(op)) read_offset += cig.operation_length();
+      if (op != CigarUnit::SKIP) *new_read.mutable_alignment()->add_cigar() = cig;
+      if (op == CigarUnit::SKIP || on_last) {
+        new_read.set_aligned_sequence(
+            read.aligned_sequence().substr(read_start, read_offset - read_start));
+        new_read.set_aligned_quality(
+            read.aligned_quality().substr(read_start, read_offset - read_start));
+        if (static_cast<int>(new_read.aligned_sequence().size()) >= kMinSplitLen)
+          out.push_back(new_read);
+        if (!on_last) {
+          read_start = read_offset;
+          ++part;
+          new_read = make_part(part);
+        }
+      }
+    }
+  }
+  return out;
+}
+
 // Infer sample name from the first RG:SM field in the BAM header.
 std::string InferSampleName(
     const nucleus::genomics::v1::SamHeader& header) {
@@ -1994,6 +2076,18 @@ int RunMakeExamples(int argc, char** argv) {
 
     LOG(INFO) << "  read " << reads.size() << " reads from BAM";
     if (reads.empty()) continue;
+
+    // RNA-seq: split reads on N (SKIP) CIGAR ops into per-exon sub-reads
+    // before candidate discovery / realignment / pileup. Mirrors upstream
+    // realigner.py:realign_reads → split_reads (gated by --split_skip_reads,
+    // the RNASEQ example_info default). Must run before the AlleleCounter so
+    // intron gaps don't pollute the pileup image.
+    if (absl::GetFlag(FLAGS_split_skip_reads)) {
+      const size_t before = reads.size();
+      reads = SplitReadsOnSkip(reads);
+      LOG(INFO) << "  split_skip_reads: " << before << " → " << reads.size()
+                << " reads (split on N CIGAR)";
+    }
 
     // ── Optional: realign reads through assembled haplotypes ─────────────
     // Done before any AlleleCounter pass so candidate sweep + ref read
