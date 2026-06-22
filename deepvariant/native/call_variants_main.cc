@@ -751,7 +751,10 @@ int RunCallVariants(int argc, char** argv) {
   }
 
   reader->Close();
-  writer->Close();
+  if (!writer->Close()) {
+    LOG(ERROR) << "Failed to flush/close output: " << outfile_path;
+    return 1;
+  }
 
   LOG(INFO) << "call_variants done: " << total_examples << " examples, "
             << total_batches << " batches → " << outfile_path;

@@ -545,7 +545,11 @@ int RunPostprocessVariants(int argc, char** argv) {
                                  ? contig_to_pos.at(std::get<0>(b))
                                  : INT_MAX;
               if (pa != pb) return pa < pb;
-              return std::get<1>(a) < std::get<1>(b);
+              if (std::get<1>(a) != std::get<1>(b))
+                return std::get<1>(a) < std::get<1>(b);
+              if (std::get<2>(a) != std::get<2>(b))
+                return std::get<2>(a) < std::get<2>(b);
+              return std::get<3>(a) < std::get<3>(b);
             });
 
   // ── Open VCF writer ───────────────────────────────────────────────────────
@@ -1013,9 +1017,17 @@ int RunPostprocessVariants(int argc, char** argv) {
       for (const auto& v : variants_buffer) {
         std::string serialized;
         v.SerializeToString(&serialized);
-        w->WriteRecord(serialized);
+        if (!w->WriteRecord(serialized)) {
+          LOG(ERROR) << "Failed to write temp variant TFRecord: "
+                     << tmp_var_tfrecord;
+          return 1;
+        }
       }
-      w->Close();
+      if (!w->Close()) {
+        LOG(ERROR) << "Failed to flush temp variant TFRecord: "
+                   << tmp_var_tfrecord;
+        return 1;
+      }
     }
 
     // Open the variant + non-variant readers and a second VcfWriter
