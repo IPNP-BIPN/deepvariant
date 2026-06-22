@@ -1255,6 +1255,12 @@ bool MetalInception::Predict(const float* input, int batch_size,
     }
     [cb commit];
     [cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) {
+      LOG(ERROR) << "MetalInception::Predict(det): GPU command buffer failed: "
+                 << (cb.error ? cb.error.localizedDescription.UTF8String
+                              : "unknown");
+      return false;
+    }
 
     // Phase 8 / Tier 6.0 — full-network det path: bypass MPSGraph entirely
     // by chaining all 11 Inception blocks + global avg pool, then copying
@@ -1288,6 +1294,13 @@ bool MetalInception::Predict(const float* input, int batch_size,
       }
       [cb_blk commit];
       [cb_blk waitUntilCompleted];
+      if (cb_blk.status == MTLCommandBufferStatusError) {
+        LOG(ERROR) << "MetalInception::Predict(det): GPU command buffer failed: "
+                   << (cb_blk.error
+                           ? cb_blk.error.localizedDescription.UTF8String
+                           : "unknown");
+        return false;
+      }
       // Copy (B, feature_dim) FP32 result to `output`.
       const size_t out_bytes = (size_t)batch_size * I.feature_dim * sizeof(float);
       std::memcpy(output, [I.gap_out_buf contents], out_bytes);
