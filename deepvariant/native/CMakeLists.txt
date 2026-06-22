@@ -82,8 +82,13 @@ target_include_directories(dv_metal_conv_kahan PUBLIC
   "${CMAKE_SOURCE_DIR}"
   "${ABSL_PREFIX}/include"
 )
+# NB: dv_metal_conv_kahan only needs ConvDesc from metal_conv_serial.h (a
+# compile-time include available via target_include_directories), not any
+# compiled MetalConvSerial symbol — so there is no link edge back to
+# dv_metal_conv_serial. Adding one would create a static-library cycle
+# (serial -> kahan is the only real edge, via MetalConvKahan::Create) that
+# Apple ld reports as "ignoring duplicate libraries".
 target_link_libraries(dv_metal_conv_kahan PUBLIC
-  dv_metal_conv_serial   # reuse ConvDesc
   absl::log
   "-framework Metal"
   "-framework Foundation"

@@ -31,3 +31,19 @@ phase1_test(small_model_smoke     small_model_smoke_test.cc     dv_small_model)
 phase1_test(dv_weights_smoke      dv_weights_smoke_test.cc      dv_weights)
 phase1_test(metal_inference_smoke metal_inference_smoke_test.cc dv_metal_inference)
 phase1_test(bnns_finalize_smoke   bnns_finalize_smoke_test.cc   dv_bnns_finalize)
+
+# Self-contained determinism / fidelity microtests (defined as executables in
+# deepvariant/native/CMakeLists.txt). Each returns non-zero on mismatch, so it
+# is a real ctest gate. The fixture-dependent microtests (det_mixed5b,
+# det_inception, bnns_stem — they read /tmp/dv_per_layer/*.npy) are left
+# unregistered since they need pre-generated per-layer dumps.
+foreach(t
+    microtest_numpy_rng
+    microtest_neon_base_color
+    microtest_neon_cigar_classify
+    microtest_conv_serial
+    microtest_conv_kahan)
+  if(TARGET ${t})
+    add_test(NAME ${t} COMMAND ${t})
+  endif()
+endforeach()

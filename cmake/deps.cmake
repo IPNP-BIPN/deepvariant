@@ -34,9 +34,18 @@ set_target_properties(htslib::htslib PROPERTIES
   IMPORTED_LOCATION "${HTSLIB_LIB}"
   INTERFACE_INCLUDE_DIRECTORIES "${HTSLIB_PREFIX}/include"
 )
+# Resolve libdeflate via Homebrew rather than a hardcoded /opt/homebrew path,
+# so the build works under a non-default Homebrew prefix or keg-only layout.
+execute_process(
+  COMMAND ${BREW_EXECUTABLE} --prefix libdeflate
+  OUTPUT_VARIABLE LIBDEFLATE_PREFIX
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+find_library(LIBDEFLATE_LIB NAMES libdeflate.a deflate
+  PATHS "${LIBDEFLATE_PREFIX}/lib" REQUIRED)
 target_link_libraries(htslib::htslib INTERFACE
   "-framework CoreFoundation"
-  /opt/homebrew/lib/libdeflate.a
+  "${LIBDEFLATE_LIB}"
   z bz2 lzma curl
 )
 message(STATUS "htslib: ${HTSLIB_LIB}")
@@ -83,10 +92,10 @@ FetchContent_Declare(
   URL      https://github.com/mengyao/Complete-Striped-Smith-Waterman-Library/archive/v1.2.5.tar.gz
   URL_HASH SHA256=b294c0cb6f0f3d578db11b4112a88b20583b9d4190b0a9cf04d83bb6a8704d9a
 )
-FetchContent_GetProperties(libssw)
-if(NOT libssw_POPULATED)
-  FetchContent_Populate(libssw)
-endif()
+# libssw ships no CMakeLists, so MakeAvailable just populates ${libssw_SOURCE_DIR}
+# (no add_subdirectory) — and avoids the deprecated single-arg
+# FetchContent_Populate(libssw) call.
+FetchContent_MakeAvailable(libssw)
 
 # OVERLAY: replace the vendored sse2neon.h (Ratcliff/NVIDIA early version,
 # 8798 lines, missing fixes) with the modern DLTcollab fork (11744 lines,

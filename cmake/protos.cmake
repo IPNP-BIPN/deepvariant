@@ -46,7 +46,7 @@ endfunction()
 # 1. nucleus protos (self-contained, no TF imports)
 # ---------------------------------------------------------------------------
 set(NUCLEUS_PROTO_ROOT "${CMAKE_SOURCE_DIR}/third_party/nucleus/protos")
-file(GLOB NUCLEUS_PROTOS "${NUCLEUS_PROTO_ROOT}/*.proto")
+file(GLOB NUCLEUS_PROTOS CONFIGURE_DEPENDS "${NUCLEUS_PROTO_ROOT}/*.proto")
 
 set(NUCLEUS_PB_SRCS)
 foreach(_p ${NUCLEUS_PROTOS})
@@ -72,7 +72,7 @@ add_library(proto_tf_example ALIAS proto_nucleus)
 # 2. deepvariant protos
 # ---------------------------------------------------------------------------
 set(DV_PROTO_ROOT "${CMAKE_SOURCE_DIR}/deepvariant/protos")
-file(GLOB DV_PROTOS "${DV_PROTO_ROOT}/*.proto")
+file(GLOB DV_PROTOS CONFIGURE_DEPENDS "${DV_PROTO_ROOT}/*.proto")
 
 set(DV_PB_SRCS)
 foreach(_p ${DV_PROTOS})

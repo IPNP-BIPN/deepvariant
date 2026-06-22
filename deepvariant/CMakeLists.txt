@@ -36,7 +36,7 @@ dv_library(dv_utils
 # ---------------------------------------------------------------------------
 # dv_channels — all pileup channel implementations
 # ---------------------------------------------------------------------------
-file(GLOB DV_CHANNEL_SRCS "channels/*.cc")
+file(GLOB DV_CHANNEL_SRCS CONFIGURE_DEPENDS "channels/*.cc")
 list(FILTER DV_CHANNEL_SRCS EXCLUDE REGEX "_test\\.cc$")
 dv_library(dv_channels
   SRCS ${DV_CHANNEL_SRCS}
