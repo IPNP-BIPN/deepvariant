@@ -23,7 +23,7 @@ Running log: `PORT_LOG.md`.
 
 ## Working rules
 
-1. **Test before commit.** Every commit must leave the build green: `swift build && swift test` in `tools/conversion/` for Phase 0 work; `cmake --build build && ctest -V` for Phases 1+.
+1. **Test before commit.** Every commit must leave the build green: `swift build && swift test` in `tools/conversion/` for Phase 0 work; `cmake --build build-macos && ctest -V` for Phases 1+. (Use `build-macos`, not `build` — a `build/` dir collides with the Bazel `BUILD` file on macOS's case-insensitive filesystem.)
 2. **Never degrade scientific precision.** F1 thresholds are gates, not goals. If we slip below, we fix the root cause — we do not lower the bar.
 3. **Never bypass an error.** No `--no-verify`, no swallowed exceptions, no commenting out of failing tests. Diagnose the root cause.
 4. **Document every critical decision** in `PORT_LOG.md` with date, context, alternatives considered, and rationale.

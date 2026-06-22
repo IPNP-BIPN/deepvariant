@@ -59,6 +59,10 @@ echo "    pyenv:   $(pyenv --version)"
 echo "    brew:    $(brew --version | head -1)"
 
 echo "==> ready. next:"
-echo "    cmake -S . -B build -G Ninja"
-echo "    cmake --build build --parallel"
-echo "    ctest --test-dir build --output-on-failure"
+# NB: use 'build-macos', not 'build' — the repo has a Bazel 'BUILD' file at the
+# root and macOS's default case-insensitive filesystem treats a 'build/'
+# directory as the same name, clobbering it. README/docs/release already
+# standardize on 'build-macos'.
+echo "    cmake -S . -B build-macos -G Ninja"
+echo "    cmake --build build-macos --parallel"
+echo "    ctest --test-dir build-macos --output-on-failure"
