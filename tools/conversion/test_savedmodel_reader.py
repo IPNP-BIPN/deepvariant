@@ -5,7 +5,8 @@ parse it back via SavedModelReader. Run from `tools/conversion/`:
 
 No real SavedModel artefacts are needed — this exercises only the
 proto-parsing half of the reader. The TensorBundle (weights) half is
-asserted to raise NotImplementedError.
+implemented now; here we only assert that it raises on a malformed
+(zeroed) variables.index rather than building a valid bundle inline.
 """
 
 from __future__ import annotations
@@ -70,7 +71,8 @@ def _build_synth_savedmodel(tmp: Path) -> Path:
     out_dir = tmp / "synth_model"
     out_dir.mkdir(parents=True)
     (out_dir / "saved_model.pb").write_bytes(sm.SerializeToString())
-    # Empty variables/ to trip the weights() NotImplementedError.
+    # A zeroed variables.index is a malformed tensor bundle — weights() should
+    # raise when it tries to parse it (the magic/footer check fails).
     (out_dir / "variables").mkdir()
     (out_dir / "variables" / "variables.index").write_bytes(b"\x00" * 64)
     return out_dir
@@ -95,12 +97,15 @@ def main() -> int:
 
         assert "conv_kernel" in summary.variables, summary.variables
 
+        # weights() is implemented now; on a zeroed/malformed variables.index
+        # it must raise (the exact type depends on the TensorBundle reader —
+        # e.g. RuntimeError on the magic check), but never succeed silently.
         try:
             reader.weights()
-        except NotImplementedError as e:
-            print(f"weights() correctly stubs out: {e}")
+        except Exception as e:
+            print(f"weights() correctly raises on a malformed index: {e!r}")
         else:
-            print("FAIL: weights() should have raised NotImplementedError")
+            print("FAIL: weights() should have raised on a zeroed variables.index")
             return 1
 
         print("OK")
