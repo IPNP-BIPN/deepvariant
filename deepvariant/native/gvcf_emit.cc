@@ -157,7 +157,12 @@ std::vector<nucleus::genomics::v1::Variant> MakeGvcfRows(
       dps.push_back(entries[k].n_total);
     }
     std::sort(dps.begin(), dps.end());
-    const int med_dp = dps[dps.size() / 2];
+    // True median: average the two middle values on even-length input, matching
+    // upstream int(statistics.median(...)).
+    const size_t n = dps.size();
+    const int med_dp = (n % 2 == 1)
+                           ? dps[n / 2]
+                           : static_cast<int>((dps[n / 2 - 1] + dps[n / 2]) / 2);
 
     if (first.gl_is_valid) {
       // Emit ONE merged Variant for [i, j).

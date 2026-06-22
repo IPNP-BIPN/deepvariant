@@ -146,16 +146,12 @@ double Log10SumExp(const std::vector<double>& xs) {
   return m + std::log10(s);
 }
 
-// Subtract-max + log10(probs / sum) — mirror of
+// Subtract log10sumexp so 10^x sums to 1 — mirror of
 // genomics_math.normalize_log10_probs.
 std::vector<double> NormalizeLog10Probs(std::vector<double> v) {
   if (v.empty()) return v;
-  double m = -std::numeric_limits<double>::infinity();
-  for (double x : v) m = std::max(m, x);
-  for (double& x : v) x -= m;     // approximation: subtract max
-  // Exact: also normalise so 10^x sums to 1. The approximation upstream
-  // uses is the subtract-max version (line: scaled = [x - m for x in xs]);
-  // but it's not divided by sum. Both produce the same argmax.
+  const double lse = Log10SumExp(v);
+  for (double& x : v) x = std::min(x - lse, 0.0);
   return v;
 }
 

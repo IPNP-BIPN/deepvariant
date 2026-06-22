@@ -2075,7 +2075,11 @@ int RunMakeExamples(int argc, char** argv) {
     }
 
     LOG(INFO) << "  read " << reads.size() << " reads from BAM";
-    if (reads.empty()) continue;
+    // Upstream make_examples_core.py only aborts a zero-coverage region early
+    // when gVCF is disabled; with a gvcf_writer we must still fall through to
+    // emit per-position reference-confidence rows (the gVCF block below tolerates
+    // empty reads, and probe_candidates.empty() then `continue`s with no work).
+    if (reads.empty() && gvcf_writer == nullptr) continue;
 
     // RNA-seq: split reads on N (SKIP) CIGAR ops into per-exon sub-reads
     // before candidate discovery / realignment / pileup. Mirrors upstream

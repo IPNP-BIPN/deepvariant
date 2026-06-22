@@ -9,6 +9,7 @@
 
 #include "absl/log/log.h"
 #include "absl/strings/numbers.h"
+#include "absl/strings/str_replace.h"
 #include "absl/strings/str_split.h"
 #include "third_party/nucleus/protos/range.pb.h"
 #include "third_party/nucleus/protos/reference.pb.h"
@@ -39,16 +40,23 @@ bool ParseRegionString(
 
   auto dash = range_part.find('-');
   int64_t start_1based, end_1based;
+  // Strip comma grouping from numeric substrings (e.g. "1,000,000") before
+  // parsing, matching upstream ranges.parse_literal which accepts [0-9,]+.
   if (dash == std::string::npos) {
     // Single position: "chr1:1000" → half-open [999, 1000)
-    if (!absl::SimpleAtoi(range_part, &start_1based)) {
+    const std::string pos_str = absl::StrReplaceAll(range_part, {{",", ""}});
+    if (!absl::SimpleAtoi(pos_str, &start_1based)) {
       LOG(ERROR) << "Cannot parse position in region: " << s;
       return false;
     }
     end_1based = start_1based;
   } else {
-    if (!absl::SimpleAtoi(range_part.substr(0, dash), &start_1based) ||
-        !absl::SimpleAtoi(range_part.substr(dash + 1), &end_1based)) {
+    const std::string start_str =
+        absl::StrReplaceAll(range_part.substr(0, dash), {{",", ""}});
+    const std::string end_str =
+        absl::StrReplaceAll(range_part.substr(dash + 1), {{",", ""}});
+    if (!absl::SimpleAtoi(start_str, &start_1based) ||
+        !absl::SimpleAtoi(end_str, &end_1based)) {
       LOG(ERROR) << "Cannot parse range in region: " << s;
       return false;
     }

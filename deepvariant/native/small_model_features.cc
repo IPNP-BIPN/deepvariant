@@ -19,6 +19,17 @@ using nucleus::genomics::v1::Variant;
 
 namespace {
 
+// Count alternate_bases entries that are not symbolic/placeholder alleles.
+// Mirrors variant_utils.is_multiallelic, which default-excludes "<*>",
+// "<NON_REF>", and "." before counting.
+int NumNonSymbolicAlts(const Variant& v) {
+  int n = 0;
+  for (const auto& alt : v.alternate_bases()) {
+    if (alt != "<*>" && alt != "<NON_REF>" && alt != ".") ++n;
+  }
+  return n;
+}
+
 // Pull the reads supporting the chosen alt allele indices into a single
 // flat vector of ReadSupport pointers. If `sample_filter` is non-empty,
 // only reads with matching `sample_name` are retained (mirrors upstream's
@@ -197,7 +208,7 @@ std::vector<float> EncodeSmallModelFeatures(
     del_len = std::max(del_len, d);
   }
   features.push_back(std::max(0, del_len));                      // deletion_length
-  features.push_back(v.alternate_bases_size() > 1 ? 1 : 0);      // is_multiallelic
+  features.push_back(NumNonSymbolicAlts(v) > 1 ? 1 : 0);         // is_multiallelic
   features.push_back(alt_allele_indices.size() > 1 ? 1 : 0);     // is_multiple_alt_alleles
 
   // ── VAF context (51 features, offsets -25..+25 inclusive) ─────────────────
@@ -271,7 +282,7 @@ std::vector<float> EncodeSmallModelFeaturesMultiSample(
     del_len = std::max(del_len, d);
   }
   features.push_back(std::max(0, del_len));
-  features.push_back(v.alternate_bases_size() > 1 ? 1 : 0);
+  features.push_back(NumNonSymbolicAlts(v) > 1 ? 1 : 0);
   features.push_back(alt_allele_indices.size() > 1 ? 1 : 0);
 
   // ── VAF context (51) ─────────────────────────────────────────────────────
@@ -388,7 +399,7 @@ std::vector<float> EncodeSmallModelFeaturesHaplotype(
   }
   features.push_back(std::max(0, ins_len));
   features.push_back(std::max(0, del_len));
-  features.push_back(v.alternate_bases_size() > 1 ? 1 : 0);
+  features.push_back(NumNonSymbolicAlts(v) > 1 ? 1 : 0);
   features.push_back(static_cast<int>(alt_allele_indices.size()) > 1 ? 1 : 0);
   {
     const auto& vaf_at_pos = candidate.allele_frequency_at_position();
