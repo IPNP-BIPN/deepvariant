@@ -328,8 +328,7 @@ add_executable(debug_metal "${CMAKE_CURRENT_SOURCE_DIR}/debug_metal_main.cc")
 target_include_directories(debug_metal PRIVATE ${ME_INCLUDE_DIRS})
 target_compile_options(debug_metal PRIVATE ${ME_COMPILE_OPTS})
 target_link_libraries(debug_metal PRIVATE
-  dv_metal_inference
-  dv_weights
+  dv_metal_inference  # transitively links dv_weights (PUBLIC); do not repeat it
 )
 
 # ---------------------------------------------------------------------------
