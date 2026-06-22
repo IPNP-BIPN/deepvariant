@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <sys/stat.h>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -37,7 +39,8 @@ ABSL_FLAG(bool, include_alt_contigs, false,
           "FILTER parity at WG scale.");
 
 ABSL_FLAG(std::string, model_type, "WGS",
-          "Model type: WGS, WES, PACBIO, ONT, HYBRID_PACBIO_ILLUMINA");
+          "Model type: WGS, WES, PACBIO, ONT (alias ONT_R104), "
+          "HYBRID_PACBIO_ILLUMINA");
 ABSL_FLAG(std::string, output_vcf, "", "Output VCF path (run mode).");
 ABSL_FLAG(std::string, output_gvcf, "",
           "Output gVCF path (run mode, optional).");
@@ -362,6 +365,19 @@ int EffectiveBatchSize() {
   return AutoBatchSize();
 }
 
+// CanonicalModelType — canonicalize user-facing model_type aliases to the
+// internal short form this file compares against. Upstream's canonical
+// long-read ONT string is `ONT_R104` (also `ONT_R10` / `ONT_R9`), but every
+// comparison in this file is against the short `"ONT"`. Without this, a user
+// passing --model_type=ONT_R104 would be silently misrouted to the WGS/WES
+// default branch. Upper-cases first to match the existing convention in this
+// file (all comparisons here are against upper-case forms).
+std::string CanonicalModelType(std::string mt) {
+  for (char& c : mt) c = static_cast<char>(std::toupper(c));
+  if (mt == "ONT_R104" || mt == "ONT_R10" || mt == "ONT_R9") return "ONT";
+  return mt;
+}
+
 std::string ModelPath(const std::string& model_type) {
   if (!absl::GetFlag(FLAGS_model).empty()) {
     return absl::GetFlag(FLAGS_model);
@@ -373,6 +389,69 @@ std::string ModelPath(const std::string& model_type) {
   // Normalise to lowercase.
   for (char& c : type) c = static_cast<char>(std::tolower(c));
   return absl::StrCat(base, "/", type, ".mlpackage");
+}
+
+// MergeCvoFiles — concatenate small-model CVO shards (if any) followed by the
+// big-model CVO into a single `merged_cvo_path`, by raw byte copy. TFRecord
+// allows naive byte concatenation because each record is self-delimiting.
+//
+// `small_cvo_pattern` is either empty (no small model → only big_cvo is
+// copied), a single file path, or a `name@N` shard spec written one-file-per
+// make_examples worker thread; in the `@N` case we expand to the conventional
+// `name-NNNNN-of-NNNNN` shard files and append each in order. `big_cvo_path`
+// is the single file written by call_variants.
+//
+// This replaces an earlier unquoted `std::system("cat ... > ...")` merge in
+// the somatic/pangenome paths, which broke on paths containing spaces or shell
+// metacharacters. Returns false (with LOG(ERROR)) on any I/O failure.
+//
+// Critical subtlety preserved from the germline merge: we read each source
+// into a buffer and only write when non-empty. `operator<<(streambuf*)` sets
+// the output stream's failbit when the source is empty, which silently breaks
+// ALL subsequent writes — and sharded small_cvo routinely has 0-record shards.
+bool MergeCvoFiles(const std::string& small_cvo_pattern,
+                   const std::string& big_cvo_path,
+                   const std::string& merged_cvo_path) {
+  std::ofstream out(merged_cvo_path, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    LOG(ERROR) << "Cannot open merged CVO: " << merged_cvo_path;
+    return false;
+  }
+  bool ok = true;
+  auto append_path = [&](const std::string& p) {
+    std::ifstream in(p, std::ios::binary);
+    if (!in) return;  // missing shard (e.g. 0-record) → skip, not an error.
+    std::vector<char> buf((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    if (!buf.empty()) out.write(buf.data(), buf.size());
+  };
+  // small_cvo first (matching the germline / `cat small big` order), then big.
+  if (!small_cvo_pattern.empty()) {
+    const auto at = small_cvo_pattern.find('@');
+    if (at == std::string::npos) {
+      append_path(small_cvo_pattern);
+    } else {
+      const std::string prefix = small_cvo_pattern.substr(0, at);
+      int nshard = 0;
+      if (!absl::SimpleAtoi(small_cvo_pattern.substr(at + 1), &nshard) ||
+          nshard <= 0) {
+        LOG(ERROR) << "Bad small_cvo shard spec: " << small_cvo_pattern;
+        return false;
+      }
+      for (int i = 0; i < nshard; ++i) {
+        append_path(absl::StrCat(prefix, "-",
+                                  absl::Dec(i, absl::kZeroPad5),
+                                  "-of-", absl::Dec(nshard, absl::kZeroPad5)));
+      }
+    }
+  }
+  append_path(big_cvo_path);
+  out.close();
+  if (!out) {
+    LOG(ERROR) << "Failed writing merged CVO: " << merged_cvo_path;
+    ok = false;
+  }
+  return ok;
 }
 
 }  // namespace
@@ -909,7 +988,8 @@ int RunAll(int argc, char** argv) {
     return RunAllPangenome(argc, argv);
   }
 
-  const std::string model_type = absl::GetFlag(FLAGS_model_type);
+  const std::string model_type =
+      CanonicalModelType(absl::GetFlag(FLAGS_model_type));
   const std::string reads_flag = absl::GetFlag(FLAGS_reads);
   const std::string ref_flag = absl::GetFlag(FLAGS_ref);
   const std::string output_vcf_flag = absl::GetFlag(FLAGS_output_vcf);
@@ -917,6 +997,20 @@ int RunAll(int argc, char** argv) {
   const std::string regions_flag = EffectiveRegions(user_regions, ref_flag);
   const std::string tmp_dir = absl::GetFlag(FLAGS_intermediate_results_dir);
   const int num_shards = EffectiveNumShards();
+
+  // Ensure the intermediate results dir exists before any stage writes into it
+  // (the trio/somatic/pangenome dispatchers already create it; germline did
+  // not, so a non-existent --intermediate_results_dir failed mid-pipeline when
+  // make_examples tried to open its TFRecord output).
+  {
+    std::error_code ec;
+    std::filesystem::create_directories(tmp_dir, ec);
+    if (ec) {
+      LOG(ERROR) << "Failed to create intermediate dir " << tmp_dir << ": "
+                 << ec.message();
+      return 1;
+    }
+  }
 
   if (reads_flag.empty() || ref_flag.empty() || output_vcf_flag.empty()) {
     LOG(ERROR) << "Usage: deepvariant run --reads=<BAM> --ref=<FASTA> "
@@ -1084,42 +1178,9 @@ int RunAll(int argc, char** argv) {
   std::string postprocess_input = cvo_pattern;
   if (!small_model_path.empty()) {
     LOG(INFO) << "Stage 2.5: merge small_cvo + big_cvo → " << merged_cvo_path;
-    std::ofstream out(merged_cvo_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-      LOG(ERROR) << "Cannot open merged CVO: " << merged_cvo_path;
+    if (!MergeCvoFiles(small_cvo_path, cvo_pattern, merged_cvo_path)) {
       return 1;
     }
-    auto append_path = [&](const std::string& p) {
-      std::ifstream in(p, std::ios::binary);
-      if (!in) return;
-      // Read into buffer first — operator<<(streambuf*) sets failbit when
-      // the source is empty, which silently breaks ALL subsequent writes.
-      // Critical for sharded small_cvo where some shards have 0 records.
-      std::vector<char> buf((std::istreambuf_iterator<char>(in)),
-                             std::istreambuf_iterator<char>());
-      if (!buf.empty()) out.write(buf.data(), buf.size());
-    };
-    // small_cvo: expand "@N" → per-shard files.
-    auto at = small_cvo_path.find('@');
-    if (at == std::string::npos) {
-      append_path(small_cvo_path);
-    } else {
-      const std::string prefix = small_cvo_path.substr(0, at);
-      int nshard = 0;
-      if (!absl::SimpleAtoi(small_cvo_path.substr(at + 1), &nshard) ||
-          nshard <= 0) {
-        LOG(ERROR) << "Bad small_cvo shard spec: " << small_cvo_path;
-        return 1;
-      }
-      for (int i = 0; i < nshard; ++i) {
-        append_path(absl::StrCat(prefix, "-",
-                                  absl::Dec(i, absl::kZeroPad5),
-                                  "-of-", absl::Dec(nshard, absl::kZeroPad5)));
-      }
-    }
-    // big_cvo: single file (call_variants writes once).
-    append_path(cvo_pattern);
-    out.close();
     postprocess_input = merged_cvo_path;
   }
 
@@ -1158,7 +1219,8 @@ int RunAll(int argc, char** argv) {
 // ──────────────────────────────────────────────────────────────────────
 int RunAllTrio(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
-  const std::string model_type = absl::GetFlag(FLAGS_model_type);
+  const std::string model_type =
+      CanonicalModelType(absl::GetFlag(FLAGS_model_type));
   // Ensure intermediate_results_dir exists (may not be pre-created by caller).
   { std::system(absl::StrCat("mkdir -p '",
       absl::GetFlag(FLAGS_intermediate_results_dir), "'").c_str()); }
@@ -1501,7 +1563,8 @@ int RunAllTrio(int argc, char** argv) {
 // ──────────────────────────────────────────────────────────────────────
 int RunAllSomatic(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
-  const std::string model_type = absl::GetFlag(FLAGS_model_type);
+  const std::string model_type =
+      CanonicalModelType(absl::GetFlag(FLAGS_model_type));
   { std::system(absl::StrCat("mkdir -p '",
       absl::GetFlag(FLAGS_intermediate_results_dir), "'").c_str()); }
   const std::string ref_flag = absl::GetFlag(FLAGS_ref);
@@ -1669,19 +1732,11 @@ int RunAllSomatic(int argc, char** argv) {
   // ── Stage 2.5: merge small_cvo into cvo (if SM was used). ──
   LOG(INFO) << "Somatic Stage 2.5: merge → " << merged_cvo_path;
   {
-    std::vector<std::string> cmd = {
-        "/bin/sh", "-c",
-        absl::StrCat("cat ", cvo_path, " > ", merged_cvo_path)};
-    if (!sm_path.empty()) {
-      // Pre-pend small_cvo records.
-      cmd[2] = absl::StrCat(
-          "cat ",
-          n_threads > 1 ? absl::StrCat(tmp_dir, "/small_cvo_tumor.tfrecord-*")
-                        : small_cvo_pattern,
-          " ", cvo_path, " > ", merged_cvo_path);
-    }
-    int rc = std::system(cmd[2].c_str());
-    if (rc != 0) {
+    // small_cvo_pattern is a `name@N` shard spec (n_threads>1) or a single
+    // file; MergeCvoFiles expands `@N` to the per-shard files. When sm_path is
+    // empty no small_cvo was written, so we merge only the big cvo.
+    const std::string small = sm_path.empty() ? "" : small_cvo_pattern;
+    if (!MergeCvoFiles(small, cvo_path, merged_cvo_path)) {
       LOG(ERROR) << "Somatic: merge step failed";
       return 1;
     }
@@ -1882,18 +1937,11 @@ int RunAllPangenome(int argc, char** argv) {
   // ── Stage 2.5: merge small_cvo into cvo. ──
   LOG(INFO) << "Pangenome Stage 2.5: merge → " << merged_cvo_path;
   {
-    std::vector<std::string> cmd = {
-        "/bin/sh", "-c",
-        absl::StrCat("cat ", cvo_path, " > ", merged_cvo_path)};
-    if (!sm_path.empty()) {
-      cmd[2] = absl::StrCat(
-          "cat ",
-          n_threads > 1 ? absl::StrCat(tmp_dir, "/small_cvo_reads.tfrecord-*")
-                        : small_cvo_pattern,
-          " ", cvo_path, " > ", merged_cvo_path);
-    }
-    int rc = std::system(cmd[2].c_str());
-    if (rc != 0) {
+    // small_cvo_pattern is a `name@N` shard spec (n_threads>1) or a single
+    // file; MergeCvoFiles expands `@N` to the per-shard files. When sm_path is
+    // empty no small_cvo was written, so we merge only the big cvo.
+    const std::string small = sm_path.empty() ? "" : small_cvo_pattern;
+    if (!MergeCvoFiles(small, cvo_path, merged_cvo_path)) {
       LOG(ERROR) << "Pangenome: merge step failed";
       return 1;
     }

@@ -125,7 +125,7 @@ int main() {
     static const char alphabet[] = "ACGTNacgtX0";
     std::mt19937 rng(0xFEEDFACEu);
     for (size_t i = 0; i < n; ++i)
-      read_buf[i] = alphabet[rng() % sizeof(alphabet) - 1];
+      read_buf[i] = alphabet[rng() % (sizeof(alphabet) - 1)];
     for (uint8_t q : test_quals) {
       qual_buf.assign(n, q);
       for (int leg = 0; leg <= 1; ++leg) {

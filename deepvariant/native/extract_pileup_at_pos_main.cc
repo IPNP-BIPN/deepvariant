@@ -14,8 +14,10 @@
 //   start_1based is the conventional VCF coordinate (1-based);
 //   internally we compare against variant.start() which is 0-based.
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -199,7 +201,19 @@ int main(int argc, char** argv) {
   const std::string tfr_path = argv[1];
   const std::string out_path = argv[2];
   const std::string chrom = argv[3];
-  const int64_t start_0b = std::strtoll(argv[4], nullptr, 10) - 1;
+  // Checked parse of the 1-based start position. An unchecked strtoll() would
+  // silently turn bad input ("abc", "", "12x") into position 0, scanning the
+  // whole TFRecord and matching nothing — a confusing no-op. Reject anything
+  // that isn't a complete, in-range positive integer.
+  errno = 0;
+  char* end = nullptr;
+  const long long start_1based = std::strtoll(argv[4], &end, 10);
+  if (errno != 0 || end == argv[4] || *end != '\0' || start_1based < 1) {
+    std::fprintf(stderr, "error: <start_1based> must be a positive integer, "
+                 "got \"%s\"\n", argv[4]);
+    return 2;
+  }
+  const int64_t start_0b = static_cast<int64_t>(start_1based) - 1;
   const std::string ref = argv[5];
   const std::string alt = argv[6];
 
