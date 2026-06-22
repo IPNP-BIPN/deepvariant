@@ -40,3 +40,6 @@ testdata/reference/large/
 .DS_Store
 validation/work/
 validation/output/
+
+# Local Claude Code settings (do not commit)
+.claude/
