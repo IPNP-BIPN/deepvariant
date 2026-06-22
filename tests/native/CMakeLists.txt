@@ -24,6 +24,22 @@ function(phase1_test name src lib)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+# Like phase1_test, but the source lives outside tests/native/ (it is the
+# upstream test, shared verbatim). Pass an absolute path to the .cc.
+function(phase1_test_abs name abs_src lib)
+  add_executable(${name} "${abs_src}")
+  target_include_directories(${name} PRIVATE ${GATE_INCLUDE_DIRS})
+  target_compile_options(${name} PRIVATE ${GATE_COMPILE_OPTS})
+  target_link_libraries(${name} PRIVATE ${lib} gtest_main gmock)
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+# Upstream methylation_aware_phasing unit test, run verbatim against the
+# native build of the algorithm (dv_methylation_aware_phasing).
+phase1_test_abs(methylation_aware_phasing_test
+  "${CMAKE_SOURCE_DIR}/deepvariant/methylation_aware_phasing_test.cc"
+  dv_methylation_aware_phasing)
+
 phase1_test(nucleus_io_smoke      nucleus_io_smoke_test.cc      nucleus_io)
 phase1_test(realigner_smoke       realigner_smoke_test.cc       realigner)
 phase1_test(call_variants_smoke   call_variants_smoke_test.cc   dv_call_variants_lib)

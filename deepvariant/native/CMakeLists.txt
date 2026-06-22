@@ -300,6 +300,34 @@ target_link_libraries(dv_make_examples_lib PUBLIC
 )
 
 # ---------------------------------------------------------------------------
+# dv_methylation_aware_phasing — faithful C++ port of upstream's
+# methylation_aware_phasing.{cc,h} (Wilcoxon rank-sum 5mC haplotype voting).
+#
+# NOTE: this algorithm is compiled and unit-tested here (so it cannot bitrot
+# against the native proto definitions), but it is NOT yet invoked by the
+# native make_examples pipeline. The native phasing step
+# (make_examples_main.cc) uses DirectPhasing only; there is no native
+# --enable_methylation_aware_phasing flag, so a user cannot currently engage
+# methylation-aware phasing. Wiring PerformMethylationAwarePhasing into the
+# make_examples region loop (mirroring make_examples_core.py's methylated-ref-
+# site partitioning + post-DirectPhasing call) is deferred follow-up work.
+# This target deliberately is not linked into dv_make_examples_lib.
+# ---------------------------------------------------------------------------
+add_library(dv_methylation_aware_phasing STATIC
+  "${CMAKE_SOURCE_DIR}/deepvariant/methylation_aware_phasing.cc"
+)
+target_include_directories(dv_methylation_aware_phasing PUBLIC ${ME_INCLUDE_DIRS})
+target_compile_options(dv_methylation_aware_phasing PRIVATE ${ME_COMPILE_OPTS})
+target_link_libraries(dv_methylation_aware_phasing PUBLIC
+  proto_dv
+  proto_nucleus
+  absl::log
+  absl::strings
+  absl::flat_hash_map   # raw_hash_set internals referenced by the .cc
+  absl::flat_hash_set
+)
+
+# ---------------------------------------------------------------------------
 # Phase 3 — postprocess_variants orchestration
 # ---------------------------------------------------------------------------
 add_library(dv_postprocess_lib STATIC
