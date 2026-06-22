@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace deepvariant {
 
@@ -56,6 +57,8 @@ class TFRecordWriter {
 
   ~TFRecordWriter();
 
+  bool WriteRecord(std::string_view payload);
+  // Convenience overload; delegates to the string_view version.
   bool WriteRecord(const std::string& payload);
   bool Flush();
   bool Close();

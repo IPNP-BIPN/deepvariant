@@ -62,13 +62,30 @@ std::string ShardName(const std::string& spec, int task_id) {
 // TFRecordReader
 // ---------------------------------------------------------------------------
 
+// Large streambuf for the reader. The writer coalesces into a 1 MiB buffer
+// (kBufBytes), but the reader otherwise uses the default ~4-8 KiB streambuf
+// and issues several stream ops per record. A 1 MiB read buffer cuts the
+// number of underlying read() syscalls dramatically. Pure buffering: the
+// on-disk format and decoded bytes are unchanged.
+namespace {
+constexpr size_t kReaderBufBytes = 1 << 20;  // 1 MiB read buffer
+}  // namespace
+
 struct TFRecordReader::Impl {
   std::vector<std::string> paths;
   size_t current_index = 0;
+  // Persistent buffer backing the stream's streambuf. Its lifetime must
+  // cover all reads, so it is owned by the Impl alongside the stream.
+  std::vector<char> read_buf;
   std::ifstream stream;
 
-  explicit Impl(const std::string& spec) : paths(ExpandShards(spec)) {
-    if (!paths.empty()) stream.open(paths[0], std::ios::binary);
+  explicit Impl(const std::string& spec)
+      : paths(ExpandShards(spec)), read_buf(kReaderBufBytes) {
+    if (!paths.empty()) {
+      // pubsetbuf must be called BEFORE open to take effect.
+      stream.rdbuf()->pubsetbuf(read_buf.data(), read_buf.size());
+      stream.open(paths[0], std::ios::binary);
+    }
   }
 
   // Advance to the next shard if the current one is exhausted; returns true
@@ -79,6 +96,8 @@ struct TFRecordReader::Impl {
       stream.close();
       ++current_index;
       stream.clear();
+      // pubsetbuf must be called BEFORE open to take effect.
+      stream.rdbuf()->pubsetbuf(read_buf.data(), read_buf.size());
       stream.open(paths[current_index], std::ios::binary);
       if (stream.is_open() && stream.good()) return true;
     }
@@ -182,6 +201,9 @@ bool TFRecordReader::GetNext() {
     impl_->stream.close();
     ++impl_->current_index;
     impl_->stream.clear();
+    // pubsetbuf must be called BEFORE open to take effect.
+    impl_->stream.rdbuf()->pubsetbuf(impl_->read_buf.data(),
+                                     impl_->read_buf.size());
     impl_->stream.open(impl_->paths[impl_->current_index], std::ios::binary);
     if (!impl_->stream.is_open()) return false;
     offset_ = 0;
@@ -300,7 +322,7 @@ std::unique_ptr<TFRecordWriter> TFRecordWriter::New(
   return w;
 }
 
-bool TFRecordWriter::WriteRecord(const std::string& payload) {
+bool TFRecordWriter::WriteRecord(std::string_view payload) {
   if (!impl_ || !impl_->ok) return false;
   uint64_t len = payload.size();
   uint32_t len_crc =
@@ -311,6 +333,10 @@ bool TFRecordWriter::WriteRecord(const std::string& payload) {
   if (!impl_->Append(payload.data(), len)) return false;
   if (!impl_->Append(reinterpret_cast<const char*>(&data_crc), 4)) return false;
   return true;
+}
+
+bool TFRecordWriter::WriteRecord(const std::string& payload) {
+  return WriteRecord(std::string_view(payload));
 }
 
 bool TFRecordWriter::Flush() {
