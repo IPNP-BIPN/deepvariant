@@ -77,9 +77,17 @@ bool TFRecordWriter::Close() {
   std::lock_guard<std::mutex> lk(mu);
   auto it = impls.find(this);
   if (it == impls.end()) return true;
-  it->second->stream.flush();
-  it->second->stream.close();
-  return !it->second->stream.fail();
+  auto& s = it->second->stream;
+  // Flush user-space buffers and surface any write error before closing.
+  // std::ofstream exposes no portable file descriptor, so we cannot
+  // ::fsync() the underlying file to force a kernel-level durability
+  // barrier; the strongest guarantee available is that all bytes were
+  // successfully handed to the OS (good() after flush) and that close()
+  // itself did not fail.
+  s.flush();
+  if (!s.good()) return false;
+  s.close();
+  return !s.fail();
 }
 
 }  // namespace nucleus

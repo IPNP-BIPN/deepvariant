@@ -4,6 +4,7 @@
 #include "deepvariant/native/tfrecord.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -103,38 +104,78 @@ bool TFRecordReader::GetNext() {
   while (true) {
     auto& s = impl_->stream;
     if (s.good()) {
+      const std::string& path = impl_->paths[impl_->current_index];
       uint64_t length = 0;
       s.read(reinterpret_cast<char*>(&length), 8);
-      if (s.gcount() == 8) {
-        s.seekg(4, std::ios::cur);  // skip length CRC (not verified)
+      const std::streamsize len_read = s.gcount();
+      if (len_read == 8) {
+        // Read and verify the length CRC (masked CRC32C over the 8 length
+        // bytes) rather than seekg-skipping it.
+        uint32_t len_crc = 0;
+        s.read(reinterpret_cast<char*>(&len_crc), 4);
+        if (s.gcount() != 4) {
+          std::fprintf(stderr,
+                       "tfrecord: truncated TFRecord (length CRC) in %s at "
+                       "offset %lld\n",
+                       path.c_str(), static_cast<long long>(offset_));
+          return false;
+        }
+        const uint32_t expected_len_crc =
+            MaskedCrc32c(reinterpret_cast<const char*>(&length), sizeof(length));
+        if (len_crc != expected_len_crc) {
+          std::fprintf(stderr,
+                       "tfrecord: length CRC mismatch in %s at offset %lld\n",
+                       path.c_str(), static_cast<long long>(offset_));
+          return false;
+        }
 
         record_.resize(length);
         s.read(record_.data(), static_cast<std::streamsize>(length));
         if (static_cast<uint64_t>(s.gcount()) != length) {
-          // BUG FIX (2026-05-10): the previous `return false` here would
-          // ABANDON all remaining shards in a multi-shard read whenever
-          // the LAST record of any shard was truncated. On a 14-shard
-          // WG run this caused 13/14 shards (~95 % of examples) to be
-          // silently dropped: call_variants only saw 69k of 954k
-          // examples → 947k PASS calls missing in the final VCF.
-          //
-          // Truncation cause: upstream's ExamplesGenerator destructor
-          // closes the writer without an explicit flush — the last
-          // partial-buffer write (1 record per shard, ≈10-150 KB out
-          // of 1 MiB buffer) is dropped on close.
-          //
-          // Fix: treat partial-payload same as EOF — fall through to
-          // shard-advance code. Loses the 1 truncated record per shard
-          // (unrecoverable since it was never written to disk) but
-          // preserves all following shards. WG impact: 14 lost records
-          // out of 954k = 0.0015 % vs 100 % loss before the fix.
-          // Fall through to shard-advance code below.
+          // A partial payload read (0 < gcount < length) is genuine
+          // truncation, not a clean record boundary: surface it as an
+          // error instead of silently advancing to the next shard.
+          std::fprintf(stderr,
+                       "tfrecord: truncated TFRecord payload in %s at offset "
+                       "%lld: read %lld of %llu bytes\n",
+                       path.c_str(), static_cast<long long>(offset_),
+                       static_cast<long long>(s.gcount()),
+                       static_cast<unsigned long long>(length));
+          return false;
         } else {
-          s.seekg(4, std::ios::cur);  // skip payload CRC
+          // Read and verify the payload CRC (masked CRC32C over record_).
+          uint32_t data_crc = 0;
+          s.read(reinterpret_cast<char*>(&data_crc), 4);
+          if (s.gcount() != 4) {
+            std::fprintf(stderr,
+                         "tfrecord: truncated TFRecord (payload CRC) in %s at "
+                         "offset %lld\n",
+                         path.c_str(), static_cast<long long>(offset_));
+            return false;
+          }
+          const uint32_t expected_data_crc =
+              MaskedCrc32c(record_.data(), record_.size());
+          if (data_crc != expected_data_crc) {
+            std::fprintf(stderr,
+                         "tfrecord: payload CRC mismatch in %s at offset "
+                         "%lld\n",
+                         path.c_str(), static_cast<long long>(offset_));
+            return false;
+          }
           offset_ += 8 + 4 + length + 4;
           return true;
         }
+      } else if (len_read != 0) {
+        // A partial length read at a record boundary is truncation.
+        std::fprintf(stderr,
+                     "tfrecord: truncated TFRecord (length field) in %s at "
+                     "offset %lld: read %lld of 8 bytes\n",
+                     path.c_str(), static_cast<long long>(offset_),
+                     static_cast<long long>(len_read));
+        return false;
       }
+      // len_read == 0: clean EOF at a record boundary — fall through to the
+      // shard-advance code below.
     }
     // Current shard exhausted (or read failed at boundary). Try next shard.
     if (impl_->current_index + 1 >= impl_->paths.size()) return false;
@@ -167,6 +208,8 @@ void TFRecordReader::Close() {
 
 namespace {
 constexpr size_t kBufBytes = 1 << 20;  // 1 MiB write coalescing buffer
+static_assert(kBufBytes % 4096 == 0,
+              "F_NOCACHE requires sector-aligned buffer");
 }
 
 struct TFRecordWriter::Impl {
@@ -279,7 +322,10 @@ bool TFRecordWriter::Close() {
   if (!impl_) return true;
   bool ok = impl_->FlushBuf();
   if (impl_->fd >= 0) {
-    ::close(impl_->fd);
+    // Best-effort durability on macOS: flush the device's write cache so the
+    // record is on stable storage before we report success.
+    ::fcntl(impl_->fd, F_FULLFSYNC, 0);
+    if (::close(impl_->fd) != 0) ok = false;
     impl_->fd = -1;
   }
   return ok;
