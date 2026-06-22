@@ -11,8 +11,58 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace deepvariant {
+
+namespace {
+
+// True when `arr`'s memory is densely packed C-contiguous (row-major) for its
+// shape, i.e. the stride of each dimension equals the product of the extents of
+// all dimensions inside it. Only then is a flat memcpy against a C-contiguous
+// host buffer valid. MLMultiArray makes no layout guarantee — `initWithShape:`
+// allocations and especially prediction-result arrays can carry padded strides.
+bool IsPackedRowMajor(MLMultiArray* arr) {
+  NSArray<NSNumber*>* shape = arr.shape;
+  NSArray<NSNumber*>* strides = arr.strides;
+  NSInteger expected = 1;
+  for (NSInteger d = (NSInteger)shape.count - 1; d >= 0; --d) {
+    if (strides[d].integerValue != expected) return false;
+    expected *= shape[d].integerValue;
+  }
+  return true;
+}
+
+// Copy `count` floats between a C-contiguous row-major host buffer and `arr`,
+// honoring `arr.strides` (element units). When `to_array` is true the host
+// buffer is the source (scatter into `arr`); otherwise `arr` is the source
+// (gather into the host buffer). `count` must equal the product of the shape.
+void StridedCopyFloat(MLMultiArray* arr, float* host, size_t count,
+                      bool to_array) {
+  float* data = (float*)arr.dataPointer;
+  const NSUInteger nd = arr.shape.count;
+  std::vector<NSInteger> dims(nd), strides(nd), idx(nd, 0);
+  for (NSUInteger d = 0; d < nd; ++d) {
+    dims[d] = arr.shape[d].integerValue;
+    strides[d] = arr.strides[d].integerValue;
+  }
+  for (size_t flat = 0; flat < count; ++flat) {
+    NSInteger off = 0;
+    for (NSUInteger d = 0; d < nd; ++d) off += idx[d] * strides[d];
+    if (to_array) {
+      data[off] = host[flat];
+    } else {
+      host[flat] = data[off];
+    }
+    // Increment the multi-index, last dimension varying fastest (row-major).
+    for (NSInteger d = (NSInteger)nd - 1; d >= 0; --d) {
+      if (++idx[d] < dims[d]) break;
+      idx[d] = 0;
+    }
+  }
+}
+
+}  // namespace
 
 struct CoreMLModel::Impl {
   MLModel* model = nil;
@@ -119,8 +169,14 @@ bool CoreMLModel::Predict(const float* images, int N, int H, int W, int C,
       NSLog(@"MLMultiArray alloc failed: %@", error.localizedDescription);
       return false;
     }
-    std::memcpy(arr.dataPointer, images,
-                (size_t)N * (size_t)elemPerImage * sizeof(float));
+    const size_t in_count = (size_t)N * (size_t)elemPerImage;
+    if (IsPackedRowMajor(arr)) {
+      std::memcpy(arr.dataPointer, images, in_count * sizeof(float));
+    } else {
+      // Padded strides: scatter element-by-element so we write the right cells.
+      StridedCopyFloat(arr, const_cast<float*>(images), in_count,
+                       /*to_array=*/true);
+    }
 
     MLDictionaryFeatureProvider* fp =
         [[MLDictionaryFeatureProvider alloc]
@@ -145,8 +201,18 @@ bool CoreMLModel::Predict(const float* images, int N, int H, int W, int C,
       return false;
     }
     // Output is FP32 (we requested it at conversion time) and shape (N, K).
-    const float* src = (const float*)out_arr.dataPointer;
-    std::memcpy(probs, src, (size_t)N * (size_t)num_classes * sizeof(float));
+    const size_t out_count = (size_t)N * (size_t)num_classes;
+    if ((size_t)out_arr.count < out_count) {
+      NSLog(@"Output array has %ld elements, expected %zu",
+            (long)out_arr.count, out_count);
+      return false;
+    }
+    if (IsPackedRowMajor(out_arr)) {
+      std::memcpy(probs, out_arr.dataPointer, out_count * sizeof(float));
+    } else {
+      // Core ML may hand back a strided/padded array; gather honoring strides.
+      StridedCopyFloat(out_arr, probs, out_count, /*to_array=*/false);
+    }
     return true;
   }
 }
