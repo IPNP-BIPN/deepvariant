@@ -50,8 +50,9 @@ int main(int argc, char** argv) {
     std::vector<std::string> se = absl::StrSplit(parts[1], '-');
     if (se.size() != 2) { std::fprintf(stderr, "bad region\n"); return 2; }
     int64_t s = 0, e = 0;
-    if (!absl::SimpleAtoi(se[0], &s) || !absl::SimpleAtoi(se[1], &e)) {
-      std::fprintf(stderr, "bad region\n");
+    if (!absl::SimpleAtoi(se[0], &s) || !absl::SimpleAtoi(se[1], &e) ||
+        s < 1 || e < s) {
+      std::fprintf(stderr, "bad region\n");  // 1-based, non-empty range
       return 2;
     }
     region.set_start(s - 1);  // 1-based input → 0-based proto.

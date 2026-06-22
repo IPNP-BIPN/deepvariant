@@ -85,9 +85,12 @@ bool TFRecordWriter::Close() {
   // successfully handed to the OS (good() after flush) and that close()
   // itself did not fail.
   s.flush();
-  if (!s.good()) return false;
+  const bool flush_ok = s.good();
+  // Always close to release the underlying stream/fd, even if flush detected
+  // a write error — otherwise a failed flush leaks the open stream in `impls`.
   s.close();
-  return !s.fail();
+  const bool close_ok = !s.fail();
+  return flush_ok && close_ok;
 }
 
 }  // namespace nucleus

@@ -21,6 +21,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <map>
 #include <memory>
 #include <set>
@@ -1020,12 +1021,14 @@ int RunPostprocessVariants(int argc, char** argv) {
         if (!w->WriteRecord(serialized)) {
           LOG(ERROR) << "Failed to write temp variant TFRecord: "
                      << tmp_var_tfrecord;
+          std::remove(tmp_var_tfrecord.c_str());  // don't leave a partial file
           return 1;
         }
       }
       if (!w->Close()) {
         LOG(ERROR) << "Failed to flush temp variant TFRecord: "
                    << tmp_var_tfrecord;
+        std::remove(tmp_var_tfrecord.c_str());  // don't leave a partial file
         return 1;
       }
     }
