@@ -97,15 +97,16 @@ inline void AppendSelectVariantTypes(std::vector<std::string>& me_args) {
   }
 }
 
-// Helper: forward sex-chromosome haploid-calling flags to postprocess_variants.
-// postprocess_main.cc owns the flags and applies the het-zeroing correction;
-// here we just pass the user's values through to each per-mode postprocess
-// worker. (Not forwarded to make_examples — that binary defines no such flags.)
-inline void AppendHaploidFlags(std::vector<std::string>& pp_args) {
+// Helper: forward sex-chromosome haploid-calling flags to a worker's argv.
+// Called for both the make_examples and postprocess args: postprocess_main.cc
+// defines the flags and applies the het-zeroing correction, and
+// make_examples_main.cc declares them and uses them for haploid-aware gVCF
+// reference confidence. The arg vector is the per-mode worker's command line.
+inline void AppendHaploidFlags(std::vector<std::string>& args) {
   const std::string hc = absl::GetFlag(FLAGS_haploid_contigs);
-  if (!hc.empty()) pp_args.push_back(absl::StrCat("--haploid_contigs=", hc));
+  if (!hc.empty()) args.push_back(absl::StrCat("--haploid_contigs=", hc));
   const std::string par = absl::GetFlag(FLAGS_par_regions_bed);
-  if (!par.empty()) pp_args.push_back(absl::StrCat("--par_regions_bed=", par));
+  if (!par.empty()) args.push_back(absl::StrCat("--par_regions_bed=", par));
 }
 }  // namespace
 ABSL_DECLARE_FLAG(std::string, checkpoint);

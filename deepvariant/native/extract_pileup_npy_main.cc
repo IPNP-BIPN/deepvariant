@@ -95,7 +95,9 @@ std::vector<int64_t> ParseInt64List(const uint8_t* buf, size_t len) {
             if (si + plen > seg_len) break;
             size_t pend = si + plen;
             while (si < pend) {
-              out.push_back(static_cast<int64_t>(ReadVarint(sub, seg_len, si)));
+              // Bound reads by pend (the packed-blob end), not seg_len, so a
+              // truncated trailing varint can't run into the rest of the message.
+              out.push_back(static_cast<int64_t>(ReadVarint(sub, pend, si)));
             }
           } else if (vfield == 1 && vwire == 0) {  // single unpacked value
             out.push_back(static_cast<int64_t>(ReadVarint(sub, seg_len, si)));
@@ -121,7 +123,9 @@ std::vector<int64_t> ParseInt64List(const uint8_t* buf, size_t len) {
 
 struct ParsedExample {
   std::string image_encoded;
-  std::vector<int64_t> image_shape;  // [H, W, C] when present.
+  std::vector<int64_t> image_shape;  // [H, W, C] when present & well-formed.
+  bool image_shape_present = false;  // true if the feature key was seen at all,
+                                     // independent of whether it decoded to 3.
 };
 
 ParsedExample ParseExample(const std::string& payload) {
@@ -167,6 +171,7 @@ ParsedExample ParseExample(const std::string& payload) {
             reinterpret_cast<const uint8_t*>(value_bytes.data()),
             value_bytes.size());
       } else if (key == "image/shape") {
+        out.image_shape_present = true;
         out.image_shape = ParseInt64List(
             reinterpret_cast<const uint8_t*>(value_bytes.data()),
             value_bytes.size());
@@ -243,28 +248,42 @@ int main(int argc, char** argv) {
     }
     const ParsedExample ex = ParseExample(reader->record());
     if (i == 0) {
-      if (ex.image_shape.size() == 3) {
-        H = static_cast<int>(ex.image_shape[0]);
-        W = static_cast<int>(ex.image_shape[1]);
-        C = static_cast<int>(ex.image_shape[2]);
-      } else if (ex.image_shape.empty()) {
-        H = 100; W = 221; C = 7;  // WGS fallback when image/shape is absent.
+      if (!ex.image_shape_present) {
+        H = 100; W = 221; C = 7;  // WGS fallback only when the feature is absent.
         std::fprintf(stderr,
             "warning: record 0 has no image/shape; assuming WGS %dx%dx%d\n",
             H, W, C);
-      } else {
+      } else if (ex.image_shape.size() != 3) {
         // Present but not a 3-D [H,W,C] shape — don't silently guess WGS.
         std::fprintf(stderr,
             "record 0: image/shape has %zu values, expected 3 (H,W,C)\n",
             ex.image_shape.size());
         return 1;
-      }
-      if (H <= 0 || W <= 0 || C <= 0) {
-        std::fprintf(stderr, "record 0: invalid image/shape %dx%dx%d\n",
-                     H, W, C);
-        return 1;
+      } else {
+        // Validate each int64 dim is a sane positive value before narrowing to
+        // int, so a corrupt shape can't wrap to garbage or request an absurd
+        // allocation.
+        constexpr int64_t kMaxDim = 100000;
+        const int64_t h = ex.image_shape[0], w = ex.image_shape[1],
+                      c = ex.image_shape[2];
+        if (h <= 0 || w <= 0 || c <= 0 ||
+            h > kMaxDim || w > kMaxDim || c > kMaxDim) {
+          std::fprintf(stderr,
+              "record 0: image/shape %lldx%lldx%lld out of range (1..%lld)\n",
+              (long long)h, (long long)w, (long long)c, (long long)kMaxDim);
+          return 1;
+        }
+        H = static_cast<int>(h);
+        W = static_cast<int>(w);
+        C = static_cast<int>(c);
       }
       kElemPerImg = static_cast<int64_t>(H) * W * C;
+      // count is already bounded to (0, 100000]; guard the batch allocation.
+      if (kElemPerImg <= 0 || kElemPerImg > INT64_MAX / count) {
+        std::fprintf(stderr, "record 0: batch too large (%lld elems x %d)\n",
+                     (long long)kElemPerImg, count);
+        return 1;
+      }
       all.resize(static_cast<size_t>(count) * kElemPerImg);
     } else if (ex.image_shape.size() == 3 &&
                (ex.image_shape[0] != H || ex.image_shape[1] != W ||

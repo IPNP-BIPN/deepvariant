@@ -143,6 +143,13 @@ inline bool IsHaploidPosition(const std::string& chrom, int64_t start,
 // postprocess_variants.py:correct_nonautosome_probabilities.
 inline void CorrectNonautosomeProbabilities(std::vector<double>* like,
                                             int n_alts) {
+  // Guard the caller's contract: `like` must hold one entry per diploid
+  // genotype for n_alts alts, i.e. (n_alts+1)(n_alts+2)/2. A mismatch would
+  // otherwise be a silent out-of-bounds write below.
+  if (n_alts < 0 ||
+      like->size() != static_cast<size_t>((n_alts + 1) * (n_alts + 2) / 2)) {
+    return;
+  }
   for (int k = 0; k <= n_alts; ++k) {
     for (int j = 0; j <= k; ++j) {
       if (j != k) (*like)[k * (k + 1) / 2 + j] = 0.0;

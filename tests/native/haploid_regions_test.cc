@@ -78,5 +78,15 @@ TEST(HaploidRegions, CorrectNonautosomeAllZeroIsSafe) {
   for (double v : like) EXPECT_DOUBLE_EQ(v, 0.0);
 }
 
+TEST(HaploidRegions, CorrectNonautosomeSizeMismatchIsNoOp) {
+  // A vector whose length doesn't match (n_alts+1)(n_alts+2)/2 is a contract
+  // violation; the function must leave it untouched rather than write OOB.
+  std::vector<double> like = {0.2, 0.5};  // n_alts=1 expects 3 entries.
+  CorrectNonautosomeProbabilities(&like, /*n_alts=*/1);
+  ASSERT_EQ(like.size(), 2u);
+  EXPECT_DOUBLE_EQ(like[0], 0.2);
+  EXPECT_DOUBLE_EQ(like[1], 0.5);
+}
+
 }  // namespace
 }  // namespace deepvariant

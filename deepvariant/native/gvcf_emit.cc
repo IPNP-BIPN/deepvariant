@@ -147,6 +147,13 @@ std::vector<nucleus::genomics::v1::Variant> MakeGvcfRows(
   // 2. Group consecutive entries with same (quantized_gq, gl_is_valid). Emit
   // one merged Variant row per group when gl_is_valid; emit one Variant per
   // site when not (uncalled `./.` rows).
+  //
+  // is_haploid is deliberately NOT part of the grouping key: upstream
+  // variant_caller.make_gvcfs groups only on (quantized_gq, has_valid_gl), so
+  // keying on ploidy here would emit more blocks than upstream and break gVCF
+  // parity. In practice a haploid site drops its het mass and renormalizes to a
+  // higher ref probability (higher GQ), so it usually lands in a different
+  // quantized-GQ bin than an adjacent diploid site and won't merge anyway.
   size_t i = 0;
   while (i < entries.size()) {
     const SiteEntry& first = entries[i];

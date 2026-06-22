@@ -93,7 +93,9 @@ std::vector<int64_t> ParseInt64List(const uint8_t* buf, size_t len) {
             if (si + plen > seg_len) break;
             size_t pend = si + plen;
             while (si < pend) {
-              out.push_back(static_cast<int64_t>(ReadVarint(sub, seg_len, si)));
+              // Bound reads by pend (the packed-blob end), not seg_len, so a
+              // truncated trailing varint can't run into the rest of the message.
+              out.push_back(static_cast<int64_t>(ReadVarint(sub, pend, si)));
             }
           } else if (vfield == 1 && vwire == 0) {  // single unpacked value
             out.push_back(static_cast<int64_t>(ReadVarint(sub, seg_len, si)));
@@ -121,7 +123,9 @@ std::vector<int64_t> ParseInt64List(const uint8_t* buf, size_t len) {
 struct ExampleParts {
   std::string image_encoded;
   std::string variant_encoded;
-  std::vector<int64_t> image_shape;  // [H, W, C] when present.
+  std::vector<int64_t> image_shape;  // [H, W, C] when present & well-formed.
+  bool image_shape_present = false;  // true if the feature key was seen at all,
+                                     // independent of whether it decoded to 3.
 };
 
 ExampleParts ParseExample(const std::string& payload) {
@@ -168,6 +172,7 @@ ExampleParts ParseExample(const std::string& payload) {
             reinterpret_cast<const uint8_t*>(value_bytes.data()),
             value_bytes.size());
       } else if (key == "image/shape") {
+        out.image_shape_present = true;
         out.image_shape = ParseInt64List(
             reinterpret_cast<const uint8_t*>(value_bytes.data()),
             value_bytes.size());
@@ -287,22 +292,29 @@ int main(int argc, char** argv) {
     if (p.image_encoded.empty()) continue;
     // Geometry comes from the matched example's image/shape so non-WGS models
     // (WES/PacBio/ONT) work; fall back to WGS only when the feature is absent.
-    // A present-but-non-3-D shape is an error, not a silent WGS guess.
+    // A present-but-non-3-D or out-of-range shape is an error, not a WGS guess.
     int H = 100, W = 221, C = 7;
-    if (p.image_shape.size() == 3) {
-      H = static_cast<int>(p.image_shape[0]);
-      W = static_cast<int>(p.image_shape[1]);
-      C = static_cast<int>(p.image_shape[2]);
-    } else if (!p.image_shape.empty()) {
-      std::fprintf(stderr,
-          "record %ld: image/shape has %zu values, expected 3 (H,W,C)\n",
-          scanned, p.image_shape.size());
-      return 1;
-    }
-    if (H <= 0 || W <= 0 || C <= 0) {
-      std::fprintf(stderr, "record %ld: invalid image/shape %dx%dx%d\n",
-                   scanned, H, W, C);
-      return 1;
+    if (p.image_shape_present) {
+      if (p.image_shape.size() != 3) {
+        std::fprintf(stderr,
+            "record %ld: image/shape has %zu values, expected 3 (H,W,C)\n",
+            scanned, p.image_shape.size());
+        return 1;
+      }
+      constexpr int64_t kMaxDim = 100000;
+      const int64_t h = p.image_shape[0], w = p.image_shape[1],
+                    c = p.image_shape[2];
+      if (h <= 0 || w <= 0 || c <= 0 ||
+          h > kMaxDim || w > kMaxDim || c > kMaxDim) {
+        std::fprintf(stderr,
+            "record %ld: image/shape %lldx%lldx%lld out of range (1..%lld)\n",
+            scanned, (long long)h, (long long)w, (long long)c,
+            (long long)kMaxDim);
+        return 1;
+      }
+      H = static_cast<int>(h);
+      W = static_cast<int>(w);
+      C = static_cast<int>(c);
     }
     const int64_t kElem = static_cast<int64_t>(H) * W * C;
     std::vector<float> img(kElem);
