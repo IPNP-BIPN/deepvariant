@@ -1,6 +1,8 @@
 // Profiling tool: extract the first N pileup images from a TFRecord (or
 // `name@N` shard spec) and write them as a NumPy `.npy` array of shape
-// (N, 100, 221, 7) FP32 NHWC.  Pixel encoding mirrors call_variants:
+// (N, H, W, C) FP32 NHWC, where H/W/C are read from the example's
+// image/shape feature (WGS 100x221x7 when absent).  Pixel encoding mirrors
+// call_variants:
 //   uint8 src → (src - 128) / 128.0 → FP32
 // or a passthrough when the input is already FP32.
 //
@@ -68,7 +70,62 @@ std::string ExtractBytesListFirst(const uint8_t* buf, size_t len) {
   return {};
 }
 
-std::string ParseImageEncoded(const std::string& payload) {
+// Decode a tf.train.Feature message holding an Int64List into its values.
+// Handles both packed (proto3 default) and unpacked repeated-int64 encodings.
+// Returns empty if the Feature is not an Int64List.
+std::vector<int64_t> ParseInt64List(const uint8_t* buf, size_t len) {
+  std::vector<int64_t> out;
+  size_t i = 0;
+  while (i < len) {
+    uint64_t tag = ReadVarint(buf, len, i);
+    uint32_t field = static_cast<uint32_t>(tag >> 3);
+    uint32_t wire  = static_cast<uint32_t>(tag & 7);
+    if (wire == 2) {
+      uint64_t seg_len = ReadVarint(buf, len, i);
+      if (i + seg_len > len) break;
+      if (field == 3) {  // Feature.int64_list
+        const uint8_t* sub = buf + i;
+        size_t si = 0;
+        while (si < seg_len) {
+          uint64_t vtag = ReadVarint(sub, seg_len, si);
+          uint32_t vfield = static_cast<uint32_t>(vtag >> 3);
+          uint32_t vwire  = static_cast<uint32_t>(vtag & 7);
+          if (vfield == 1 && vwire == 2) {        // packed values
+            uint64_t plen = ReadVarint(sub, seg_len, si);
+            if (si + plen > seg_len) break;
+            size_t pend = si + plen;
+            while (si < pend) {
+              out.push_back(static_cast<int64_t>(ReadVarint(sub, seg_len, si)));
+            }
+          } else if (vfield == 1 && vwire == 0) {  // single unpacked value
+            out.push_back(static_cast<int64_t>(ReadVarint(sub, seg_len, si)));
+          } else {
+            break;
+          }
+        }
+        return out;
+      }
+      i += seg_len;
+    } else if (wire == 0) {
+      ReadVarint(buf, len, i);
+    } else if (wire == 5) {
+      i += 4;
+    } else if (wire == 1) {
+      i += 8;
+    } else {
+      break;
+    }
+  }
+  return out;
+}
+
+struct ParsedExample {
+  std::string image_encoded;
+  std::vector<int64_t> image_shape;  // [H, W, C] when present.
+};
+
+ParsedExample ParseExample(const std::string& payload) {
+  ParsedExample out;
   const uint8_t* buf = reinterpret_cast<const uint8_t*>(payload.data());
   size_t n = payload.size();
   size_t i = 0;
@@ -106,16 +163,20 @@ std::string ParseImageEncoded(const std::string& payload) {
         ei += elen;
       }
       if (key == "image/encoded" || key == "image") {
-        return ExtractBytesListFirst(
+        out.image_encoded = ExtractBytesListFirst(
+            reinterpret_cast<const uint8_t*>(value_bytes.data()),
+            value_bytes.size());
+      } else if (key == "image/shape") {
+        out.image_shape = ParseInt64List(
             reinterpret_cast<const uint8_t*>(value_bytes.data()),
             value_bytes.size());
       }
     }
   }
-  return {};
+  return out;
 }
 
-// Write a (N, 100, 221, 7) FP32 NHWC array to NumPy v1 .npy.
+// Write a (N, H, W, C) FP32 NHWC array to NumPy v1 .npy.
 bool WriteNpyFp32NHWC(const std::string& path, int N, int H, int W, int C,
                       const float* data) {
   std::ofstream f(path, std::ios::binary);
@@ -161,24 +222,56 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  // Standard WGS DeepVariant pileup geometry.
-  constexpr int H = 100, W = 221, C = 7;
-  constexpr int64_t kElemPerImg = static_cast<int64_t>(H) * W * C;
-
   auto reader = deepvariant::TFRecordReader::New(tfr_path);
   if (!reader) {
     std::fprintf(stderr, "cannot open %s\n", tfr_path.c_str());
     return 1;
   }
 
-  std::vector<float> all(static_cast<size_t>(count) * kElemPerImg);
+  // Geometry is taken from the first record's image/shape feature so the tool
+  // adapts to any model type (WES/PacBio/ONT differ from WGS). The whole batch
+  // is packed into one (N, H, W, C) array, so later records must share the
+  // geometry — a mismatch is an error rather than a silent overwrite.
+  int H = 0, W = 0, C = 0;
+  int64_t kElemPerImg = 0;
+  std::vector<float> all;
   int n_loaded = 0;
   for (int i = 0; i < count; ++i) {
     if (!reader->GetNext()) {
       std::fprintf(stderr, "EOF after %d records\n", i);
       break;
     }
-    const std::string img = ParseImageEncoded(reader->record());
+    const ParsedExample ex = ParseExample(reader->record());
+    if (i == 0) {
+      if (ex.image_shape.size() == 3) {
+        H = static_cast<int>(ex.image_shape[0]);
+        W = static_cast<int>(ex.image_shape[1]);
+        C = static_cast<int>(ex.image_shape[2]);
+      } else {
+        H = 100; W = 221; C = 7;  // WGS fallback when image/shape is absent.
+        std::fprintf(stderr,
+            "warning: record 0 has no image/shape; assuming WGS %dx%dx%d\n",
+            H, W, C);
+      }
+      if (H <= 0 || W <= 0 || C <= 0) {
+        std::fprintf(stderr, "record 0: invalid image/shape %dx%dx%d\n",
+                     H, W, C);
+        return 1;
+      }
+      kElemPerImg = static_cast<int64_t>(H) * W * C;
+      all.resize(static_cast<size_t>(count) * kElemPerImg);
+    } else if (ex.image_shape.size() == 3 &&
+               (ex.image_shape[0] != H || ex.image_shape[1] != W ||
+                ex.image_shape[2] != C)) {
+      std::fprintf(stderr,
+          "record %d: image/shape %lldx%lldx%lld differs from batch %dx%dx%d; "
+          "cannot pack heterogeneous geometry into one array\n",
+          i, static_cast<long long>(ex.image_shape[0]),
+          static_cast<long long>(ex.image_shape[1]),
+          static_cast<long long>(ex.image_shape[2]), H, W, C);
+      return 1;
+    }
+    const std::string& img = ex.image_encoded;
     float* dst = all.data() + static_cast<size_t>(i) * kElemPerImg;
     if (static_cast<int64_t>(img.size()) == kElemPerImg) {
       // uint8 → (x - 128) / 128 — same path as call_variants.

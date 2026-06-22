@@ -1,7 +1,8 @@
 // Phase 5.5c PASS-flip diagnostic: extract the pileup image at a
 // specific (chrom, pos, ref, alt) from an examples TFRecord and write
-// it as a single (1, 100, 221, 7) NHWC FP32 .npy. Pixel encoding
-// matches call_variants ((src - 128) / 128).
+// it as a single (1, H, W, C) NHWC FP32 .npy, where H/W/C are read from
+// the example's image/shape feature (WGS 100x221x7 when absent). Pixel
+// encoding matches call_variants ((src - 128) / 128).
 //
 // Used to byte-compare our pileup image against Docker's at the same
 // site, isolating "inference drift" from "different pileup-image
@@ -67,10 +68,60 @@ std::string ExtractBytesListFirst(const uint8_t* buf, size_t len) {
   return {};
 }
 
-// Parse top-level tf.train.Example, return (image_encoded, variant_encoded).
+// Decode a tf.train.Feature message holding an Int64List into its values.
+// Handles both packed (proto3 default) and unpacked repeated-int64 encodings.
+// Returns empty if the Feature is not an Int64List.
+std::vector<int64_t> ParseInt64List(const uint8_t* buf, size_t len) {
+  std::vector<int64_t> out;
+  size_t i = 0;
+  while (i < len) {
+    uint64_t tag = ReadVarint(buf, len, i);
+    uint32_t field = static_cast<uint32_t>(tag >> 3);
+    uint32_t wire  = static_cast<uint32_t>(tag & 7);
+    if (wire == 2) {
+      uint64_t seg_len = ReadVarint(buf, len, i);
+      if (i + seg_len > len) break;
+      if (field == 3) {  // Feature.int64_list
+        const uint8_t* sub = buf + i;
+        size_t si = 0;
+        while (si < seg_len) {
+          uint64_t vtag = ReadVarint(sub, seg_len, si);
+          uint32_t vfield = static_cast<uint32_t>(vtag >> 3);
+          uint32_t vwire  = static_cast<uint32_t>(vtag & 7);
+          if (vfield == 1 && vwire == 2) {        // packed values
+            uint64_t plen = ReadVarint(sub, seg_len, si);
+            if (si + plen > seg_len) break;
+            size_t pend = si + plen;
+            while (si < pend) {
+              out.push_back(static_cast<int64_t>(ReadVarint(sub, seg_len, si)));
+            }
+          } else if (vfield == 1 && vwire == 0) {  // single unpacked value
+            out.push_back(static_cast<int64_t>(ReadVarint(sub, seg_len, si)));
+          } else {
+            break;
+          }
+        }
+        return out;
+      }
+      i += seg_len;
+    } else if (wire == 0) {
+      ReadVarint(buf, len, i);
+    } else if (wire == 5) {
+      i += 4;
+    } else if (wire == 1) {
+      i += 8;
+    } else {
+      break;
+    }
+  }
+  return out;
+}
+
+// Parse top-level tf.train.Example, return image bytes, variant bytes, shape.
 struct ExampleParts {
   std::string image_encoded;
   std::string variant_encoded;
+  std::vector<int64_t> image_shape;  // [H, W, C] when present.
 };
 
 ExampleParts ParseExample(const std::string& payload) {
@@ -114,6 +165,10 @@ ExampleParts ParseExample(const std::string& payload) {
             value_bytes.size());
       } else if (key == "variant/encoded") {
         out.variant_encoded = ExtractBytesListFirst(
+            reinterpret_cast<const uint8_t*>(value_bytes.data()),
+            value_bytes.size());
+      } else if (key == "image/shape") {
+        out.image_shape = ParseInt64List(
             reinterpret_cast<const uint8_t*>(value_bytes.data()),
             value_bytes.size());
       }
@@ -217,16 +272,12 @@ int main(int argc, char** argv) {
   const std::string ref = argv[5];
   const std::string alt = argv[6];
 
-  constexpr int H = 100, W = 221, C = 7;
-  constexpr int64_t kElem = (int64_t)H * W * C;
-
   auto reader = deepvariant::TFRecordReader::New(tfr_path);
   if (!reader) {
     std::fprintf(stderr, "cannot open %s\n", tfr_path.c_str());
     return 1;
   }
 
-  std::vector<float> img(kElem);
   int found = 0;
   long scanned = 0;
   while (reader->GetNext()) {
@@ -234,6 +285,21 @@ int main(int argc, char** argv) {
     auto p = ParseExample(reader->record());
     if (!VariantMatches(p.variant_encoded, chrom, start_0b, ref, alt)) continue;
     if (p.image_encoded.empty()) continue;
+    // Geometry comes from the matched example's image/shape so non-WGS models
+    // (WES/PacBio/ONT) work; fall back to WGS when the feature is absent.
+    int H = 100, W = 221, C = 7;
+    if (p.image_shape.size() == 3) {
+      H = static_cast<int>(p.image_shape[0]);
+      W = static_cast<int>(p.image_shape[1]);
+      C = static_cast<int>(p.image_shape[2]);
+    }
+    if (H <= 0 || W <= 0 || C <= 0) {
+      std::fprintf(stderr, "record %ld: invalid image/shape %dx%dx%d\n",
+                   scanned, H, W, C);
+      return 1;
+    }
+    const int64_t kElem = static_cast<int64_t>(H) * W * C;
+    std::vector<float> img(kElem);
     if ((int64_t)p.image_encoded.size() == kElem) {
       const uint8_t* src = reinterpret_cast<const uint8_t*>(p.image_encoded.data());
       constexpr float inv = 1.0f / 128.0f;
@@ -244,8 +310,9 @@ int main(int argc, char** argv) {
       std::memcpy(img.data(), p.image_encoded.data(),
                    (size_t)kElem * sizeof(float));
     } else {
-      std::fprintf(stderr, "record %ld: bad image size %zu\n", scanned,
-                   p.image_encoded.size());
+      std::fprintf(stderr, "record %ld: bad image size %zu (expected %lld or "
+                   "%lld for %dx%dx%d)\n", scanned, p.image_encoded.size(),
+                   (long long)kElem, (long long)kElem * 4, H, W, C);
       continue;
     }
     if (!WriteNpyFp32(out_path, img.data(), 1, H, W, C)) {
