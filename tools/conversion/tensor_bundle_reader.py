@@ -223,7 +223,7 @@ _NUMPY_DTYPE = {
     3: (np.int32, 4),       # DT_INT32
     9: (np.int64, 8),       # DT_INT64
     10: (np.bool_, 1),      # DT_BOOL
-    14: (np.float32, 2),    # DT_BFLOAT16 (decoded as fp32; bfloat16 isn't in numpy)
+    14: (np.float32, 2),    # DT_BFLOAT16 (2 bytes on disk; widened to fp32 on read since bfloat16 isn't in numpy)
     17: (np.float16, 2),    # DT_HALF
 }
 
@@ -327,7 +327,7 @@ class TensorBundle:
             raise NotImplementedError(
                 f"dtype {e.dtype} not supported (variable {name})"
             )
-        np_dtype, _ = _NUMPY_DTYPE[e.dtype]
+        np_dtype, dtype_size = _NUMPY_DTYPE[e.dtype]
         path = self.shard_path(e.shard_id)
         with open(path, "rb") as f:
             f.seek(e.offset)
@@ -337,7 +337,21 @@ class TensorBundle:
                 f"truncated read of {name} from {path}: "
                 f"want {e.size} bytes, got {len(raw)}"
             )
-        arr = np.frombuffer(raw, dtype=np_dtype)
+        # Guard: the raw byte count must be a whole number of elements that
+        # matches the declared shape. Otherwise np.frombuffer would silently
+        # mis-decode (e.g. reinterpreting 2-byte values as 4-byte ones).
+        expected_bytes = int(np.prod(e.shape)) * dtype_size
+        if len(raw) != expected_bytes:
+            raise ValueError(
+                f"size mismatch for variable {name}: shape {e.shape} with "
+                f"{dtype_size}-byte elements implies {expected_bytes} bytes, "
+                f"but got {len(raw)} bytes"
+            )
+        if e.dtype == 14:  # DT_BFLOAT16: 2 raw bytes are the high 16 bits of fp32.
+            u16 = np.frombuffer(raw, dtype=np.uint16)
+            arr = (u16.astype(np.uint32) << 16).view(np.float32)
+        else:
+            arr = np.frombuffer(raw, dtype=np_dtype)
         if e.shape:
             arr = arr.reshape(e.shape)
         return arr
