@@ -247,11 +247,17 @@ int main(int argc, char** argv) {
         H = static_cast<int>(ex.image_shape[0]);
         W = static_cast<int>(ex.image_shape[1]);
         C = static_cast<int>(ex.image_shape[2]);
-      } else {
+      } else if (ex.image_shape.empty()) {
         H = 100; W = 221; C = 7;  // WGS fallback when image/shape is absent.
         std::fprintf(stderr,
             "warning: record 0 has no image/shape; assuming WGS %dx%dx%d\n",
             H, W, C);
+      } else {
+        // Present but not a 3-D [H,W,C] shape — don't silently guess WGS.
+        std::fprintf(stderr,
+            "record 0: image/shape has %zu values, expected 3 (H,W,C)\n",
+            ex.image_shape.size());
+        return 1;
       }
       if (H <= 0 || W <= 0 || C <= 0) {
         std::fprintf(stderr, "record 0: invalid image/shape %dx%dx%d\n",
@@ -292,6 +298,13 @@ int main(int argc, char** argv) {
       return 1;
     }
     ++n_loaded;
+  }
+
+  if (n_loaded == 0) {
+    // Empty input / immediate EOF: don't emit a bogus (0,0,0,0) .npy.
+    std::fprintf(stderr, "no records read from %s; nothing written\n",
+                 tfr_path.c_str());
+    return 1;
   }
 
   if (!WriteNpyFp32NHWC(out_path, n_loaded, H, W, C, all.data())) {

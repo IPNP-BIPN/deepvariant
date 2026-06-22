@@ -286,12 +286,18 @@ int main(int argc, char** argv) {
     if (!VariantMatches(p.variant_encoded, chrom, start_0b, ref, alt)) continue;
     if (p.image_encoded.empty()) continue;
     // Geometry comes from the matched example's image/shape so non-WGS models
-    // (WES/PacBio/ONT) work; fall back to WGS when the feature is absent.
+    // (WES/PacBio/ONT) work; fall back to WGS only when the feature is absent.
+    // A present-but-non-3-D shape is an error, not a silent WGS guess.
     int H = 100, W = 221, C = 7;
     if (p.image_shape.size() == 3) {
       H = static_cast<int>(p.image_shape[0]);
       W = static_cast<int>(p.image_shape[1]);
       C = static_cast<int>(p.image_shape[2]);
+    } else if (!p.image_shape.empty()) {
+      std::fprintf(stderr,
+          "record %ld: image/shape has %zu values, expected 3 (H,W,C)\n",
+          scanned, p.image_shape.size());
+      return 1;
     }
     if (H <= 0 || W <= 0 || C <= 0) {
       std::fprintf(stderr, "record %ld: invalid image/shape %dx%dx%d\n",

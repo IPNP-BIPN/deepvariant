@@ -135,13 +135,12 @@ constexpr int kMaxPhred = 99;
 bool IsHaploidVariant(const Variant& variant,
                       const std::set<std::string>& haploid_contigs,
                       const ParRegions& par_regions) {
+  // Upstream is_in_regions -> RangeSet.variant_overlaps tests only the single
+  // 0-based point variant.start (not the variant span), so a multi-base
+  // variant whose start is outside every PAR interval is still corrected even
+  // if its tail reaches into one. Match that exactly: probe [start, start+1).
   const int64_t start = variant.start();
-  const int64_t end =
-      variant.end() > start
-          ? variant.end()
-          : start + std::max<int64_t>(
-                        1, static_cast<int64_t>(variant.reference_bases().size()));
-  return IsHaploidPosition(variant.reference_name(), start, end,
+  return IsHaploidPosition(variant.reference_name(), start, start + 1,
                            haploid_contigs, par_regions);
 }
 

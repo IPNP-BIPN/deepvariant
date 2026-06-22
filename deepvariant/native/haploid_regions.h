@@ -86,10 +86,24 @@ inline std::set<std::string> ParseHaploidContigs(const std::string& flag) {
 // than silently disabling the exemption.
 inline bool LoadParRegions(const std::string& path, ParRegions* out,
                            std::string* err) {
-  std::ifstream f(path);
+  std::ifstream f(path, std::ios::binary);
   if (!f) {
     *err = absl::StrCat("cannot open --par_regions_bed: ", path);
     return false;
+  }
+  // This is a plaintext parser; upstream's htslib BedReader also accepts
+  // bgzipped BED. Detect the gzip magic (0x1f 0x8b) and fail with a clear
+  // message rather than mis-parsing binary as malformed lines.
+  const int b0 = f.peek();
+  if (b0 == 0x1f) {
+    f.get();
+    const int b1 = f.peek();
+    f.unget();
+    if (b1 == 0x8b) {
+      *err = absl::StrCat("--par_regions_bed appears gzipped (", path,
+                          "); provide a plaintext BED");
+      return false;
+    }
   }
   std::string line;
   int lineno = 0;

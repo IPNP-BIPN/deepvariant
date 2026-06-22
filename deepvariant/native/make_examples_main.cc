@@ -1924,6 +1924,14 @@ int RunMakeExamples(int argc, char** argv) {
 
         std::vector<DeepVariantCall> candidates =
             caller.CallsFromAlleleCounts(ac_map, C.name, C.role);
+        // Multi-sample path filters before small_model so pruned types are not
+        // emitted via the small_model CVO. The trio small_model uses no
+        // per-read HP features, so this does not affect genotypes; the only
+        // residual gap vs upstream is that is_phased/PS (computed later on the
+        // surviving big_candidates) sees the filtered set when
+        // --select_variant_types is combined with trio --use_direct_phasing —
+        // a rare combination, and the trio path already phases big_candidates
+        // (a subset) rather than the full candidate set.
         FilterCandidatesBySelectedTypes(&candidates, selected_types);
         if (candidates.empty()) continue;
         C.total_candidates += candidates.size();
@@ -2414,10 +2422,7 @@ int RunMakeExamples(int argc, char** argv) {
 
     std::vector<DeepVariantCall> candidates =
         caller.CallsFromAlleleCounter(counter);
-    FilterCandidatesBySelectedTypes(&candidates, selected_types);
     if (candidates.empty()) continue;
-
-    total_candidates += candidates.size();
 
     // Phase 5.5d/14 — DirectPhasing runs BEFORE small_model dispatch so the
     // 106-feature haplotype-expanded small_model (PacBio/ONT) sees the same
@@ -2534,6 +2539,16 @@ int RunMakeExamples(int argc, char** argv) {
         }
       }
     }
+
+    // select_variant_types pruning runs AFTER DirectPhasing so the phasing
+    // graph — and the per-read HP tags it produces, which feed the haplotype
+    // small_model's 106-feature vector — is built from the full candidate set.
+    // This matches upstream's order: filter_candidates runs in process() only
+    // after candidates_in_region has already phased. Pruning earlier would drop
+    // the SNP backbone DirectPhasing relies on and silently change phasing.
+    FilterCandidatesBySelectedTypes(&candidates, selected_types);
+    if (candidates.empty()) continue;
+    total_candidates += candidates.size();
 
     // Small-model first-pass dispatch. Mirror of upstream
     // `SmallModelVariantCaller.call_variants` + `make_small_model_examples.

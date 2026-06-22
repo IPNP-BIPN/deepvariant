@@ -202,7 +202,11 @@ bool CoreMLModel::Predict(const float* images, int N, int H, int W, int C,
     }
     // Output is FP32 (we requested it at conversion time) and shape (N, K).
     const size_t out_count = (size_t)N * (size_t)num_classes;
-    if ((size_t)out_arr.count < out_count) {
+    // Require an exact logical-element match: a larger array means a different
+    // shape than (N, num_classes), and copying/gathering out_count elements
+    // against its real dims would silently scramble the per-genotype
+    // probabilities (the strided gather walks out_arr's own dims).
+    if ((size_t)out_arr.count != out_count) {
       NSLog(@"Output array has %ld elements, expected %zu",
             (long)out_arr.count, out_count);
       return false;
