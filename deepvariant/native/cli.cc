@@ -56,6 +56,7 @@ ABSL_FLAG(std::string, small_model_path, "",
 ABSL_DECLARE_FLAG(std::string, reads);
 ABSL_DECLARE_FLAG(std::string, ref);
 ABSL_DECLARE_FLAG(std::string, regions);
+ABSL_DECLARE_FLAG(std::string, select_variant_types);
 ABSL_DECLARE_FLAG(int, num_shards);
 ABSL_DECLARE_FLAG(int, batch_size);
 ABSL_DECLARE_FLAG(std::string, inference_backend);
@@ -82,6 +83,16 @@ inline void AppendAneSpeculateArgs(std::vector<std::string>& cv_args,
   cv_args.push_back(absl::StrCat(
       "--ane_speculate_confidence=",
       absl::GetFlag(FLAGS_ane_speculate_confidence)));
+}
+
+// Helper: forward the user's --select_variant_types (if any) to make_examples.
+// make_examples_main.cc owns the flag and does the actual candidate filtering;
+// here we just pass the value through to each per-mode make_examples worker.
+inline void AppendSelectVariantTypes(std::vector<std::string>& me_args) {
+  const std::string svt = absl::GetFlag(FLAGS_select_variant_types);
+  if (!svt.empty()) {
+    me_args.push_back(absl::StrCat("--select_variant_types=", svt));
+  }
 }
 }  // namespace
 ABSL_DECLARE_FLAG(std::string, checkpoint);
@@ -1138,6 +1149,7 @@ int RunAll(int argc, char** argv) {
     if (absl::GetFlag(FLAGS_use_direct_phasing)) {
       me_args.push_back("--use_direct_phasing=true");
     }
+    AppendSelectVariantTypes(me_args);
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
@@ -1455,6 +1467,7 @@ int RunAllTrio(int argc, char** argv) {
     if (absl::GetFlag(FLAGS_use_direct_phasing)) {
       me_args.push_back("--use_direct_phasing=true");
     }
+    AppendSelectVariantTypes(me_args);
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
@@ -1696,6 +1709,7 @@ int RunAllSomatic(int argc, char** argv) {
         me_args.push_back(absl::StrCat("--population_vcfs=", pon));
       }
     }
+    AppendSelectVariantTypes(me_args);
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
@@ -1903,6 +1917,7 @@ int RunAllPangenome(int argc, char** argv) {
     // 25kb-partition reservoir sampling reduced to ~1, killing the candidate).
     // partition_size=1000 mirrors Docker's per-1kb reservoir granularity.
     me_args.push_back("--partition_size=1000");
+    AppendSelectVariantTypes(me_args);
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {

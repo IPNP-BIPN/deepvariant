@@ -151,6 +151,16 @@ ABSL_FLAG(int, partition_size, 1000,
 // stricter thresholds (20 / 14).
 ABSL_FLAG(int, min_mapping_quality, 5, "Min read mapping quality.");
 ABSL_FLAG(int, min_base_quality, 10, "Min base quality.");
+// Mirrors make_examples_options.py's --select_variant_types: a
+// whitespace-separated subset of {snps, indels, insertions, deletions,
+// multi-allelics, all}. When set, only candidates whose variant matches one
+// of the selectors (OR'd) are kept; empty means keep everything.
+ABSL_FLAG(std::string, select_variant_types, "",
+          "Whitespace-separated variant types to keep when generating "
+          "examples: snps, indels, insertions, deletions, multi-allelics, "
+          "all. snps/indels/insertions/deletions select bi-allelic variants "
+          "of that type; multi-allelics selects any multi-allelic variant. "
+          "Empty (default) keeps all candidates.");
 // Small model first-pass.
 ABSL_FLAG(std::string, small_model, "",
           "Path to the small_model .mlpackage. Empty = no small model "
@@ -1120,6 +1130,148 @@ bool IsSnpForIndices(const nucleus::genomics::v1::Variant& v,
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// select_variant_types candidate filtering
+//
+// Faithful port of make_examples_core.filter_candidates +
+// nucleus/util/variant_utils. The variant-type predicates exclude the gVCF
+// '<*>' allele, the '<NON_REF>' symbolic allele, and the '.' missing field
+// from the alt set (variant_utils._non_excluded_alts) before classifying.
+// ---------------------------------------------------------------------------
+
+// True for alts ignored by the type predicates (variant_utils default set).
+bool IsExcludedAlt(const std::string& alt) {
+  return alt == "<*>" || alt == "<NON_REF>" || alt == ".";
+}
+
+// Alt alleles that count toward variant-type classification (non-excluded).
+std::vector<const std::string*> RelevantAlts(
+    const nucleus::genomics::v1::Variant& v) {
+  std::vector<const std::string*> alts;
+  for (const auto& a : v.alternate_bases()) {
+    if (!IsExcludedAlt(a)) alts.push_back(&a);
+  }
+  return alts;
+}
+
+// is_snp: REF is 1 bp and every non-excluded alt is 1 bp (>=1 such alt).
+bool VarIsSnp(const nucleus::genomics::v1::Variant& v) {
+  const auto alts = RelevantAlts(v);
+  if (v.reference_bases().size() != 1 || alts.empty()) return false;
+  for (const auto* a : alts) {
+    if (a->size() != 1) return false;
+  }
+  return true;
+}
+
+// is_indel: at least one non-excluded alt, and REF>1 or some alt>1 bp.
+bool VarIsIndel(const nucleus::genomics::v1::Variant& v) {
+  const auto alts = RelevantAlts(v);
+  if (alts.empty()) return false;
+  if (v.reference_bases().size() > 1) return true;
+  for (const auto* a : alts) {
+    if (a->size() > 1) return true;
+  }
+  return false;
+}
+
+bool VarIsBiallelic(const nucleus::genomics::v1::Variant& v) {
+  return RelevantAlts(v).size() == 1;
+}
+
+bool VarIsMultiallelic(const nucleus::genomics::v1::Variant& v) {
+  return RelevantAlts(v).size() > 1;
+}
+
+// has_insertion/has_deletion gate on is_indel but, like variant_utils, test
+// the length condition over ALL alternate_bases (not just the non-excluded).
+bool VarHasInsertion(const nucleus::genomics::v1::Variant& v) {
+  if (!VarIsIndel(v)) return false;
+  const size_t ref_len = v.reference_bases().size();
+  for (const auto& a : v.alternate_bases()) {
+    if (ref_len < a.size()) return true;
+  }
+  return false;
+}
+
+bool VarHasDeletion(const nucleus::genomics::v1::Variant& v) {
+  if (!VarIsIndel(v)) return false;
+  const size_t ref_len = v.reference_bases().size();
+  for (const auto& a : v.alternate_bases()) {
+    if (ref_len > a.size()) return true;
+  }
+  return false;
+}
+
+// Parsed --select_variant_types flag. `active` is false when no selector was
+// requested, in which case filtering is a no-op (keep all candidates).
+struct SelectedVariantTypes {
+  bool active = false;
+  bool snps = false;
+  bool indels = false;
+  bool insertions = false;
+  bool deletions = false;
+  bool multiallelics = false;
+  bool all = false;
+};
+
+// Parse the whitespace-separated flag. Mirrors make_examples_options.py: an
+// unknown selector is a fatal command-line error (returns false + *err set).
+bool ParseSelectVariantTypes(const std::string& flag,
+                             SelectedVariantTypes* out, std::string* err) {
+  for (absl::string_view tok :
+       absl::StrSplit(flag, absl::ByAnyChar(" \t\r\n"), absl::SkipEmpty())) {
+    if (tok == "snps") {
+      out->snps = true;
+    } else if (tok == "indels") {
+      out->indels = true;
+    } else if (tok == "insertions") {
+      out->insertions = true;
+    } else if (tok == "deletions") {
+      out->deletions = true;
+    } else if (tok == "multi-allelics") {
+      out->multiallelics = true;
+    } else if (tok == "all") {
+      out->all = true;
+    } else {
+      *err = absl::StrCat(
+          "Select variant type '", tok,
+          "' not recognized. Allowed values are snps, indels, insertions, "
+          "deletions, multi-allelics, all");
+      return false;
+    }
+    out->active = true;
+  }
+  return true;
+}
+
+// Does the candidate's variant match any requested selector (OR'd)?
+// snps/indels/insertions/deletions are bi-allelic-gated, matching the
+// VARIANT_TYPE_SELECTORS table in make_examples_core.
+bool CandidateSelected(const nucleus::genomics::v1::Variant& v,
+                       const SelectedVariantTypes& sel) {
+  if (sel.all) return true;
+  if (sel.snps && VarIsSnp(v) && VarIsBiallelic(v)) return true;
+  if (sel.indels && VarIsIndel(v) && VarIsBiallelic(v)) return true;
+  if (sel.insertions && VarHasInsertion(v) && VarIsBiallelic(v)) return true;
+  if (sel.deletions && VarHasDeletion(v) && VarIsBiallelic(v)) return true;
+  if (sel.multiallelics && VarIsMultiallelic(v)) return true;
+  return false;
+}
+
+// Drop candidates whose variant matches no requested selector, preserving
+// order. No-op when no selector is active.
+void FilterCandidatesBySelectedTypes(std::vector<DeepVariantCall>* candidates,
+                                     const SelectedVariantTypes& sel) {
+  if (!sel.active) return;
+  candidates->erase(
+      std::remove_if(candidates->begin(), candidates->end(),
+                     [&](const DeepVariantCall& c) {
+                       return !CandidateSelected(c.variant(), sel);
+                     }),
+      candidates->end());
+}
+
 // Phred = -10 * log10(p), truncated toward zero. Capped at 99.
 //
 // Truncation (not std::round) matches upstream's small_model
@@ -1240,6 +1392,18 @@ int RunMakeExamples(int argc, char** argv) {
   if (ref_path.empty()) {
     LOG(ERROR) << "Required: --ref";
     return 1;
+  }
+
+  // Validate --select_variant_types up front so a typo fails fast rather than
+  // silently keeping everything (the pre-fix behavior) or erroring mid-region.
+  SelectedVariantTypes selected_types;
+  {
+    std::string err;
+    if (!ParseSelectVariantTypes(absl::GetFlag(FLAGS_select_variant_types),
+                                 &selected_types, &err)) {
+      LOG(ERROR) << err;
+      return 1;
+    }
   }
   if (reads_path.empty() && !IsSomaticMode()) {
     LOG(ERROR) << "Required: --reads (or --reads_tumor for somatic mode)";
@@ -1740,6 +1904,7 @@ int RunMakeExamples(int argc, char** argv) {
 
         std::vector<DeepVariantCall> candidates =
             caller.CallsFromAlleleCounts(ac_map, C.name, C.role);
+        FilterCandidatesBySelectedTypes(&candidates, selected_types);
         if (candidates.empty()) continue;
         C.total_candidates += candidates.size();
 
@@ -2228,6 +2393,7 @@ int RunMakeExamples(int argc, char** argv) {
 
     std::vector<DeepVariantCall> candidates =
         caller.CallsFromAlleleCounter(counter);
+    FilterCandidatesBySelectedTypes(&candidates, selected_types);
     if (candidates.empty()) continue;
 
     total_candidates += candidates.size();
