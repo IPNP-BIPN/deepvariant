@@ -57,6 +57,8 @@ ABSL_DECLARE_FLAG(std::string, reads);
 ABSL_DECLARE_FLAG(std::string, ref);
 ABSL_DECLARE_FLAG(std::string, regions);
 ABSL_DECLARE_FLAG(std::string, select_variant_types);
+ABSL_DECLARE_FLAG(std::string, haploid_contigs);     // postprocess_main.cc
+ABSL_DECLARE_FLAG(std::string, par_regions_bed);      // postprocess_main.cc
 ABSL_DECLARE_FLAG(int, num_shards);
 ABSL_DECLARE_FLAG(int, batch_size);
 ABSL_DECLARE_FLAG(std::string, inference_backend);
@@ -93,6 +95,17 @@ inline void AppendSelectVariantTypes(std::vector<std::string>& me_args) {
   if (!svt.empty()) {
     me_args.push_back(absl::StrCat("--select_variant_types=", svt));
   }
+}
+
+// Helper: forward sex-chromosome haploid-calling flags to postprocess_variants.
+// postprocess_main.cc owns the flags and applies the het-zeroing correction;
+// here we just pass the user's values through to each per-mode postprocess
+// worker. (Not forwarded to make_examples — that binary defines no such flags.)
+inline void AppendHaploidFlags(std::vector<std::string>& pp_args) {
+  const std::string hc = absl::GetFlag(FLAGS_haploid_contigs);
+  if (!hc.empty()) pp_args.push_back(absl::StrCat("--haploid_contigs=", hc));
+  const std::string par = absl::GetFlag(FLAGS_par_regions_bed);
+  if (!par.empty()) pp_args.push_back(absl::StrCat("--par_regions_bed=", par));
 }
 }  // namespace
 ABSL_DECLARE_FLAG(std::string, checkpoint);
@@ -1150,6 +1163,7 @@ int RunAll(int argc, char** argv) {
       me_args.push_back("--use_direct_phasing=true");
     }
     AppendSelectVariantTypes(me_args);
+    AppendHaploidFlags(me_args);  // haploid gVCF reference confidence
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
@@ -1211,6 +1225,7 @@ int RunAll(int argc, char** argv) {
     }
     // Per-model postprocess flags (e.g. WES multiallelic_mode=min).
     for (const auto& f : PostprocessModelFlags(model_type)) pp_args.push_back(f);
+    AppendHaploidFlags(pp_args);
     auto argv_pp = MakeArgv("deepvariant_postprocess", pp_args);
     int n = static_cast<int>(argv_pp.size()) - 1;
     if (int rc = RunPostprocessVariants(n, argv_pp.data()); rc != 0) {
@@ -1468,6 +1483,7 @@ int RunAllTrio(int argc, char** argv) {
       me_args.push_back("--use_direct_phasing=true");
     }
     AppendSelectVariantTypes(me_args);
+    AppendHaploidFlags(me_args);  // haploid gVCF reference confidence
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
@@ -1554,6 +1570,7 @@ int RunAllTrio(int argc, char** argv) {
     if (!p.output_gvcf.empty()) {
       pp_args.push_back(absl::StrCat("--gvcf_outfile=", p.output_gvcf));
     }
+    AppendHaploidFlags(pp_args);
     auto argv_pp = MakeArgv("deepvariant_postprocess", pp_args);
     int n = static_cast<int>(argv_pp.size()) - 1;
     if (int rc = RunPostprocessVariants(n, argv_pp.data()); rc != 0) {
@@ -1710,6 +1727,7 @@ int RunAllSomatic(int argc, char** argv) {
       }
     }
     AppendSelectVariantTypes(me_args);
+    AppendHaploidFlags(me_args);  // haploid gVCF reference confidence
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
@@ -1775,6 +1793,7 @@ int RunAllSomatic(int argc, char** argv) {
         pp_args.push_back(absl::StrCat("--pon_filtering=", user_pon));
       }
     }
+    AppendHaploidFlags(pp_args);
     auto argv_pp = MakeArgv("deepvariant_postprocess", pp_args);
     int n = static_cast<int>(argv_pp.size()) - 1;
     if (int rc = RunPostprocessVariants(n, argv_pp.data()); rc != 0) {
@@ -1918,6 +1937,7 @@ int RunAllPangenome(int argc, char** argv) {
     // partition_size=1000 mirrors Docker's per-1kb reservoir granularity.
     me_args.push_back("--partition_size=1000");
     AppendSelectVariantTypes(me_args);
+    AppendHaploidFlags(me_args);  // haploid gVCF reference confidence
     auto argv_me = MakeArgv("deepvariant_make_examples", me_args);
     int n = static_cast<int>(argv_me.size()) - 1;
     if (int rc = RunMakeExamples(n, argv_me.data()); rc != 0) {
@@ -1970,6 +1990,7 @@ int RunAllPangenome(int argc, char** argv) {
         absl::StrCat("--infile=", merged_cvo_path),
         absl::StrCat("--output_vcf_outfile=", out_vcf),
     };
+    AppendHaploidFlags(pp_args);
     auto argv_pp = MakeArgv("deepvariant_postprocess", pp_args);
     int n = static_cast<int>(argv_pp.size()) - 1;
     if (int rc = RunPostprocessVariants(n, argv_pp.data()); rc != 0) {

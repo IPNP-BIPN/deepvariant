@@ -28,6 +28,7 @@
 #include "deepvariant/direct_phasing.h"
 #include "deepvariant/make_examples_native.h"
 #include "deepvariant/native/gvcf_emit.h"
+#include "deepvariant/native/haploid_regions.h"
 #include "deepvariant/native/numpy_mt19937.h"
 #include "deepvariant/native/realigner_native.h"
 #include "deepvariant/native/regions.h"
@@ -161,6 +162,11 @@ ABSL_FLAG(std::string, select_variant_types, "",
           "all. snps/indels/insertions/deletions select bi-allelic variants "
           "of that type; multi-allelics selects any multi-allelic variant. "
           "Empty (default) keeps all candidates.");
+// Sex-chromosome haploid calling. The flags are DEFINED in postprocess_main.cc
+// (same multi-call binary, so defining them twice would abort at startup); we
+// only read them here to drive haploid gVCF reference confidence.
+ABSL_DECLARE_FLAG(std::string, haploid_contigs);
+ABSL_DECLARE_FLAG(std::string, par_regions_bed);
 // Small model first-pass.
 ABSL_FLAG(std::string, small_model, "",
           "Path to the small_model .mlpackage. Empty = no small model "
@@ -1405,6 +1411,20 @@ int RunMakeExamples(int argc, char** argv) {
       return 1;
     }
   }
+
+  // Sex-chromosome haploid calling config — drives haploid gVCF reference
+  // confidence on the --haploid_contigs (outside the PAR).
+  const std::set<std::string> haploid_contigs =
+      ParseHaploidContigs(absl::GetFlag(FLAGS_haploid_contigs));
+  ParRegions par_regions;
+  if (const std::string par_bed = absl::GetFlag(FLAGS_par_regions_bed);
+      !par_bed.empty()) {
+    std::string err;
+    if (!LoadParRegions(par_bed, &par_regions, &err)) {
+      LOG(ERROR) << err;
+      return 1;
+    }
+  }
   if (reads_path.empty() && !IsSomaticMode()) {
     LOG(ERROR) << "Required: --reads (or --reads_tumor for somatic mode)";
     return 1;
@@ -2359,7 +2379,8 @@ int RunMakeExamples(int argc, char** argv) {
           absl::GetFlag(FLAGS_p_error),
           absl::GetFlag(FLAGS_gvcf_gq_binsize),
           /*max_gq=*/50,
-          absl::GetFlag(FLAGS_include_med_dp));
+          absl::GetFlag(FLAGS_include_med_dp),
+          &haploid_contigs, &par_regions);
       for (const auto& v : gvcf_rows) {
         std::string serialized;
         v.SerializeToString(&serialized);

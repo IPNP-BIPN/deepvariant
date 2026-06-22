@@ -43,22 +43,31 @@ int Log10PtrueToPhred(double log10_p_ref, int max_gq) {
   return std::min(gq, max_gq);
 }
 
+// log10 of an effectively-impossible probability, used to drive the
+// heterozygous likelihood to zero on haploid contigs (matches upstream
+// variant_caller.py:IMPOSSIBLE_PROBABILITY_LOG10 = 999.0).
+constexpr double kImpossibleProbabilityLog10 = 999.0;
+
 // Compute reference-confidence likelihoods + GQ for one site, given ref/total
 // read counts and per-base error rate. Returns log10 probs in [ref, het, alt].
+// When `is_haploid` (a haploid contig outside the PAR), the heterozygous
+// likelihood is forced to zero, mirroring variant_caller.py's is_haploid
+// branch in _calc_reference_confidence.
 void ReferenceConfidence(int n_ref, int n_total, double p_error,
-                          double* log10_p_ref, double* log10_p_het,
-                          double* log10_p_alt) {
+                         bool is_haploid, double* log10_p_ref,
+                         double* log10_p_het, double* log10_p_alt) {
   if (n_total <= 0) {
-    // No coverage: uniform.
+    // No coverage: uniform over the possible genotypes. Haploid drops het.
     *log10_p_ref = -1.0;
-    *log10_p_het = -1.0;
+    *log10_p_het = is_haploid ? -kImpossibleProbabilityLog10 : -1.0;
     *log10_p_alt = -1.0;
   } else {
     const int n_alts = n_total - n_ref;
     const double logp = std::log(p_error) / kLog10;
     const double log1p = std::log1p(-p_error) / kLog10;
     *log10_p_ref = n_ref * log1p + n_alts * logp;
-    *log10_p_het = -n_total * std::log10(2.0);
+    *log10_p_het = is_haploid ? -kImpossibleProbabilityLog10
+                              : -n_total * std::log10(2.0);
     *log10_p_alt = n_ref * logp + n_alts * log1p;
   }
   NormalizeLog10Probs(log10_p_ref, log10_p_het, log10_p_alt);
@@ -98,9 +107,14 @@ std::vector<nucleus::genomics::v1::Variant> MakeGvcfRows(
     const std::vector<learning::genomics::deepvariant::AlleleCountSummary>&
         summaries,
     const std::string& sample_name,
-    double p_error, int gq_resolution, int max_gq, bool include_med_dp) {
+    double p_error, int gq_resolution, int max_gq, bool include_med_dp,
+    const std::set<std::string>* haploid_contigs,
+    const ParRegions* par_regions) {
   std::vector<nucleus::genomics::v1::Variant> out;
   if (summaries.empty()) return out;
+
+  static const ParRegions kNoParRegions;
+  const ParRegions& par = par_regions ? *par_regions : kNoParRegions;
 
   // 1. Compute per-site GQ + likelihoods.
   std::vector<SiteEntry> entries;
@@ -115,9 +129,13 @@ std::vector<nucleus::genomics::v1::Variant> MakeGvcfRows(
       // Skip non-canonical (N, IUPAC) — upstream does the same.
       continue;
     }
+    const bool is_haploid =
+        haploid_contigs &&
+        IsHaploidPosition(e.ref_name, e.position, e.position + 1,
+                          *haploid_contigs, par);
     ReferenceConfidence(s.ref_supporting_read_count(), s.total_read_count(),
-                         p_error, &e.log10_probs[0], &e.log10_probs[1],
-                         &e.log10_probs[2]);
+                        p_error, is_haploid, &e.log10_probs[0],
+                        &e.log10_probs[1], &e.log10_probs[2]);
     e.raw_gq = Log10PtrueToPhred(e.log10_probs[0], max_gq);
     e.quantized_gq = QuantizeGq(e.raw_gq, gq_resolution);
     e.gl_is_valid =

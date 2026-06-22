@@ -40,6 +40,15 @@ phase1_test_abs(methylation_aware_phasing_test
   "${CMAKE_SOURCE_DIR}/deepvariant/methylation_aware_phasing_test.cc"
   dv_methylation_aware_phasing)
 
+# Header-only haploid-calling helpers (deepvariant/native/haploid_regions.h):
+# needs only absl + gtest, no dv library.
+add_executable(haploid_regions_test
+  "${CMAKE_CURRENT_SOURCE_DIR}/haploid_regions_test.cc")
+target_include_directories(haploid_regions_test PRIVATE ${GATE_INCLUDE_DIRS})
+target_link_libraries(haploid_regions_test PRIVATE
+  absl::strings gtest_main gmock)
+add_test(NAME haploid_regions_test COMMAND haploid_regions_test)
+
 phase1_test(nucleus_io_smoke      nucleus_io_smoke_test.cc      nucleus_io)
 phase1_test(realigner_smoke       realigner_smoke_test.cc       realigner)
 phase1_test(call_variants_smoke   call_variants_smoke_test.cc   dv_call_variants_lib)

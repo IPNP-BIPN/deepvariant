@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <set>
@@ -29,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "deepvariant/native/haploid_regions.h"
 #include "deepvariant/native/haplotypes.h"
 #include "deepvariant/native/tfrecord.h"
 #include "deepvariant/protos/deepvariant.pb.h"
@@ -99,6 +101,17 @@ ABSL_FLAG(bool, process_somatic, false,
 //   "min" (WES):             take minimum probability across kept CVOs.
 ABSL_FLAG(std::string, multiallelic_mode, "product",
           "Multi-allelic CVO fusion: product (WGS default) or min (WES).");
+// Sex-chromosome haploid calling (mirror of upstream postprocess_variants.py
+// --haploid_contigs / --par_regions_bed). On a haploid contig (e.g. chrX/chrY
+// in an XY sample) outside the pseudo-autosomal regions, heterozygous
+// genotypes are disallowed: their probabilities are zeroed and the vector
+// renormalized, forcing a haploid (homozygous) call.
+ABSL_FLAG(std::string, haploid_contigs, "",
+          "Comma/space-separated contigs to call as haploid (e.g. "
+          "\"chrX,chrY\" for GRCh38, \"X,Y\" for GRCh37). Empty = all diploid.");
+ABSL_FLAG(std::string, par_regions_bed, "",
+          "BED of pseudo-autosomal regions exempted from haploid calling on "
+          "the --haploid_contigs (they stay diploid). Empty = no exemptions.");
 
 namespace deepvariant {
 
@@ -109,6 +122,28 @@ using nucleus::genomics::v1::VariantCall;
 namespace {
 
 constexpr int kMaxPhred = 99;
+
+// ---------------------------------------------------------------------------
+// Sex-chromosome haploid calling (--haploid_contigs / --par_regions_bed).
+// ParRegions / ParseHaploidContigs / LoadParRegions / IsHaploidPosition are
+// shared with the make_examples gVCF path via haploid_regions.h.
+// ---------------------------------------------------------------------------
+
+// True when the variant should be called haploid: it sits on a --haploid_contig
+// and does not overlap a PAR region. Mirror of postprocess_variants.py's
+// `is_non_autosome(v) and not is_in_regions(v, par_regions)`.
+bool IsHaploidVariant(const Variant& variant,
+                      const std::set<std::string>& haploid_contigs,
+                      const ParRegions& par_regions) {
+  const int64_t start = variant.start();
+  const int64_t end =
+      variant.end() > start
+          ? variant.end()
+          : start + std::max<int64_t>(
+                        1, static_cast<int64_t>(variant.reference_bases().size()));
+  return IsHaploidPosition(variant.reference_name(), start, end,
+                           haploid_contigs, par_regions);
+}
 
 std::vector<std::string> ExpandShards(const std::string& spec) {
   auto at = spec.find('@');
@@ -570,6 +605,19 @@ int RunPostprocessVariants(int argc, char** argv) {
   const double qual_filter = absl::GetFlag(FLAGS_qual_filter);
   const double homref_min_gq = absl::GetFlag(FLAGS_cnn_homref_call_min_gq);
 
+  // Sex-chromosome haploid calling config.
+  const std::set<std::string> haploid_contigs =
+      ParseHaploidContigs(absl::GetFlag(FLAGS_haploid_contigs));
+  ParRegions par_regions;
+  if (const std::string par_bed = absl::GetFlag(FLAGS_par_regions_bed);
+      !par_bed.empty()) {
+    std::string err;
+    if (!LoadParRegions(par_bed, &par_regions, &err)) {
+      LOG(ERROR) << err;
+      return 1;
+    }
+  }
+
   int written = 0;
   int refcall = 0;
   int nocall = 0;
@@ -754,6 +802,14 @@ int RunPostprocessVariants(int argc, char** argv) {
       if (sp > 0.0) for (double& v : like_pruned) v /= sp;
     }
     like = std::move(like_pruned);
+
+    // Haploid correction: on a haploid contig outside the PAR, disallow
+    // heterozygous genotypes before the genotype/QUAL/GQ/GL are derived from
+    // `like` (mirrors merge_predictions applying
+    // correct_nonautosome_probabilities to the merged probabilities).
+    if (IsHaploidVariant(variant, haploid_contigs, par_regions)) {
+      CorrectNonautosomeProbabilities(&like, n_alts);
+    }
 
     // argmax genotype.
     int best = 0;

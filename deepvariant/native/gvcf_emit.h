@@ -11,9 +11,11 @@
 
 #pragma once
 
+#include <set>
 #include <string>
 #include <vector>
 
+#include "deepvariant/native/haploid_regions.h"
 #include "deepvariant/protos/deepvariant.pb.h"
 #include "third_party/nucleus/protos/variants.pb.h"
 
@@ -30,10 +32,13 @@ namespace deepvariant {
 //                  default).
 //   max_gq: upper cap on GQ (typical: 50).
 //   include_med_dp: emit MED_DP info field (default false).
+//   haploid_contigs: contigs to call as haploid (null/empty = all diploid).
+//   par_regions: PAR intervals exempted from haploid calling (null = none).
 //
 // Returns: coordinate-sorted Variant protos with `<*>` alt and
 // `END` info field. Each row may span multiple positions if their
-// quantized GQs match.
+// quantized GQs match. On a haploid contig outside the PAR, the
+// reference-confidence het likelihood is forced to zero.
 std::vector<nucleus::genomics::v1::Variant> MakeGvcfRows(
     const std::vector<learning::genomics::deepvariant::AlleleCountSummary>&
         summaries,
@@ -41,6 +46,8 @@ std::vector<nucleus::genomics::v1::Variant> MakeGvcfRows(
     double p_error = 1e-3,
     int gq_resolution = 5,    // Matches upstream --gvcf_gq_binsize default.
     int max_gq = 50,
-    bool include_med_dp = false);
+    bool include_med_dp = false,
+    const std::set<std::string>* haploid_contigs = nullptr,
+    const ParRegions* par_regions = nullptr);
 
 }  // namespace deepvariant
