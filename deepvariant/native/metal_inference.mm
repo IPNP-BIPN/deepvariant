@@ -751,7 +751,7 @@ std::unique_ptr<MetalInception> MetalInception::Create(
       fp16 ? MPSGraphOptimizationLevel1 : MPSGraphOptimizationLevel0;
   I.compileDesc.waitForCompilationCompletion = YES;
   // macOS 26+: control reduced-precision fast-math paths (FP16 Winograd
-  // intermediates, FP19/TF32 operand conversion). Default is `None` already
+  // intermediates, TF32 (19-bit) operand conversion). Default is `None` already
   // — set explicitly to make the behaviour contractually visible and logged.
   if (@available(macOS 26.0, iOS 26.0, *)) {
     I.compileDesc.reducedPrecisionFastMath =
