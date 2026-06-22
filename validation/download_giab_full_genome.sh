@@ -42,7 +42,8 @@ dl() {
     return
   fi
   echo "==> Downloading ${out} (URL: ${url})"
-  curl -L --progress-bar -o "${out}" "${url}"
+  curl -fL --retry 3 --connect-timeout 15 --progress-bar -o "${out}.partial" "${url}"
+  mv "${out}.partial" "${out}"
 }
 
 # 1. Full GRCh38 reference FASTA from NCBI canonical no_alt_analysis_set.

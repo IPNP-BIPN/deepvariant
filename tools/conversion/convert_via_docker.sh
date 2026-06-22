@@ -27,6 +27,7 @@ import json, sys
 d = json.load(open('${MODEL_DIR}/model.example_info.json'))
 print(','.join(str(x) for x in d['shape']))
 ")
+  [[ -n "${SHAPE_JSON}" && "${SHAPE_JSON}" == *,*,* ]] || { echo "error: failed to parse shape from ${MODEL_DIR}/model.example_info.json" >&2; exit 1; }
 else
   SHAPE_JSON="100,221,7"
 fi

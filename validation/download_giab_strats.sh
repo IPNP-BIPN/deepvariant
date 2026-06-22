@@ -45,7 +45,8 @@ if [ ! -f "${ARCHIVE}" ]; then
   echo "==> Downloading GIAB stratifications v3.6 GRCh38 (~1.4 GB) ..."
   echo "    URL: ${URL}"
   echo "    Target: ${TARGET}/${ARCHIVE}"
-  curl -L --progress-bar -o "${ARCHIVE}" "${URL}"
+  curl -fL --retry 3 --connect-timeout 15 --progress-bar -o "${ARCHIVE}.partial" "${URL}"
+  mv "${ARCHIVE}.partial" "${ARCHIVE}"
 fi
 
 echo "==> Extracting ..."

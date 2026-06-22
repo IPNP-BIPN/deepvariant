@@ -67,6 +67,8 @@ if (( ${#EXAMPLES_GLOB[@]} > 0 && ${#CV_GLOB[@]} > 0 )); then
   cp "${CV_GLOB[0]}"       "${OUT}/call_variants_chr20.tfrecord"
 fi
 
+[[ -s "${OUT}/examples_chr20.tfrecord" ]] || { echo "error: examples_chr20.tfrecord missing — make_examples produced no output" >&2; exit 1; }
+
 # Build a 1000-example slice for fast bench iteration.
 mkdir -p cache
 python3 - <<PY "${OUT}/examples_chr20.tfrecord" "cache/${VARIANT}_chr20_1000.tfrecord"

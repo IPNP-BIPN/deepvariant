@@ -49,6 +49,7 @@ echo "[$(date +%H:%M:%S)] Docker baseline PID=${DOCKER_PID}"
 
 echo "[$(date +%H:%M:%S)] Waiting for Docker WG (${DOCKER}) ..."
 until [ -f "${DOCKER}" ] && [ -s "${DOCKER}" ]; do
+  kill -0 "${DOCKER_PID}" 2>/dev/null || { echo "ERROR: Docker baseline (PID ${DOCKER_PID}) exited before producing ${DOCKER}; see /tmp/hg002_wg_docker.log" >&2; exit 1; }
   sleep 600   # 10 min poll — Docker takes ~22 h, no rush
 done
 echo "[$(date +%H:%M:%S)] Docker WG ready"

@@ -66,7 +66,8 @@ cd "${WORK}"
 
 if [ ! -f "GLnexus-${VERSION}.tar.gz" ]; then
   echo "==> Downloading GLnexus v${VERSION} ..."
-  curl -sL "${URL}" -o "GLnexus-${VERSION}.tar.gz"
+  curl -fsL --retry 3 --connect-timeout 15 "${URL}" -o "GLnexus-${VERSION}.tar.gz.partial"
+  mv "GLnexus-${VERSION}.tar.gz.partial" "GLnexus-${VERSION}.tar.gz"
 fi
 
 if [ ! -d "GLnexus-${VERSION}" ]; then

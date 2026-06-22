@@ -25,6 +25,7 @@ OURS="$1"
 DOCKER="$2"
 BCFTOOLS="${BCFTOOLS:-/opt/homebrew/bin/bcftools}"
 WORK="$(mktemp -d)"
+trap '[[ -n "${DV_DIFF_KEEP:-}" ]] || rm -rf "${WORK}"' EXIT
 
 # Index inputs if not already.
 [ -f "${OURS}.tbi" ]   || "${BCFTOOLS}" index -t -f "${OURS}"
@@ -63,10 +64,7 @@ if [ "${ONLY_OURS}" -eq 0 ] && [ "${ONLY_DOCKER}" -eq 0 ] && [ "${FM}" -eq 0 ]; 
   exit 0
 fi
 
-# Cleanup tempdir if not in DEBUG mode.
-if [ -z "${DV_DIFF_KEEP:-}" ]; then
-  rm -rf "${WORK}"
-else
+if [ -n "${DV_DIFF_KEEP:-}" ]; then
   echo
   echo "Intermediate files kept at: ${WORK}"
 fi
