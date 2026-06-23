@@ -275,6 +275,24 @@ set(ME_COMPILE_OPTS
   "-include${CMAKE_SOURCE_DIR}/cmake/tf_stubs/tensorflow/core/platform/tf_compat.h"
 )
 
+# ---------------------------------------------------------------------------
+# dv_haploid_regions — sex-chromosome haploid-calling helpers shared by
+# make_examples (gVCF) and postprocess. The header is dependency-free and
+# header-only; only LoadParRegions lives here because it uses zlib to read
+# plaintext-or-gzipped PAR BEDs.
+# ---------------------------------------------------------------------------
+add_library(dv_haploid_regions STATIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/haploid_regions.cc"
+)
+target_include_directories(dv_haploid_regions PUBLIC
+  "${CMAKE_SOURCE_DIR}"
+  "${ABSL_PREFIX}/include"
+)
+target_link_libraries(dv_haploid_regions PUBLIC
+  absl::strings
+  z  # zlib (also pulled in transitively by htslib); for gzopen/gzgets
+)
+
 add_library(dv_make_examples_lib STATIC
   "${CMAKE_CURRENT_SOURCE_DIR}/make_examples_main.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/regions.cc"
@@ -289,6 +307,7 @@ target_link_libraries(dv_make_examples_lib PUBLIC
   dv_tfrecord
   dv_small_model
   dv_direct_phasing       # Phase 9 / Step 4 — per-region read phasing
+  dv_haploid_regions      # haploid gVCF reference confidence (PAR BED loader)
   realigner
   proto_dv
   proto_nucleus
@@ -338,6 +357,7 @@ target_include_directories(dv_postprocess_lib PUBLIC ${ME_INCLUDE_DIRS})
 target_compile_options(dv_postprocess_lib PRIVATE ${ME_COMPILE_OPTS})
 target_link_libraries(dv_postprocess_lib PUBLIC
   dv_tfrecord
+  dv_haploid_regions      # haploid het-zeroing (PAR BED loader)
   proto_dv
   proto_nucleus
   absl::flags

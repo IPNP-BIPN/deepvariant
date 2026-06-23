@@ -40,15 +40,12 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <fstream>
 #include <map>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "absl/strings/numbers.h"
-#include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 
@@ -81,49 +78,13 @@ inline std::set<std::string> ParseHaploidContigs(const std::string& flag) {
   return out;
 }
 
-// Load a PAR BED (chrom \t start \t end, 0-based half-open). Returns false on
-// an unreadable file or a malformed line so a typo'd path fails fast rather
-// than silently disabling the exemption.
-inline bool LoadParRegions(const std::string& path, ParRegions* out,
-                           std::string* err) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f) {
-    *err = absl::StrCat("cannot open --par_regions_bed: ", path);
-    return false;
-  }
-  // This is a plaintext parser; upstream's htslib BedReader also accepts
-  // bgzipped BED. Detect the gzip magic (0x1f 0x8b) and fail with a clear
-  // message rather than mis-parsing binary as malformed lines.
-  const int b0 = f.peek();
-  if (b0 == 0x1f) {
-    f.get();
-    const int b1 = f.peek();
-    f.unget();
-    if (b1 == 0x8b) {
-      *err = absl::StrCat("--par_regions_bed appears gzipped (", path,
-                          "); provide a plaintext BED");
-      return false;
-    }
-  }
-  std::string line;
-  int lineno = 0;
-  while (std::getline(f, line)) {
-    ++lineno;
-    if (line.empty() || line[0] == '#') continue;
-    if (line.rfind("track", 0) == 0 || line.rfind("browser", 0) == 0) continue;
-    std::vector<absl::string_view> cols =
-        absl::StrSplit(line, absl::ByAnyChar("\t "), absl::SkipEmpty());
-    int64_t start, end;
-    if (cols.size() < 3 || !absl::SimpleAtoi(cols[1], &start) ||
-        !absl::SimpleAtoi(cols[2], &end) || start < 0 || end < start) {
-      *err = absl::StrCat("malformed BED line ", lineno, " in ", path, ": ",
-                          line);
-      return false;
-    }
-    out->by_contig[std::string(cols[0])].emplace_back(start, end);
-  }
-  return true;
-}
+// Load a PAR BED (chrom \t start \t end, 0-based half-open). Transparently
+// reads plaintext or bgzipped/gzipped BED (matching upstream's htslib
+// BedReader). Returns false on an unreadable file or a malformed line so a
+// typo'd path fails fast rather than silently disabling the exemption.
+// Defined in haploid_regions.cc (uses zlib, so it is kept out of this
+// otherwise dependency-free, header-only API).
+bool LoadParRegions(const std::string& path, ParRegions* out, std::string* err);
 
 // True when [start, end) on `chrom` should be called haploid: the contig is in
 // `haploid_contigs` and the interval does not overlap a PAR region. Mirror of
