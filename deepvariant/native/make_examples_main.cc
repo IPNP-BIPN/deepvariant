@@ -1924,14 +1924,19 @@ int RunMakeExamples(int argc, char** argv) {
 
         std::vector<DeepVariantCall> candidates =
             caller.CallsFromAlleleCounts(ac_map, C.name, C.role);
-        // Multi-sample path filters before small_model so pruned types are not
-        // emitted via the small_model CVO. The trio small_model uses no
-        // per-read HP features, so this does not affect genotypes; the only
-        // residual gap vs upstream is that is_phased/PS (computed later on the
-        // surviving big_candidates) sees the filtered set when
-        // --select_variant_types is combined with trio --use_direct_phasing —
-        // a rare combination, and the trio path already phases big_candidates
-        // (a subset) rather than the full candidate set.
+        // DirectPhasing (is_phased/PS, below) must see the FULL candidate set so
+        // its SNP phasing graph matches upstream, which phases in
+        // candidates_in_region *before* filter_candidates. Capture the
+        // pre-prune set here (only when phasing is on) and phase that; the
+        // select_variant_types prune + small_model dispatch then run on the
+        // filtered set, and is_phased/PS is applied to the surviving
+        // big_candidates by position. The multi-sample path still filters
+        // before small_model so pruned types are not emitted via the
+        // small_model CVO.
+        std::vector<DeepVariantCall> phasing_candidates;
+        if (absl::GetFlag(FLAGS_use_direct_phasing)) {
+          phasing_candidates = candidates;  // full set, pre-prune
+        }
         FilterCandidatesBySelectedTypes(&candidates, selected_types);
         if (candidates.empty()) continue;
         C.total_candidates += candidates.size();
@@ -2037,7 +2042,10 @@ int RunMakeExamples(int argc, char** argv) {
           for (auto& r : reads_per_sample_v[s]) dp_read_ptrs.emplace_back(&r);
           ::learning::genomics::deepvariant::DirectPhasing dp(
               opts.direct_phasing_options());
-          auto so = dp.PhaseReads(absl::MakeSpan(big_candidates),
+          // Phase the full pre-prune candidate set (not just big_candidates)
+          // so the phasing graph matches upstream; is_phased/PS is then applied
+          // to the surviving big_candidates by position below.
+          auto so = dp.PhaseReads(absl::MakeSpan(phasing_candidates),
                                    absl::MakeSpan(dp_read_ptrs));
           if (so.ok()) {
             const auto phased = dp.GetPhasedVariants();
