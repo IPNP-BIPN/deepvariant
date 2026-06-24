@@ -738,18 +738,33 @@ std::unique_ptr<MetalInception> MetalInception::Create(
   // produces channel-permuted output for our FP32 Inception-v3 conv.
   // Level0 forces GPU-only, full-precision execution at the cost of
   // some perf optimisations.
+  // DV_METAL_FP16=1 opts into reduced-precision inference: MPSGraph is
+  // allowed to use FP16 Winograd intermediates + operand conversion and the
+  // Level1 perf optimisations. This is faster on Apple Silicon but is NOT
+  // bit-identical to the FP32 path and changes genotype likelihoods at the
+  // last digits — gate any default flip behind a GIAB concordance check.
+  // Default (unset) keeps the contractual full-FP32 behaviour unchanged.
+  const char* fp16_env = std::getenv("DV_METAL_FP16");
+  const bool fp16 = fp16_env && fp16_env[0] == '1';
   I.compileDesc = [MPSGraphCompilationDescriptor new];
-  I.compileDesc.optimizationLevel = MPSGraphOptimizationLevel0;
+  I.compileDesc.optimizationLevel =
+      fp16 ? MPSGraphOptimizationLevel1 : MPSGraphOptimizationLevel0;
   I.compileDesc.waitForCompilationCompletion = YES;
-  // macOS 26+: explicitly disable any reduced-precision fast-math paths
-  // (FP16 Winograd intermediates, FP19/TF32 operand conversion). Default
-  // is `None` already — setting explicitly to make this behaviour
-  // contractually visible and to log it on supported macOS versions.
+  // macOS 26+: control reduced-precision fast-math paths (FP16 Winograd
+  // intermediates, TF32 (19-bit) operand conversion). Default is `None` already
+  // — set explicitly to make the behaviour contractually visible and logged.
   if (@available(macOS 26.0, iOS 26.0, *)) {
     I.compileDesc.reducedPrecisionFastMath =
-        MPSGraphReducedPrecisionFastMathNone;
-    LOG(INFO) << "MPSGraph: reducedPrecisionFastMath=None (full FP32, "
-              << "no Winograd-FP16, no FP19/TF32 operand conversion)";
+        fp16 ? MPSGraphReducedPrecisionFastMathDefault
+             : MPSGraphReducedPrecisionFastMathNone;
+    LOG(INFO) << "MPSGraph: reducedPrecisionFastMath="
+              << (fp16 ? "Default (FP16 fast-math allowed)"
+                       : "None (full FP32)");
+  }
+  if (fp16) {
+    LOG(INFO) << "MetalInception: DV_METAL_FP16=1 — reduced-precision "
+                 "inference (Level1, FP16 fast-math). NOT bit-identical to "
+                 "FP32; validate accuracy before relying on it.";
   }
   I.execCache = [NSMutableDictionary dictionary];
   I.taps = [NSMutableDictionary dictionary];
