@@ -2156,7 +2156,12 @@ int RunMakeExamples(int argc, char** argv) {
     CHECK(t_sam_or.ok()) << "thread " << tid << ": BAM reopen failed";
     auto sam_reader = std::move(t_sam_or.ValueOrDie());
 
-    vcf_candidate_importer::VariantCaller caller(
+    // Use the multi-sample VariantCaller (as upstream does for every sample
+    // count) rather than the vcf_candidate_importer caller: only the former
+    // emits methylated reference sites (alt='.'), which methylation-aware
+    // phasing consumes. For a single sample the candidate set is otherwise
+    // identical (validated against the WGS baseline).
+    multi_sample::VariantCaller caller(
         opts.sample_options(0).variant_caller_options());
 
     const std::unordered_map<std::string, std::string> example_filenames = {
@@ -2413,7 +2418,8 @@ int RunMakeExamples(int argc, char** argv) {
       }
     }
 
-    auto probe_candidates = caller.CallsFromAlleleCounter(probe);
+    auto probe_candidates = caller.CallsFromAlleleCounts(
+        {{sample_name, &probe}}, sample_name, "sample");
     if (probe_candidates.empty()) continue;
 
     // Second pass: rerun AlleleCounter with the candidate positions known
@@ -2438,7 +2444,8 @@ int RunMakeExamples(int argc, char** argv) {
     DV_SIGNPOST_INTERVAL_END(AlleleCounterMain);
 
     std::vector<DeepVariantCall> candidates =
-        caller.CallsFromAlleleCounter(counter);
+        caller.CallsFromAlleleCounts({{sample_name, &counter}}, sample_name,
+                                     "sample");
     if (candidates.empty()) continue;
 
     // Phase 5.5d/14 — DirectPhasing runs BEFORE small_model dispatch so the
