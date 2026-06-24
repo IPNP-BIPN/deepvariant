@@ -187,9 +187,23 @@ def _decode_feature(
             j = 1  # skip BytesList.value tag
             l2, j = _read_varint(seg, j)
             data = seg[j:j + l2]
-            return np.frombuffer(data, dtype=np.uint8).astype(np.float32).reshape(h, w, c)
+            pixels = np.frombuffer(data, dtype=np.uint8)
+            if pixels.size != h * w * c:
+                raise RuntimeError(
+                    f"image/encoded BytesList has {pixels.size} uint8 elements, "
+                    f"expected {h * w * c} for shape ({h}, {w}, {c}); the feature "
+                    "may be a compressed encoding (e.g. PNG) rather than raw "
+                    "uint8 pixels"
+                )
+            return pixels.astype(np.float32).reshape(h, w, c)
         if field == 2 and not prefer_bytes:  # FloatList (packed)
-            return np.frombuffer(seg, dtype=np.float32).reshape(h, w, c)
+            floats = np.frombuffer(seg, dtype=np.float32)
+            if floats.size != h * w * c:
+                raise RuntimeError(
+                    f"FloatList has {floats.size} float32 elements, expected "
+                    f"{h * w * c} for shape ({h}, {w}, {c})"
+                )
+            return floats.reshape(h, w, c)
     raise RuntimeError("Feature has no recognized list")
 
 

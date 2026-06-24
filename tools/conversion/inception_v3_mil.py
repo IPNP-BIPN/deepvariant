@@ -54,6 +54,16 @@ def _k(bundle, n: int) -> np.ndarray:
     return np.transpose(raw, (3, 2, 0, 1)).astype(np.float32)  # HWIO→OIHW
 
 
+# Expected stem-conv kernel geometry in OIHW: 7-channel pileup input, 3×3
+# spatial. A regression that flips the HWIO→OIHW perm in _k() would build a
+# valid-but-wrong model, so we assert this once at build time.
+_STEM_IN_CHANNELS = 7
+_STEM_SPATIAL = (3, 3)
+
+# Number of output classes for the WGS model (hom-ref / het / hom-alt).
+_NUM_CLASSES = 3
+
+
 def _bn_params(bundle, n: int) -> tuple:
     """Return (gamma, beta, mean, var) for layer_with_weights-N.
 
@@ -340,6 +350,19 @@ def build_program(
     """
     from coremltools.converters.mil.mil.program import get_new_symbol
 
+    # Validate the stem conv geometry up front: OIHW must be (O, 7, 3, 3) for
+    # the 7-channel pileup input. Guards against a perm regression in _k().
+    stem_kernel = _k(bundle, 0)
+    if stem_kernel.ndim != 4 or stem_kernel.shape[1] != _STEM_IN_CHANNELS or (
+        stem_kernel.shape[2], stem_kernel.shape[3]
+    ) != _STEM_SPATIAL:
+        raise ValueError(
+            "stem conv kernel 'layer_with_weights-0/kernel' has OIHW shape "
+            f"{stem_kernel.shape}, expected "
+            f"(O, {_STEM_IN_CHANNELS}, {_STEM_SPATIAL[0]}, {_STEM_SPATIAL[1]}) — "
+            "the HWIO→OIHW transpose in _k() may be wrong"
+        )
+
     # Use a symbol for the batch dim so ct.convert() can override it with
     # a RangeDim (see convert_coreml.py inputs= parameter).
     batch_sym = get_new_symbol()
@@ -398,6 +421,26 @@ def build_program(
         b = bundle.read_tensor(
             f"layer_with_weights-188/bias/{_ATTR}"
         ).astype(np.float32)
+        # mb.linear weight is [Dout, Din]; the Dense kernel is stored [Din, Dout]
+        # so the .T above is load-bearing. Assert the final layer is a 2-D
+        # weight whose output dim matches the bias and the expected class count
+        # — a dropped .T would surface here rather than as silent miscalibration.
+        if w.ndim != 2:
+            raise ValueError(
+                "final Dense weight 'layer_with_weights-188/kernel' must be 2-D "
+                f"after transpose, got shape {w.shape}"
+            )
+        if b.ndim != 1 or b.shape[0] != w.shape[0]:
+            raise ValueError(
+                "final Dense bias 'layer_with_weights-188/bias' shape "
+                f"{b.shape} is inconsistent with weight output dim {w.shape[0]}"
+            )
+        if w.shape[0] != _NUM_CLASSES:
+            raise ValueError(
+                "final Dense weight 'layer_with_weights-188/kernel' has output "
+                f"dim {w.shape[0]}, expected {_NUM_CLASSES} classes — the "
+                ".T transpose may have been dropped"
+            )
         x = mb.linear(x=x, weight=w, bias=b, name="logits")
 
         return mb.softmax(x=x, axis=1, name="classification")

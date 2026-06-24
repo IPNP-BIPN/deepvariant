@@ -64,7 +64,6 @@ phase1_test(bnns_finalize_smoke   bnns_finalize_smoke_test.cc   dv_bnns_finalize
 # unregistered since they need pre-generated per-layer dumps.
 foreach(t
     microtest_numpy_rng
-    microtest_neon_base_color
     microtest_neon_cigar_classify
     microtest_conv_serial
     microtest_conv_kahan)

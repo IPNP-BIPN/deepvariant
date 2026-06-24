@@ -43,6 +43,11 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 # ---------------------------------------------------------------------------
 add_compile_options(
   -arch arm64
+  # Target the Apple-M microarchitecture for scheduling + the full ARMv8 ISA
+  # (CRC32/dotprod/etc.). ISA/scheduling only — fast-math stays OFF globally,
+  # so the deterministic conv_serial/conv_kahan/bnns reductions remain
+  # bit-identical (guarded by the determinism microtests in ctest).
+  -mcpu=apple-m1
   -Wall
   -Wextra
   -Wno-unused-parameter

@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -91,6 +92,9 @@ ABSL_FLAG(double, ane_speculate_confidence, 0.99,
           "Borderline threshold for ane_speculate. If max(softmax_ane) < "
           "this value, the example is reclassified on GPU FP32. Lower "
           "→ more GPU reruns, more wall-time, fewer FP-drift artefacts.");
+ABSL_FLAG(bool, enable_inference_pipelining, false,
+          "Overlap GPU backbone (batch N+1) with CPU BNNS finalize + CVO "
+          "build (batch N). Determinism-neutral; default off.");
 
 namespace deepvariant {
 
@@ -393,6 +397,25 @@ int RunCallVariants(int argc, char** argv) {
     }
   });
 
+  // RAII guard: join the async writer on EVERY exit path, including early
+  // `return 1` (e.g. a flush_batch failure). Without it, returning while
+  // writer_thread is still joinable destroys a joinable std::thread →
+  // std::terminate(). Declared before PipeJoiner (below) so it destructs
+  // LAST — after the pipelined finalize worker has drained its CVOs into the
+  // write queue — preserving the same ordering as the explicit teardown.
+  struct WriterJoiner {
+    std::thread& t;
+    std::mutex& mu;
+    bool& done;
+    std::condition_variable& cv;
+    ~WriterJoiner() {
+      if (!t.joinable()) return;
+      { std::lock_guard<std::mutex> lk(mu); done = true; }
+      cv.notify_all();
+      t.join();
+    }
+  } writer_joiner{writer_thread, wq_mu, writer_done, wq_nonempty};
+
   auto enqueue_write = [&](std::string&& payload) -> bool {
     if (writer_failed.load()) return false;
     std::unique_lock<std::mutex> lk(wq_mu);
@@ -426,6 +449,200 @@ int RunCallVariants(int argc, char** argv) {
                               static_cast<size_t>(H * W * C));
   std::vector<float> probs(static_cast<size_t>(batch_size) *
                              static_cast<size_t>(K));
+
+  // Shared CVO emit: builds one CallVariantsOutput per example from a
+  // probabilities buffer and per-example variant/alt metadata, then pushes
+  // each serialized record to the async writer via enqueue_write. This is
+  // the SOLE producer of CVO records and is used by BOTH the serial path
+  // and the pipelined finalize worker so the two paths cannot diverge.
+  //
+  // `variant_at(i)` / `alt_at(i)` return the encoded bytes for example i;
+  // `probs_ptr` points at the (n × K) probabilities for this batch. Records
+  // are emitted strictly in increasing i — combined with the writer's FIFO
+  // queue and a single consumer, output byte-order matches the serial path.
+  auto emit_cvos = [&](const float* probs_ptr, int n,
+                       auto&& variant_at, auto&& alt_at) -> bool {
+    for (int i = 0; i < n; ++i) {
+      learning::genomics::deepvariant::CallVariantsOutput cvo;
+      const std::string& variant_encoded = variant_at(i);
+      const std::string& alt_encoded = alt_at(i);
+      if (!variant_encoded.empty() &&
+          !cvo.mutable_variant()->ParseFromString(variant_encoded)) {
+        LOG(ERROR) << "Failed to parse variant/encoded for example " << i;
+        return false;
+      }
+      if (!alt_encoded.empty() &&
+          !cvo.mutable_alt_allele_indices()->ParseFromString(alt_encoded)) {
+        LOG(ERROR) << "Failed to parse alt_allele_indices/encoded for example "
+                   << i;
+        return false;
+      }
+      for (int k = 0; k < K; ++k) {
+        cvo.add_genotype_probabilities(probs_ptr[i * K + k]);
+      }
+      // Tag MID="deepvariant" so postprocess can write it as a VCF FORMAT
+      // field. Reuse the empty VariantCall slot that variant_calling.cc
+      // already added (otherwise we end up with 2 calls and VcfWriter
+      // rejects the variant for not matching sample count).
+      auto* v = cvo.mutable_variant();
+      if (v->calls_size() == 0) v->add_calls();
+      nucleus::SetInfoField("MID", std::string("deepvariant"),
+                             v->mutable_calls(0));
+
+      std::string serialized;
+      if (!cvo.SerializeToString(&serialized)) {
+        LOG(ERROR) << "Failed to serialize CallVariantsOutput";
+        return false;
+      }
+      // P1: async writer thread consumes this. Push std::move so the
+      // writer thread owns the buffer; main thread can recycle storage.
+      if (!enqueue_write(std::move(serialized))) {
+        LOG(ERROR) << "Failed to enqueue output record (writer thread error)";
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // ── P3 (opt-in): GPU backbone / CPU finalize pipelining ──────────────────
+  // When --enable_inference_pipelining is set AND the active backend is the
+  // two-stage Metal/BNNS path, we overlap the GPU MPSGraph backbone of batch
+  // N+1 with the CPU BNNS finalize + CVO build of batch N.
+  //
+  // Structure (one-batch-deep double buffer + single FIFO worker):
+  //   main thread  : normalize → metal_model->Predict() (blocks on the GPU;
+  //                  on return `images` is free to reuse and the per-slot
+  //                  features buffer holds the backbone activations) → hand
+  //                  the slot to the worker → continue with next batch.
+  //   worker thread: pop slot in FIFO order → metal_finalize->ApplyBatch()
+  //                  (CPU BNNS dense+softmax) → emit_cvos() in per-example
+  //                  order → mark slot free.
+  //
+  // Determinism / order: there is exactly ONE worker draining a FIFO job
+  // deque, and emit_cvos() (shared with the serial path) is the sole CVO
+  // producer. So CVOs are built and enqueued in the same global order as the
+  // serial path → byte-identical output. ApplyBatch on identical features is
+  // bit-deterministic, so probabilities are identical too.
+  //
+  // At-most-one-in-flight invariant: we use exactly 2 slots. The main thread
+  // must not Predict-write features[slot] for batch N+2 until the worker has
+  // finished batch N (which used the same slot). `slot_busy[slot]` guards
+  // this: the main thread waits for slot_busy[slot]==false before writing,
+  // the worker sets it false after finishing that slot's job. Thus the main
+  // thread is at most one batch ahead of the worker.
+  const bool pipeline_enabled =
+      absl::GetFlag(FLAGS_enable_inference_pipelining);
+  const int kPipelineSlots = 2;
+
+  // Per-slot job metadata captured by the main thread for the worker. We copy
+  // the (small) variant/alt encoded strings out of `batch` so `batch` can be
+  // cleared and refilled for the next batch while the worker still needs
+  // this batch's metadata.
+  struct CvoMeta {
+    std::string variant_encoded;
+    std::string alt_allele_indices_encoded;
+  };
+  struct PipelineJob {
+    int slot = 0;
+    int n = 0;
+    std::vector<CvoMeta> meta;  // size n
+  };
+
+  // Double-buffered features and probs (only allocated when the pipeline is
+  // actually used; sized lazily once the FeatureDim is known).
+  std::vector<float> pipe_features[2];
+  std::vector<float> pipe_probs[2];
+
+  // Job queue + slot-free signaling.
+  std::deque<PipelineJob> pipe_queue;
+  std::mutex pipe_mu;
+  std::condition_variable pipe_nonempty;   // worker waits for jobs
+  std::condition_variable pipe_slot_free;  // main waits for a slot to free
+  bool pipe_busy[2] = {false, false};      // slot occupied by an in-flight job
+  bool pipe_done = false;                   // no more jobs will be enqueued
+  std::atomic<bool> pipe_failed{false};     // worker hit an error
+
+  // The finalize worker. Started lazily on first pipelined flush so the
+  // serial path (and non-Metal backends) never spawn it. Captures by ref;
+  // `metal_finalize`, `emit_cvos`, the pipe_* state and the buffers all
+  // outlive the worker (joined before this function returns).
+  std::thread pipe_worker;
+  auto ensure_pipe_worker = [&]() {
+    if (pipe_worker.joinable()) return;
+    pipe_worker = std::thread([&]() {
+      for (;;) {
+        PipelineJob job;
+        {
+          std::unique_lock<std::mutex> lk(pipe_mu);
+          pipe_nonempty.wait(lk, [&] {
+            return !pipe_queue.empty() || pipe_done;
+          });
+          if (pipe_queue.empty()) {
+            if (pipe_done) return;
+            continue;
+          }
+          job = std::move(pipe_queue.front());
+          pipe_queue.pop_front();
+        }
+        const int slot = job.slot;
+        bool job_ok = !pipe_failed.load();
+        if (job_ok) {
+          // CPU BNNS dense + softmax into this slot's probs buffer.
+          job_ok = metal_finalize->ApplyBatch(
+              pipe_features[slot].data(), job.n, pipe_probs[slot].data());
+          if (!job_ok) {
+            LOG(ERROR) << "Pipelined finalize: ApplyBatch failed";
+          }
+        }
+        if (job_ok) {
+          // Build + enqueue CVOs in per-example order (shared emit path).
+          job_ok = emit_cvos(
+              pipe_probs[slot].data(), job.n,
+              [&](int i) -> const std::string& {
+                return job.meta[i].variant_encoded;
+              },
+              [&](int i) -> const std::string& {
+                return job.meta[i].alt_allele_indices_encoded;
+              });
+        }
+        if (!job_ok) pipe_failed.store(true);
+        // Free the slot regardless of success so the main thread (which may
+        // be blocked waiting for this slot) is never deadlocked on error.
+        {
+          std::lock_guard<std::mutex> lk(pipe_mu);
+          pipe_busy[slot] = false;
+        }
+        pipe_slot_free.notify_one();
+      }
+    });
+  };
+
+  // Drain + join the worker. Safe to call on any exit path; idempotent.
+  // Setting pipe_done wakes the worker so it drains the queue and exits; the
+  // worker also frees slots + notifies pipe_slot_free on every job (including
+  // the error path), so the main thread can never be left blocked waiting for
+  // a slot while we are tearing down. join() is the final barrier — after it
+  // returns, all queued CVOs have been emitted to the writer.
+  auto join_pipe_worker = [&]() {
+    if (!pipe_worker.joinable()) return;
+    {
+      std::lock_guard<std::mutex> lk(pipe_mu);
+      pipe_done = true;
+    }
+    pipe_nonempty.notify_all();
+    pipe_worker.join();
+  };
+
+  // RAII guard: ensure the finalize worker is joined on EVERY exit path
+  // (including early `return 1` on flush failure). Idempotent with the
+  // explicit end-of-input join below. Declared before flush_batch / the main
+  // loop so it is destroyed (and thus joins) after them on any return.
+  struct PipeJoiner {
+    std::function<void()>& join_fn;
+    ~PipeJoiner() { join_fn(); }
+  };
+  std::function<void()> join_pipe_worker_fn = join_pipe_worker;
+  PipeJoiner pipe_joiner{join_pipe_worker_fn};
 
   auto flush_batch = [&]() -> bool {
     if (batch.empty()) return true;
@@ -590,9 +807,91 @@ int RunCallVariants(int argc, char** argv) {
       DV_SIGNPOST_INTERVAL_BEGIN(MetalGPU, "");
       ok = metal_model->Predict(images.data(), n, probs.data());
       DV_SIGNPOST_INTERVAL_END(MetalGPU);
+    } else if (metal_model && metal_finalize && pipeline_enabled) {
+      // Two-stage Metal/BNNS path, PIPELINED (opt-in). The GPU backbone runs
+      // here on the main thread (blocking on the GPU); the CPU BNNS finalize
+      // + CVO build are handed to the single finalize worker so they overlap
+      // with the NEXT batch's GPU backbone. This branch fully handles its own
+      // CVO emission (via the worker) and returns early — it does not fall
+      // through to the serial CVO loop below.
+      const size_t feat_per =
+          static_cast<size_t>(metal_model->FeatureDim());
+      const size_t feat_total =
+          static_cast<size_t>(batch_size) * feat_per;
+      const size_t prob_total =
+          static_cast<size_t>(batch_size) * static_cast<size_t>(K);
+
+      ensure_pipe_worker();
+
+      // Pick this batch's slot and WAIT until it is free. Two slots means the
+      // main thread is at most one batch ahead of the worker (the slot used
+      // `kPipelineSlots` batches ago must be drained before we overwrite it).
+      const int slot =
+          static_cast<int>(total_batches % kPipelineSlots);
+      {
+        std::unique_lock<std::mutex> lk(pipe_mu);
+        pipe_slot_free.wait(lk, [&] {
+          return !pipe_busy[slot] || pipe_failed.load();
+        });
+      }
+      if (pipe_failed.load()) {
+        // A prior job failed in the worker; abort cleanly.
+        DV_SIGNPOST_INTERVAL_END(Inference);
+        return false;
+      }
+
+      // Lazily size the double-buffered features/probs for this slot.
+      if (pipe_features[slot].size() < feat_total) {
+        pipe_features[slot].resize(feat_total);
+      }
+      if (pipe_probs[slot].size() < prob_total) {
+        pipe_probs[slot].resize(prob_total);
+      }
+
+      // GPU backbone → this slot's features buffer. Predict() blocks on
+      // waitUntilCompleted, so on return both `images` (reusable for the
+      // next batch) and pipe_features[slot] are settled.
+      DV_SIGNPOST_INTERVAL_BEGIN(MetalGPU, "");
+      bool gpu_ok =
+          metal_model->Predict(images.data(), n, pipe_features[slot].data());
+      DV_SIGNPOST_INTERVAL_END(MetalGPU);
+      DV_SIGNPOST_INTERVAL_END(Inference);
+      if (!gpu_ok) {
+        LOG(ERROR) << "Inference failed on batch " << total_batches;
+        return false;
+      }
+
+      // Capture per-example CVO metadata for the worker (small strings),
+      // moved out of `batch` so `batch` can be refilled immediately.
+      PipelineJob job;
+      job.slot = slot;
+      job.n = n;
+      job.meta.resize(n);
+      for (int i = 0; i < n; ++i) {
+        job.meta[i].variant_encoded =
+            std::move(batch[i].features.variant_encoded);
+        job.meta[i].alt_allele_indices_encoded =
+            std::move(batch[i].features.alt_allele_indices_encoded);
+      }
+
+      // Publish the job: mark the slot busy and hand it to the worker.
+      {
+        std::lock_guard<std::mutex> lk(pipe_mu);
+        pipe_busy[slot] = true;
+        pipe_queue.push_back(std::move(job));
+      }
+      pipe_nonempty.notify_one();
+
+      // Bookkeeping happens here on the main thread (it does not depend on
+      // the worker). The serial CVO loop below is skipped.
+      ++total_batches;
+      total_examples += n;
+      batch.clear();
+      DV_SIGNPOST_INTERVAL_END(FlushBatch);
+      return true;
     } else if (metal_model && metal_finalize) {
-      // Two-stage Metal/BNNS path: GPU MPSGraph for backbone, CPU BNNS
-      // for the final dense + softmax (deterministic FP32 reduction
+      // Two-stage Metal/BNNS path (serial): GPU MPSGraph for backbone, CPU
+      // BNNS for the final dense + softmax (deterministic FP32 reduction
       // = bit-parity with TF CPU). features sized to full batch_size
       // on first use; subsequent batches reuse via static thread-local.
       static thread_local std::vector<float> features;
@@ -614,40 +913,17 @@ int RunCallVariants(int argc, char** argv) {
       return false;
     }
 
-    // Write one CallVariantsOutput per example.
-    for (int i = 0; i < n; ++i) {
-      learning::genomics::deepvariant::CallVariantsOutput cvo;
-      if (!batch[i].features.variant_encoded.empty()) {
-        cvo.mutable_variant()->ParseFromString(
-            batch[i].features.variant_encoded);
-      }
-      if (!batch[i].features.alt_allele_indices_encoded.empty()) {
-        cvo.mutable_alt_allele_indices()->ParseFromString(
-            batch[i].features.alt_allele_indices_encoded);
-      }
-      for (int k = 0; k < K; ++k) {
-        cvo.add_genotype_probabilities(probs[i * K + k]);
-      }
-      // Tag MID="deepvariant" so postprocess can write it as a VCF FORMAT
-      // field. Reuse the empty VariantCall slot that variant_calling.cc
-      // already added (otherwise we end up with 2 calls and VcfWriter
-      // rejects the variant for not matching sample count).
-      auto* v = cvo.mutable_variant();
-      if (v->calls_size() == 0) v->add_calls();
-      nucleus::SetInfoField("MID", std::string("deepvariant"),
-                             v->mutable_calls(0));
-
-      std::string serialized;
-      if (!cvo.SerializeToString(&serialized)) {
-        LOG(ERROR) << "Failed to serialize CallVariantsOutput";
-        return false;
-      }
-      // P1: async writer thread consumes this. Push std::move so the
-      // writer thread owns the buffer; main thread can recycle storage.
-      if (!enqueue_write(std::move(serialized))) {
-        LOG(ERROR) << "Failed to enqueue output record (writer thread error)";
-        return false;
-      }
+    // Write one CallVariantsOutput per example (serial path; the pipelined
+    // two-stage Metal branch above returns early and emits via the worker).
+    if (!emit_cvos(
+            probs.data(), n,
+            [&](int i) -> const std::string& {
+              return batch[i].features.variant_encoded;
+            },
+            [&](int i) -> const std::string& {
+              return batch[i].features.alt_allele_indices_encoded;
+            })) {
+      return false;
     }
 
     ++total_batches;
@@ -737,6 +1013,18 @@ int RunCallVariants(int argc, char** argv) {
     }
   }
   if (!flush_batch()) return 1;
+
+  // End-of-input: drain + join the finalize worker BEFORE signaling the
+  // writer to finish. This guarantees every pipelined batch's CVOs have been
+  // emit_cvos()'d into the writer queue before we close it, so no output is
+  // lost. (No-op when pipelining is disabled / worker never started.) The
+  // RAII PipeJoiner would also join, but joining here lets us surface a
+  // worker error and keeps teardown ordering explicit.
+  join_pipe_worker();
+  if (pipe_failed.load()) {
+    LOG(ERROR) << "Pipelined finalize worker failed during run";
+    return 1;
+  }
 
   // Signal writer thread to drain + exit; then close writer ourselves.
   {

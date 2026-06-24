@@ -124,11 +124,29 @@ def compare(reference: np.ndarray, candidate: np.ndarray) -> dict:
 
 
 def autoload(path: str) -> np.ndarray:
-    """Try the upstream CallVariantsOutput format first, fall back to minimal."""
+    """Try the upstream CallVariantsOutput format first, fall back to minimal.
+
+    The DV decoder is preferred. We only switch to the minimal decoder when
+    the DV decode raises or yields zero rows, and we log which decoder won to
+    stderr so a silent format switch never goes unnoticed.
+    """
     try:
-        return load_softmax_dv(path)
-    except Exception:
+        rows = load_softmax_dv(path)
+    except Exception as exc:
+        print(
+            f"parity_check: DV decode of {path} failed ({exc}); "
+            f"falling back to minimal decoder",
+            file=sys.stderr,
+        )
         return load_softmax_minimal(path)
+    if rows.shape[0] == 0:
+        print(
+            f"parity_check: DV decode of {path} returned zero rows; "
+            f"falling back to minimal decoder",
+            file=sys.stderr,
+        )
+        return load_softmax_minimal(path)
+    return rows
 
 
 def main() -> int:
@@ -149,16 +167,25 @@ def main() -> int:
         print(f"candidate: {c}")
         cand = autoload(c)
         report = compare(ref, cand)
-        report["ok"] = report.get("argmax_disagreements", 1) == 0 and report.get("max_abs_softmax", 1.0) <= args.max_abs_tol
         results[c] = report
-        line = (
-            f"  n={report.get('n', '?')} max|Δ|={report.get('max_abs_softmax', 0):.2e} "
-            f"mean|Δ|={report.get('mean_abs_softmax', 0):.2e} "
-            f"argmax_disagree={report.get('argmax_disagreements', 0)}/{report.get('n', 0)} "
-            f"({100 * report.get('argmax_disagreement_rate', 0):.3f}%) "
-            f"{'OK' if report['ok'] else 'FAIL'}"
-        )
-        print(line)
+        if "reason" in report:
+            # compare() bailed out early (e.g. shape mismatch) and the numeric
+            # diff keys are absent — surface the reason instead of indexing them.
+            report["ok"] = False
+            print(f"  FAIL: {report['reason']}")
+        else:
+            report["ok"] = (
+                report.get("argmax_disagreements", 1) == 0
+                and report.get("max_abs_softmax", 1.0) <= args.max_abs_tol
+            )
+            line = (
+                f"  n={report.get('n', '?')} max|Δ|={report.get('max_abs_softmax', 0):.2e} "
+                f"mean|Δ|={report.get('mean_abs_softmax', 0):.2e} "
+                f"argmax_disagree={report.get('argmax_disagreements', 0)}/{report.get('n', 0)} "
+                f"({100 * report.get('argmax_disagreement_rate', 0):.3f}%) "
+                f"{'OK' if report['ok'] else 'FAIL'}"
+            )
+            print(line)
         overall_ok &= report["ok"]
 
     if args.output:

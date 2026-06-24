@@ -31,9 +31,9 @@
 // upstream bookkeeping. It is a *pre-classification* pass that lets
 // the outer scalar code skip per-base function calls.
 //
-// Production wiring is staged for the next session, jointly with
-// A2.1, behind a single upstream-divergence diff. This header
-// ships as standalone, tested infrastructure.
+// Production wiring: this kernel is live in the allele-counting path —
+// `deepvariant/allelecounter.cc` includes this header and calls
+// `ClassifyMBlockNeon` from the M-block inner loop of AlleleCounter::Add.
 
 #pragma once
 

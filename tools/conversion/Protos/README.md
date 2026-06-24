@@ -1,6 +1,6 @@
 # Vendored TF `.proto` files (TF-free SavedModel reading)
 
-25 `.proto` files vendored from `tensorflow/r2.16` (Apache-2.0). See `SOURCES.md` for the exact list, the upstream branch, and the re-fetch commands.
+26 `.proto` files vendored from `tensorflow/r2.16` (Apache-2.0). See `SOURCES.md` for the exact list, the upstream branch, and the re-fetch commands.
 
 The vendored set is just the schema definitions — no TensorFlow runtime, no Python TF package. We compile them with system `protoc --python_out=Generated/` and import the resulting `*_pb2` modules from `savedmodel_reader.py`.
 

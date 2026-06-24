@@ -51,7 +51,10 @@ ExampleWriter::~ExampleWriter() { Close(); }
 bool ExampleWriter::Add(absl::string_view value,
                          absl::string_view /*chrom*/, int64_t /*pos*/) {
   if (!impl_ || !impl_->writer) return false;
-  if (!impl_->writer->WriteRecord(std::string{value})) {
+  // Pass the string_view directly; TFRecordWriter copies into its own
+  // coalescing buffer, so materializing an intermediate std::string here
+  // would be a redundant copy.
+  if (!impl_->writer->WriteRecord(std::string_view(value.data(), value.size()))) {
     status_.Update(absl::InternalError("TFRecord write failed"));
     return false;
   }

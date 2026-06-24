@@ -2177,10 +2177,30 @@ int RunMakeExamples(int argc, char** argv) {
     int64_t total_small_hits = 0;
     int64_t total_big_dispatched = 0;
 
+    // Hoist loop-invariant flag reads (and the RealignerOptions proto, which
+    // is built purely from immutable flags) out of the per-region loop. absl
+    // flags are immutable after parse, so these values are identical on every
+    // iteration; computing them once is a pure-perf win with no value change.
+    const bool kRealignerEnabled = absl::GetFlag(FLAGS_realigner_enabled);
+    const bool kSplitSkipReads = absl::GetFlag(FLAGS_split_skip_reads);
+    const bool kUseDirectPhasing = absl::GetFlag(FLAGS_use_direct_phasing);
+    const bool kSmallModelUseHaplotypes =
+        absl::GetFlag(FLAGS_small_model_use_haplotypes);
+    const RealignerOptions kRealignerOpts = RealignerOptionsFromFlags();
+
     while (true) {
       const size_t i = next_region.fetch_add(1, std::memory_order_relaxed);
       if (i >= shard_regions.size()) break;
       const auto& region = shard_regions[i];
+    // Periodic progress: log every 1000 regions (cheap modulo only). `i` is
+    // the shared 0-based region index, so this fires once per 1000 regions
+    // across all worker threads combined; counters are thread-local running
+    // totals for this worker.
+    if (i % 1000 == 0) {
+      LOG(INFO) << "Progress: processed " << i << "/" << shard_regions.size()
+                << " regions (thread " << tid << " examples so far="
+                << total_examples << ")";
+    }
     LOG(INFO) << "Region: " << region.reference_name() << ":"
               << region.start() << "-" << region.end();
     const std::string region_str =
@@ -2287,7 +2307,7 @@ int RunMakeExamples(int argc, char** argv) {
     // realigner.py:realign_reads → split_reads (gated by --split_skip_reads,
     // the RNASEQ example_info default). Must run before the AlleleCounter so
     // intron gaps don't pollute the pileup image.
-    if (absl::GetFlag(FLAGS_split_skip_reads)) {
+    if (kSplitSkipReads) {
       const size_t before = reads.size();
       reads = SplitReadsOnSkip(reads);
       LOG(INFO) << "  split_skip_reads: " << before << " → " << reads.size()
@@ -2299,7 +2319,7 @@ int RunMakeExamples(int argc, char** argv) {
     // tracking see the realigned reads (matches upstream's flow).
     DV_SIGNPOST_INTERVAL_BEGIN(Realigner, region_str.c_str());
     std::vector<nucleus::genomics::v1::Read> working_reads;
-    if (absl::GetFlag(FLAGS_realigner_enabled)) {
+    if (kRealignerEnabled) {
       // Pre-scan AlleleCounter for the WindowSelector. Upstream
       // (realigner/window_selector.py:_candidates_from_reads) builds
       // a *dedicated* AlleleCounter with WindowSelector-specific
@@ -2307,7 +2327,7 @@ int RunMakeExamples(int argc, char** argv) {
       // expanded region (region_expansion_in_bp=20). The candidate-
       // emission AlleleCounter further down uses the looser
       // make_examples thresholds (10/10) — they're separate counters.
-      const auto realigner_opts = RealignerOptionsFromFlags();
+      const auto& realigner_opts = kRealignerOpts;
       const int expand_bp = realigner_opts.ws_config().region_expansion_in_bp();
       auto contig_or = ref_reader->Contig(region.reference_name());
       const int64_t contig_n =
@@ -2373,7 +2393,13 @@ int RunMakeExamples(int argc, char** argv) {
         }
       }
     } else {
-      working_reads = reads;
+      // No realigner: hand the read vector off by move instead of deep-
+      // copying the entire vector of Read protos (the default WGS/WES path).
+      // `reads` is not read again after this point — the only later
+      // reference (the candidates/reads size log below) is repointed to
+      // `working_reads`, whose size is identical (the realigner path also
+      // preserves read count), so this is value- and output-neutral.
+      working_reads = std::move(reads);
     }
     DV_SIGNPOST_INTERVAL_END(Realigner);
 
@@ -2454,8 +2480,7 @@ int RunMakeExamples(int argc, char** argv) {
     std::unordered_map<std::string, int8_t> read_hp_tags;
     {
       const bool need_phasing =
-          absl::GetFlag(FLAGS_use_direct_phasing) ||
-          absl::GetFlag(FLAGS_small_model_use_haplotypes);
+          kUseDirectPhasing || kSmallModelUseHaplotypes;
       if (need_phasing) {
         // BUG FIX (chr20:23.97-23.99M PacBio FN cluster, 0e15ddb2 diagnosis):
         // upstream make_examples_core.py:2308-2317 expands the region by 20%
@@ -2533,7 +2558,7 @@ int RunMakeExamples(int argc, char** argv) {
       // features, use BAM HP tags (whatshap haplotag in PacBio BAMs).
       // Guards against regression for users running --small_model_use_haplotypes
       // without --use_direct_phasing on a pre-haplotagged BAM.
-      if (!dp_ran && absl::GetFlag(FLAGS_small_model_use_haplotypes)) {
+      if (!dp_ran && kSmallModelUseHaplotypes) {
         for (const auto& r : working_reads) {
           auto hp_it = r.info().find("HP");
           if (hp_it == r.info().end() ||
@@ -2582,8 +2607,7 @@ int RunMakeExamples(int argc, char** argv) {
 
       // read_hp_tags is now built above (Phase 5.5d/14): DirectPhasing
       // output overrides BAM HP tags when DP runs successfully.
-      const bool use_haplotypes =
-          absl::GetFlag(FLAGS_small_model_use_haplotypes);
+      const bool use_haplotypes = kSmallModelUseHaplotypes;
 
       for (auto& c : candidates) {
         const int n_alts = c.variant().alternate_bases_size();
@@ -2653,7 +2677,7 @@ int RunMakeExamples(int argc, char** argv) {
     // VariantCall.is_phased = true and emit PS info field. The phase
     // set ID is per-region (= start of block); cross-region stitching
     // is a follow-up that mirrors upstream's stitch_phase_sets.
-    if (dp_ran && absl::GetFlag(FLAGS_use_direct_phasing)) {
+    if (dp_ran && kUseDirectPhasing) {
       const auto phased = dp.GetPhasedVariants();
       // Walk in order; track current phase set (= start of block).
       int64_t current_ps = -1;
@@ -2701,7 +2725,7 @@ int RunMakeExamples(int argc, char** argv) {
     std::vector<int> image_shape;
 
     LOG(INFO) << "  candidates=" << candidates.size()
-              << " reads=" << reads.size();
+              << " reads=" << working_reads.size();
 
     DV_SIGNPOST_INTERVAL_BEGIN(PileupEncode, region_str.c_str());
     auto stats = generator.WriteExamplesInRegion(
