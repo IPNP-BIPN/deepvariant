@@ -1488,6 +1488,15 @@ int RunMakeExamples(int argc, char** argv) {
   // entirely (1342 Docker-only PASS sites including homopolymer indels).
   sam_opts.mutable_read_requirements()->set_keep_supplementary_alignments(
       absl::GetFlag(FLAGS_keep_supplementary_alignments));
+  // --parse_sam_aux_fields must reach the SamReader itself: ParseAuxFields is a
+  // no-op unless aux_field_handling == PARSE_ALL_AUX_FIELDS, and without it the
+  // reader never populates read.info() (MM/ML base modifications, HP, ...).
+  // Setting it on MakeExamplesOptions alone (above) is not enough. Default off
+  // keeps the byte-identical baseline (no aux fields parsed).
+  if (absl::GetFlag(FLAGS_parse_sam_aux_fields)) {
+    sam_opts.set_aux_field_handling(
+        nucleus::genomics::v1::SamReaderOptions::PARSE_ALL_AUX_FIELDS);
+  }
   {
     std::string probe_bam = reads_path;
     if (probe_bam.empty() && IsSomaticMode()) {
