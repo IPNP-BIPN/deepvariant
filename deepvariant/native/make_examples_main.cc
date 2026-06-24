@@ -2593,6 +2593,13 @@ int RunMakeExamples(int argc, char** argv) {
             // for --phasing_error_stats_output, which the native port does not
             // emit; intentionally dropped here.
             if (meth_phases.size() == phases.size()) {
+              int rephased = 0;
+              for (size_t i = 0; i < phases.size(); ++i) {
+                if (meth_phases[i] != phases[i]) ++rephased;
+              }
+              LOG(INFO) << "Methylation-aware phasing in " << region_str << ": "
+                        << methylated_ref_sites.size() << " methylated ref sites, "
+                        << rephased << " reads rephased";
               phases = std::move(meth_phases);
             }
           }
