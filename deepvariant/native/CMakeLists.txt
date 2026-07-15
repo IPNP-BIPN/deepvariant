@@ -308,6 +308,7 @@ target_link_libraries(dv_make_examples_lib PUBLIC
   dv_small_model
   dv_direct_phasing       # Phase 9 / Step 4 — per-region read phasing
   dv_haploid_regions      # haploid gVCF reference confidence (PAR BED loader)
+  dv_methylation_aware_phasing  # --enable_methylation_aware_phasing
   realigner
   proto_dv
   proto_nucleus
@@ -322,15 +323,11 @@ target_link_libraries(dv_make_examples_lib PUBLIC
 # dv_methylation_aware_phasing — faithful C++ port of upstream's
 # methylation_aware_phasing.{cc,h} (Wilcoxon rank-sum 5mC haplotype voting).
 #
-# NOTE: this algorithm is compiled and unit-tested here (so it cannot bitrot
-# against the native proto definitions), but it is NOT yet invoked by the
-# native make_examples pipeline. The native phasing step
-# (make_examples_main.cc) uses DirectPhasing only; there is no native
-# --enable_methylation_aware_phasing flag, so a user cannot currently engage
-# methylation-aware phasing. Wiring PerformMethylationAwarePhasing into the
-# make_examples region loop (mirroring make_examples_core.py's methylated-ref-
-# site partitioning + post-DirectPhasing call) is deferred follow-up work.
-# This target deliberately is not linked into dv_make_examples_lib.
+# It is unit-tested here (so it cannot bitrot against the native proto
+# definitions) and linked into dv_make_examples_lib, which invokes
+# PerformMethylationAwarePhasing from the single-sample phasing block under
+# --enable_methylation_aware_phasing (mirroring make_examples_core.py's
+# methylated-ref-site partitioning + post-DirectPhasing call).
 # ---------------------------------------------------------------------------
 add_library(dv_methylation_aware_phasing STATIC
   "${CMAKE_SOURCE_DIR}/deepvariant/methylation_aware_phasing.cc"

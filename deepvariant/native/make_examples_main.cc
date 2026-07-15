@@ -29,6 +29,7 @@
 #include "deepvariant/make_examples_native.h"
 #include "deepvariant/native/gvcf_emit.h"
 #include "deepvariant/native/haploid_regions.h"
+#include "deepvariant/methylation_aware_phasing.h"
 #include "deepvariant/native/numpy_mt19937.h"
 #include "deepvariant/native/realigner_native.h"
 #include "deepvariant/native/regions.h"
@@ -101,6 +102,14 @@ ABSL_FLAG(double, methylation_calling_threshold, 0.5,
           "Phase 9 / Step 2 — minimum methylation probability "
           "(from ML tag) for a base to be classified as 5mC. "
           "Default 0.5 matches upstream make_examples_options.py.");
+ABSL_FLAG(bool, enable_methylation_aware_phasing, false,
+          "Run upstream's methylation-aware phasing after DirectPhasing: "
+          "methylated reference sites (alt=='.') are split out of the SNP "
+          "phasing graph and used to assign a haplotype to reads left "
+          "unphased by DirectPhasing, via a Wilcoxon rank-sum test on 5mC "
+          "levels. Implies methylation extraction in AlleleCounter. Requires "
+          "--use_direct_phasing or --small_model_use_haplotypes to have an "
+          "effect. Default false = byte-identical baseline. (PacBio/ONT.)");
 ABSL_FLAG(std::string, alt_aligned_pileup, "",
           "Phase 9 / Step 1 — alt-aligned pileup mode for PacBio/ONT "
           "models. One of: none, base_channels, diff_channels, rows, "
@@ -474,10 +483,18 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
   ac_opts.set_enable_methylation_calling(kMethylationOn);
   ac_opts.set_methylation_calling_threshold(
       absl::GetFlag(FLAGS_methylation_calling_threshold));
+  // Methylation-aware phasing also needs AlleleCounter to extract 5mC levels
+  // (allelecounter.cc gates extraction on calling OR aware-phasing), and the
+  // VariantCaller emits methylated reference sites (alt='.') as candidates
+  // only when the option is set on its options.
+  const bool kMethylAwarePhasingOn =
+      absl::GetFlag(FLAGS_enable_methylation_aware_phasing);
+  ac_opts.set_enable_methylation_aware_phasing(kMethylAwarePhasingOn);
   *opts.mutable_allele_counter_options() = ac_opts;
   // Mirror the flag onto MakeExamplesOptions (used by some downstream
   // code paths, e.g. variant emission / VCF formatting).
   opts.set_enable_methylation_calling(kMethylationOn);
+  opts.set_enable_methylation_aware_phasing(kMethylAwarePhasingOn);
   // Phase 9 / Step 4 — DirectPhasing options. Only used when
   // --use_direct_phasing is set; the algorithm wraps candidates +
   // reads to emit per-variant phase info (is_phased + PS).
@@ -485,6 +502,10 @@ MakeExamplesOptions BuildOptions(const std::string& sample_name,
 
   // Variant caller options.
   VariantCallerOptions vc_opts;
+  // The caller emits methylated reference sites (alt='.') as candidates only
+  // when this is set; they become the methylated_ref_sites for methylation-
+  // aware phasing below.
+  vc_opts.set_enable_methylation_aware_phasing(kMethylAwarePhasingOn);
   vc_opts.set_min_count_snps(absl::GetFlag(FLAGS_vsc_min_count_snps));
   vc_opts.set_min_count_indels(absl::GetFlag(FLAGS_vsc_min_count_indels));
   vc_opts.set_min_fraction_snps(absl::GetFlag(FLAGS_vsc_min_fraction_snps));
@@ -1150,6 +1171,14 @@ bool IsExcludedAlt(const std::string& alt) {
   return alt == "<*>" || alt == "<NON_REF>" || alt == ".";
 }
 
+// A methylated reference site: a candidate whose only alt is the missing-field
+// '.', i.e. a reference position retained as a candidate because it was checked
+// for methylation. Mirror of make_examples_core._is_methylated_reference_site.
+bool IsMethylatedRefSite(const DeepVariantCall& c) {
+  return c.variant().alternate_bases_size() == 1 &&
+         c.variant().alternate_bases(0) == ".";
+}
+
 // Alt alleles that count toward variant-type classification (non-excluded).
 std::vector<const std::string*> RelevantAlts(
     const nucleus::genomics::v1::Variant& v) {
@@ -1488,6 +1517,15 @@ int RunMakeExamples(int argc, char** argv) {
   // entirely (1342 Docker-only PASS sites including homopolymer indels).
   sam_opts.mutable_read_requirements()->set_keep_supplementary_alignments(
       absl::GetFlag(FLAGS_keep_supplementary_alignments));
+  // --parse_sam_aux_fields must reach the SamReader itself: ParseAuxFields is a
+  // no-op unless aux_field_handling == PARSE_ALL_AUX_FIELDS, and without it the
+  // reader never populates read.info() (MM/ML base modifications, HP, ...).
+  // Setting it on MakeExamplesOptions alone (above) is not enough. Default off
+  // keeps the byte-identical baseline (no aux fields parsed).
+  if (absl::GetFlag(FLAGS_parse_sam_aux_fields)) {
+    sam_opts.set_aux_field_handling(
+        nucleus::genomics::v1::SamReaderOptions::PARSE_ALL_AUX_FIELDS);
+  }
   {
     std::string probe_bam = reads_path;
     if (probe_bam.empty() && IsSomaticMode()) {
@@ -2147,7 +2185,12 @@ int RunMakeExamples(int argc, char** argv) {
     CHECK(t_sam_or.ok()) << "thread " << tid << ": BAM reopen failed";
     auto sam_reader = std::move(t_sam_or.ValueOrDie());
 
-    vcf_candidate_importer::VariantCaller caller(
+    // Use the multi-sample VariantCaller (as upstream does for every sample
+    // count) rather than the vcf_candidate_importer caller: only the former
+    // emits methylated reference sites (alt='.'), which methylation-aware
+    // phasing consumes. For a single sample the candidate set is otherwise
+    // identical (validated against the WGS baseline).
+    multi_sample::VariantCaller caller(
         opts.sample_options(0).variant_caller_options());
 
     const std::unordered_map<std::string, std::string> example_filenames = {
@@ -2430,7 +2473,8 @@ int RunMakeExamples(int argc, char** argv) {
       }
     }
 
-    auto probe_candidates = caller.CallsFromAlleleCounter(probe);
+    auto probe_candidates = caller.CallsFromAlleleCounts(
+        {{sample_name, &probe}}, sample_name, "sample");
     if (probe_candidates.empty()) continue;
 
     // Second pass: rerun AlleleCounter with the candidate positions known
@@ -2455,7 +2499,8 @@ int RunMakeExamples(int argc, char** argv) {
     DV_SIGNPOST_INTERVAL_END(AlleleCounterMain);
 
     std::vector<DeepVariantCall> candidates =
-        caller.CallsFromAlleleCounter(counter);
+        caller.CallsFromAlleleCounts({{sample_name, &counter}}, sample_name,
+                                     "sample");
     if (candidates.empty()) continue;
 
     // Phase 5.5d/14 — DirectPhasing runs BEFORE small_model dispatch so the
@@ -2538,11 +2583,51 @@ int RunMakeExamples(int argc, char** argv) {
             dp_read_ptrs;
         dp_read_ptrs.reserve(dp_reads_src.size());
         for (const auto& r : dp_reads_src) dp_read_ptrs.emplace_back(&r);
-        auto so = dp.PhaseReads(absl::MakeSpan(candidates),
+        // Methylation-aware phasing (PacBio/ONT): split methylated reference
+        // sites (alt='.') out of the SNP phasing graph, phase the SNP
+        // candidates, then use the methylated sites to phase reads DirectPhasing
+        // left unphased. Mirror of make_examples_core.py's
+        // enable_methylation_aware_phasing block. When the flag is off no
+        // methylated-ref-site candidates exist, so this is identical to phasing
+        // the full candidate set.
+        const bool meth_aware =
+            absl::GetFlag(FLAGS_enable_methylation_aware_phasing);
+        std::vector<DeepVariantCall> methylated_ref_sites;
+        std::vector<DeepVariantCall> snp_candidates;
+        const std::vector<DeepVariantCall>* dp_candidates = &candidates;
+        if (meth_aware) {
+          for (const auto& c : candidates) {
+            if (IsMethylatedRefSite(c)) methylated_ref_sites.push_back(c);
+            else snp_candidates.push_back(c);
+          }
+          dp_candidates = &snp_candidates;
+        }
+        auto so = dp.PhaseReads(absl::MakeSpan(*dp_candidates),
                                   absl::MakeSpan(dp_read_ptrs));
         if (so.ok()) {
           dp_ran = true;
-          const std::vector<int>& phases = so.ValueOrDie();
+          std::vector<int> phases = so.ValueOrDie();
+          // Refine per-read phases using 5mC levels at the methylated reference
+          // sites (Wilcoxon rank-sum vote over reads DirectPhasing left at HP_0).
+          if (meth_aware && !methylated_ref_sites.empty()) {
+            auto meth = PerformMethylationAwarePhasing(
+                absl::MakeSpan(dp_reads_src), phases, methylated_ref_sites,
+                /*max_iter=*/10);
+            std::vector<int>& meth_phases = std::get<0>(meth);
+            // std::get<1>(meth) holds the per-site p-values, used upstream only
+            // for --phasing_error_stats_output, which the native port does not
+            // emit; intentionally dropped here.
+            if (meth_phases.size() == phases.size()) {
+              int rephased = 0;
+              for (size_t i = 0; i < phases.size(); ++i) {
+                if (meth_phases[i] != phases[i]) ++rephased;
+              }
+              LOG(INFO) << "Methylation-aware phasing in " << region_str << ": "
+                        << methylated_ref_sites.size() << " methylated ref sites, "
+                        << rephased << " reads rephased";
+              phases = std::move(meth_phases);
+            }
+          }
           // phases[i] corresponds to dp_reads_src[i]: 0/1/2.
           for (size_t i = 0;
                i < dp_reads_src.size() && i < phases.size(); ++i) {
